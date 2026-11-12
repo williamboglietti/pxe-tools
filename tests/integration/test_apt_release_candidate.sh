@@ -48,6 +48,42 @@ apt-cache "${opts[@]}" policy pxe-tools | grep -q 'Candidate: 1.0~fixture1'
 apt-get -s "${opts[@]}" install pxe-tools > "$fixture/simulate.log" 2>&1
 grep -q '^Inst pxe-tools ' "$fixture/simulate.log"
 
+# A client may keep an old signed Release while a new version is deployed.
+# Its content-addressed index and package must remain available in the new tree.
+grep -q '^Acquire-By-Hash: yes$' "$fixture/repository/dists/stable/Release"
+old_index="$fixture/repository/dists/stable/main/binary-amd64/Packages.gz"
+old_hash=$(sha256sum "$old_index" | awk '{print $1}')
+old_object="$fixture/repository/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+cmp "$old_index" "$old_object"
+old_package=$(find "$fixture/repository/pool" -name '*.deb' -print -quit)
+sed -i 's/Version: 1.0~fixture1/Version: 1.0~fixture2/' "$fixture/pkg-pxe-tools/DEBIAN/control"
+dpkg-deb --build --root-owner-group "$fixture/pkg-pxe-tools" "$fixture/new.deb" >/dev/null
+python3 "$builder" "$fixture/new.deb" "$fixture/next" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --valid-days 1 --previous "$fixture/repository" >/dev/null
+cmp "$old_object" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+cmp "$old_package" "$fixture/next/pool/main/p/pxe-tools/$(basename "$old_package")"
+test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
+printf 'deb [signed-by=%s/key.gpg] file:%s/next stable main\n' "$fixture" "$fixture" > "$fixture/source.list"
+apt-get "${opts[@]}" update > "$fixture/update-next.log" 2>&1
+apt-cache "${opts[@]}" policy pxe-tools | grep -q 'Candidate: 1.0~fixture2'
+cp -a "$fixture/repository" "$fixture/tampered-previous"
+printf corrupt >> "$fixture/tampered-previous/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-previous" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/tampered-previous" > "$fixture/rejected.log" 2>&1; then
+    echo 'Corrupt previous immutable index unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-previous"
+cp -a "$fixture/repository" "$fixture/bad-signature-previous"
+sed -i 's/PXE Tools release candidate/PXE Tools modified candidate/' "$fixture/bad-signature-previous/dists/stable/InRelease"
+if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-signature" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/bad-signature-previous" > "$fixture/rejected-signature.log" 2>&1; then
+    echo 'Invalid previous signature unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-signature"
+cp -a "$fixture/repository" "$fixture/missing-package-previous"
+rm -- "$fixture/missing-package-previous/pool/main/p/pxe-tools/$(basename "$old_package")"
+if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-missing" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/missing-package-previous" > "$fixture/rejected-missing.log" 2>&1; then
+    echo 'Missing previously signed package unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-missing"
+
 mkdir -p "$fixture/bad/dists/stable"
 cp "$fixture/repository/dists/stable/InRelease" "$fixture/bad/dists/stable/InRelease"
 sed -i 's/PXE Tools release candidate/PXE Tools modified candidate/' "$fixture/bad/dists/stable/InRelease"

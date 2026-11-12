@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument('--primary-fingerprint', required=True)
     parser.add_argument('--signing-fingerprint', required=True)
     parser.add_argument('--valid-days', type=int, default=7)
+    parser.add_argument('--previous', type=Path, help='previous signed snapshot to retain')
     args = parser.parse_args()
     primary = args.primary_fingerprint.upper()
     signing = args.signing_fingerprint.upper()
@@ -78,9 +79,12 @@ def main() -> None:
             if len([x for x in all_public if x[0] == 'pub']) != 1:
                 raise ValueError('CI keyring must contain exactly one primary key')
             builder = Path(__file__).with_name('build-apt-release-candidate.py')
-            run(['python3', str(builder), str(args.package), str(args.destination),
-                 '--gnupg-home', str(home), '--fingerprint', signing,
-                 '--valid-days', str(args.valid_days), '--passphrase-file', str(password_file)])
+            build_args = ['python3', str(builder), str(args.package), str(args.destination),
+                          '--gnupg-home', str(home), '--fingerprint', signing,
+                          '--valid-days', str(args.valid_days), '--passphrase-file', str(password_file)]
+            if args.previous is not None:
+                build_args += ['--previous', str(args.previous)]
+            run(build_args)
             release = args.destination / 'dists/stable/InRelease'
             status = run(common + ['--status-fd', '1', '--verify', str(release)]).decode('utf-8')
             signatures = [line.split() for line in status.splitlines() if line.startswith('[GNUPG:] VALIDSIG ')]

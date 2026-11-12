@@ -42,6 +42,14 @@ python3 "$helper" "$fixture/package.deb" "$fixture/good" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 > "$fixture/good.log" 2>&1
 test -s "$fixture/good/dists/stable/InRelease"
 gpg --homedir "$gnupg" --batch --status-fd 1 --verify "$fixture/good/dists/stable/InRelease" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $sub "
+old_index="$fixture/good/dists/stable/main/binary-amd64/Packages.gz"
+old_hash=$(sha256sum "$old_index" | awk '{print $1}')
+sed -i 's/Version: 1.0~fixture1/Version: 1.0~fixture2/' "$fixture/package/DEBIAN/control"
+dpkg-deb --build --root-owner-group "$fixture/package" "$fixture/package-next.deb" >/dev/null
+python3 "$helper" "$fixture/package-next.deb" "$fixture/next" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 --previous "$fixture/good" > "$fixture/next.log" 2>&1
+cmp "$old_index" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 APT_SIGNING_KEY="$(cat "$fixture/full.asc")" python3 "$helper" "$fixture/package.deb" "$fixture/with-primary" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/full.log" 2>&1 && {
     echo 'Secret primary key unexpectedly accepted' >&2; exit 1;

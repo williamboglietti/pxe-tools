@@ -28,7 +28,8 @@ def command(*args: str, cwd: Path | None = None, pass_fds: tuple[int, ...] = ())
 
 def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
           valid_days: int = 7, ansible_package: Path | None = None, *,
-          release_candidate: bool = False, passphrase_file: Path | None = None) -> None:
+          release_candidate: bool = False, passphrase_file: Path | None = None,
+          previous: Path | None = None) -> None:
     if release_candidate and ansible_package is not None:
         raise ValueError('the optional production module is not prepared')
     for candidate in (package, ansible_package):
@@ -45,6 +46,8 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
     if passphrase_file is not None and (not passphrase_file.is_absolute() or passphrase_file.is_symlink()
                                         or not passphrase_file.is_file()):
         raise ValueError('passphrase file must be an absolute regular file')
+    if previous is not None and (not previous.is_absolute() or previous.is_symlink() or not previous.is_dir()):
+        raise ValueError('previous repository must be an absolute directory')
     if not 1 <= valid_days <= 31:
         raise ValueError('validity must be between 1 and 31 days')
     for binary in ('apt-ftparchive', 'dpkg-deb', 'dpkg', 'gpg'):
@@ -103,6 +106,11 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             raise RuntimeError('APT package index is empty')
         (index / 'Packages').write_bytes(packages)
         (index / 'Packages.gz').write_bytes(gzip.compress(packages, mtime=0))
+        by_hash = index / 'by-hash/SHA256'
+        by_hash.mkdir(parents=True)
+        for name in ('Packages', 'Packages.gz'):
+            data = (index / name).read_bytes()
+            (by_hash / hashlib.sha256(data).hexdigest()).write_bytes(data)
         now = datetime.now(timezone.utc)
         settings = {
             'Origin': 'PXE Tools' if release_candidate else 'PXE Tools local test',
@@ -111,6 +119,7 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             'Codename': 'stable',
             'Architectures': 'amd64',
             'Components': 'main',
+            'Acquire-By-Hash': 'yes',
             'Description': 'PXE Tools release candidate repository' if release_candidate else 'PXE Tools experimental local test repository',
         }
         options = [item for name, value in settings.items()
@@ -146,6 +155,85 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
         command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'InRelease'))
         command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'Release.gpg'),
                 str(release_dir / 'Release'))
+        if previous is not None:
+            def previous_path(relative: str) -> Path:
+                result = previous
+                for part in Path(relative).parts:
+                    result = result / part
+                    if result.is_symlink():
+                        raise ValueError('previous snapshot contains a symlink')
+                return result
+
+            old_release = previous_path('dists/stable/InRelease')
+            if old_release.is_symlink() or not old_release.is_file():
+                raise ValueError('previous signed release is missing')
+            status = command('gpg', '--homedir', str(gnupg_home), '--batch', '--status-fd', '1',
+                             '--verify', str(old_release)).decode('utf-8')
+            signatures = [line.split() for line in status.splitlines() if line.startswith('[GNUPG:] VALIDSIG ')]
+            if len(signatures) != 1 or signatures[0][2].upper() != fingerprint.upper():
+                raise ValueError('previous snapshot was not signed by the selected key')
+            cleartext = command('gpg', '--homedir', str(gnupg_home), '--batch', '--decrypt',
+                                str(old_release)).decode('utf-8')
+            if '\nAcquire-By-Hash: yes\n' not in '\n' + cleartext:
+                raise ValueError('previous release does not support by-hash')
+            sha_section = re.search(r'(?ms)^SHA256:\s*\n((?: [^\n]+\n)+)', cleartext)
+            if not sha_section:
+                raise ValueError('previous release lacks SHA256 checksums')
+            checksums = {}
+            for line in sha_section.group(1).splitlines():
+                digest, size, name = line.split()
+                checksums[name] = (digest, int(size))
+            old_index_dir = 'dists/stable/main/binary-amd64'
+            for name in ('Packages', 'Packages.gz'):
+                rel = f'main/binary-amd64/{name}'
+                if rel not in checksums:
+                    raise ValueError('previous release does not describe its package indexes')
+                digest, size = checksums[rel]
+                if not re.fullmatch(r'[0-9a-f]{64}', digest):
+                    raise ValueError('invalid previous index checksum')
+                canonical = previous_path(f'{old_index_dir}/{name}')
+                immutable = previous_path(f'{old_index_dir}/by-hash/SHA256/{digest}')
+                if not canonical.is_file() or not immutable.is_file():
+                    raise ValueError('previous signed index or its immutable copy is missing')
+                data = canonical.read_bytes()
+                if len(data) != size or hashlib.sha256(data).hexdigest() != digest or immutable.read_bytes() != data:
+                    raise ValueError('previous signed index is inconsistent')
+            old_packages = previous_path(f'{old_index_dir}/Packages').read_text(encoding='utf-8')
+            for paragraph in old_packages.strip().split('\n\n'):
+                fields = dict(line.split(': ', 1) for line in paragraph.splitlines() if ': ' in line)
+                filename, digest = fields.get('Filename', ''), fields.get('SHA256', '')
+                if not re.fullmatch(r'pool/main/p/pxe-tools/pxe-tools-[0-9a-f]{64}\.deb', filename):
+                    raise ValueError('previous index refers to an unexpected package path')
+                old_package = previous_path(filename)
+                if not old_package.is_file() or not re.fullmatch(r'[0-9a-f]{64}', digest):
+                    raise ValueError('previous package is missing or has no checksum')
+                with old_package.open('rb') as old:
+                    if hashlib.file_digest(old, 'sha256').hexdigest() != digest:
+                        raise ValueError('previous package does not match its signed index')
+            # Only immutable, content-addressed objects are carried forward. Old
+            # mutable Release and Packages paths must never overwrite the new ones.
+            for relative, pattern in (
+                    ('pool/main/p/pxe-tools', r'pxe-tools-([0-9a-f]{64})\.deb'),
+                    ('dists/stable/main/binary-amd64/by-hash/SHA256', r'([0-9a-f]{64})')):
+                source = previous_path(relative)
+                if source.is_symlink() or not source.is_dir():
+                    raise ValueError('previous snapshot lacks immutable objects')
+                target = stage / relative
+                target.mkdir(parents=True, exist_ok=True)
+                for item in source.iterdir():
+                    match = re.fullmatch(pattern, item.name)
+                    if not match or item.is_symlink() or not item.is_file():
+                        raise ValueError('invalid previous immutable object')
+                    with item.open('rb') as old:
+                        digest = hashlib.file_digest(old, 'sha256').hexdigest()
+                    if digest != match.group(1):
+                        raise ValueError('previous immutable object has an invalid digest')
+                    dest = target / item.name
+                    if dest.exists():
+                        if dest.read_bytes() != item.read_bytes():
+                            raise ValueError('immutable object collision')
+                    else:
+                        shutil.copyfile(item, dest)
         # Reserve the output name exclusively; do not replace an existing tree.
         destination.mkdir(mode=0o700)
         try:

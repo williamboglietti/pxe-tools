@@ -71,6 +71,18 @@ if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-previous" --gnupg-ho
     echo 'Corrupt previous immutable index unexpectedly accepted' >&2; exit 1
 fi
 test ! -e "$fixture/rejected-previous"
+cp -a "$fixture/repository" "$fixture/bad-signature-previous"
+sed -i 's/PXE Tools release candidate/PXE Tools modified candidate/' "$fixture/bad-signature-previous/dists/stable/InRelease"
+if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-signature" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/bad-signature-previous" > "$fixture/rejected-signature.log" 2>&1; then
+    echo 'Invalid previous signature unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-signature"
+cp -a "$fixture/repository" "$fixture/missing-package-previous"
+rm -- "$fixture/missing-package-previous/pool/main/p/pxe-tools/$(basename "$old_package")"
+if python3 "$builder" "$fixture/new.deb" "$fixture/rejected-missing" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/missing-package-previous" > "$fixture/rejected-missing.log" 2>&1; then
+    echo 'Missing previously signed package unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-missing"
 
 mkdir -p "$fixture/bad/dists/stable"
 cp "$fixture/repository/dists/stable/InRelease" "$fixture/bad/dists/stable/InRelease"

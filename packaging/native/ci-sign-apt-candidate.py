@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument('--signing-fingerprint', required=True)
     parser.add_argument('--valid-days', type=int, default=7)
     parser.add_argument('--previous', type=Path, help='previous signed snapshot to retain')
+    parser.add_argument('--public-key-output', type=Path, help='new path for the exported public key only')
     args = parser.parse_args()
     primary = args.primary_fingerprint.upper()
     signing = args.signing_fingerprint.upper()
@@ -90,6 +91,16 @@ def main() -> None:
             signatures = [line.split() for line in status.splitlines() if line.startswith('[GNUPG:] VALIDSIG ')]
             if len(signatures) != 1 or signatures[0][2] != signing or signatures[0][-1] != primary:
                 raise RuntimeError('signed metadata does not match the expected primary and subkey')
+            if args.public_key_output is not None:
+                output = args.public_key_output
+                if not output.is_absolute() or not output.parent.is_dir() or output.parent.is_symlink():
+                    raise ValueError('public key output must be an absolute path in an existing directory')
+                public = run(common + ['--export', primary])
+                if not public:
+                    raise ValueError('public key export is empty')
+                descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                with os.fdopen(descriptor, 'wb') as key_file:
+                    key_file.write(public)
         finally:
             subprocess.run(['gpgconf', '--homedir', str(home), '--kill', 'gpg-agent'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)

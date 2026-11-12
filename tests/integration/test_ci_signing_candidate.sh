@@ -47,10 +47,12 @@ old_hash=$(sha256sum "$old_index" | awk '{print $1}')
 sed -i 's/Version: 1.0~fixture1/Version: 1.0~fixture2/' "$fixture/package/DEBIAN/control"
 dpkg-deb --build --root-owner-group "$fixture/package" "$fixture/package-next.deb" >/dev/null
 python3 "$helper" "$fixture/package-next.deb" "$fixture/next" \
-    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 --previous "$fixture/good" > "$fixture/next.log" 2>&1
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 --previous "$fixture/good" --public-key-output "$fixture/exported-public.gpg" > "$fixture/next.log" 2>&1
 cmp "$old_index" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
 test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
+cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"
+gpgv --keyring "$fixture/exported-public.gpg" "$fixture/next/dists/stable/InRelease" > /dev/null 2>&1
 prepare="$root/packaging/native/prepare-static-apt.py"
 python3 "$prepare" "$fixture/next" "$fixture/static" --keyring "$fixture/public.gpg" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1 || {

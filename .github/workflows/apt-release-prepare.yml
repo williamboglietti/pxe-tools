@@ -1,0 +1,104 @@
+name: APT release preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published product release tag
+        required: true
+        type: string
+      package_asset:
+        description: Exact amd64 Debian package asset name
+        required: true
+        type: string
+      previous_run:
+        description: Previous successful preparation run ID (empty for a first candidate)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: apt-release-preparation
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main' && github.ref_protected
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      PACKAGE_ASSET: ${{ inputs.package_asset }}
+      PREVIOUS_RUN: ${{ inputs.previous_run }}
+      PRIMARY_FINGERPRINT: CD8B4493876B4FBD1009FE2DB195E5DE026807EC
+      SIGNING_FINGERPRINT: 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev gnupg python3
+          npm ci --prefix packaging/cloudflare
+      - name: Retrieve and verify published release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          [[ "$PACKAGE_ASSET" =~ ^pxe-tools_[A-Za-z0-9.+~_-]+_amd64\.deb$ ]]
+          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/candidate"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$PACKAGE_ASSET" --dir "$RUNNER_TEMP/package"
+          python3 packaging/native/verify-release-asset.py --release-json "$RUNNER_TEMP/release.json" \
+            --tag "$RELEASE_TAG" --asset "$RUNNER_TEMP/package/$PACKAGE_ASSET"
+      - name: Retrieve previous preparation when requested
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$PREVIOUS_RUN" ]]; then
+            [[ "$PREVIOUS_RUN" =~ ^[0-9]+$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREVIOUS_RUN" | jq -e \
+              '.path == ".github/workflows/apt-release-prepare.yml" and .head_branch == "main" and .event == "workflow_dispatch" and .conclusion == "success"' > /dev/null
+            gh run download "$PREVIOUS_RUN" --repo "$GITHUB_REPOSITORY" --name pxe-apt-snapshot --dir "$RUNNER_TEMP/previous"
+            test -d "$RUNNER_TEMP/previous/snapshot"
+          fi
+      - name: Sign candidate using the existing CI subkey
+        shell: bash
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$PREVIOUS_RUN" ]]; then
+            args+=(--previous "$RUNNER_TEMP/previous/snapshot")
+          fi
+          python3 packaging/native/ci-sign-apt-candidate.py \
+            "$RUNNER_TEMP/package/$PACKAGE_ASSET" "$RUNNER_TEMP/candidate/snapshot" \
+            --primary-fingerprint "$PRIMARY_FINGERPRINT" --signing-fingerprint "$SIGNING_FINGERPRINT" \
+            --public-key-output "$RUNNER_TEMP/candidate/public.gpg" "${args[@]}"
+      - name: Validate static assets and rehearse Cloudflare deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/native/prepare-static-apt.py "$RUNNER_TEMP/candidate/snapshot" "$RUNNER_TEMP/static-assets" \
+            --keyring "$RUNNER_TEMP/candidate/public.gpg" --primary-fingerprint "$PRIMARY_FINGERPRINT" \
+            --signing-fingerprint "$SIGNING_FINGERPRINT"
+          packaging/cloudflare/node_modules/.bin/wrangler deploy --config packaging/cloudflare/wrangler.jsonc \
+            --assets "$RUNNER_TEMP/static-assets" --dry-run
+      - name: Retain signed preparation temporarily
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pxe-apt-snapshot
+          path: ${{ runner.temp }}/candidate/
+          if-no-files-found: error
+          retention-days: 90

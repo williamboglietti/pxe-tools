@@ -1,0 +1,57 @@
+name: APT signing verification
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg python3
+      - name: Verify APT candidate with disposable keys
+        run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Verify CI signer with disposable keys
+        run: PXE_CI_SIGNING_FIXTURE=1 bash tests/integration/test_ci_signing_candidate.sh
+
+  verify-production-signature:
+    needs: verify
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install signing tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg python3
+      - name: Build synthetic package
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture/DEBIAN"
+          printf '%s\n' \
+            'Package: pxe-tools' \
+            'Version: 0.0.1~ci1' \
+            'Architecture: amd64' \
+            'Maintainer: Fixture <fixture@example.invalid>' \
+            'Description: Synthetic package for CI signing verification' \
+            > "$RUNNER_TEMP/fixture/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$RUNNER_TEMP/fixture" "$RUNNER_TEMP/fixture.deb"
+      - name: Sign and verify synthetic APT repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          python3 packaging/native/ci-sign-apt-candidate.py \
+            "$RUNNER_TEMP/fixture.deb" "$RUNNER_TEMP/fixture-apt" \
+            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
+            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+      # No upload or publication: this signs only a local synthetic fixture.

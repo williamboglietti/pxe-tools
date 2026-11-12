@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pxetools-distribution",
+  "compatibility_date": "2026-11-12",
+  "workers_dev": false,
+  "assets": {
+    "directory": "../../.packages-dist"
+  },
+  "routes": [
+    { "pattern": "packages.pxetools.com", "custom_domain": true }
+  ]
+}

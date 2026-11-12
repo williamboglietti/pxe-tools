@@ -15,12 +15,19 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
       - name: Install test tools
         run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg python3
+      - name: Install locked Cloudflare tools
+        run: npm ci --prefix packaging/cloudflare
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Verify release asset selection
+        run: python3 -m unittest discover -s tests -p 'test_release_asset.py' -v
       - name: Verify CI signer with disposable keys
-        run: PXE_CI_SIGNING_FIXTURE=1 bash tests/integration/test_ci_signing_candidate.sh
+        run: PXE_CI_SIGNING_FIXTURE=1 PXE_STATIC_WRANGLER=1 bash tests/integration/test_ci_signing_candidate.sh
 
   verify-production-signature:
     needs: verify

@@ -1,0 +1,31 @@
+# Généré au démarrage par docker-entrypoint.sh depuis variables d'environnement
+# Mode courant : ${DHCP_MODE}
+
+# Désactiver le DNS — on ne veut que TFTP (et éventuellement proxy-DHCP)
+port=0
+
+log-dhcp
+# log-debug : verbose pour avoir aussi les events PXE proxy + TFTP transferts.
+# Indispensable pour le sidecar dnsmasq-tail qui parse ces events et émet les
+# checkpoints dhcp_request_* / grub_config_served_* — sans log-debug, le mode
+# proxy DHCP ne génère rien d'observable côté serveur (pas de bail = pas de
+# dhcp-script invoqué).
+log-debug
+# log-facility : fichier dédié (vs stderr capturé par s6) pour permettre au
+# sidecar dnsmasq-tail de le tail -F sans pertes (s6 stderr buffer est cyclique).
+log-facility=${PXE_DNSMASQ_LOG}
+
+interface=${PXE_INTERFACE}
+bind-interfaces
+
+enable-tftp
+tftp-root=${TFTP_ROOT}
+
+# Hook DHCP : signale les events 'add'/'old' au controller PHP. Note : en mode
+# proxy DHCP (cas typique homelab où le DHCP est géré par pfSense), ce hook
+# n'est PAS invoqué car dnsmasq ne crée pas de bail. Le sidecar dnsmasq-tail
+# prend le relais en parsant les logs log-debug pour émettre les checkpoints
+# dhcp_request_* (cf. /api/internal/dnsmasq-event).
+dhcp-script=/usr/local/bin/dhcp-hook.sh
+
+${PROXY_DHCP_BLOCK}

@@ -1,0 +1,8 @@
+/* Canonical stylesheet: shared palette, application shell and PXE workflows. */
+@import "tailwindcss";
+@import "./tokens.css";
+@import "./components.css";
+@import "./legacy-components.css";
+@import "./base.css";
+@import "./shell.css";
+@import "./console.css";

@@ -1,0 +1,53 @@
+name: Publish corresponding source offer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pxe-apt-publication
+  cancel-in-progress: false
+
+jobs:
+  publish-sources:
+    if: github.ref == 'refs/heads/main' && github.ref_protected
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download the fixed source-only release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-offer"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/sources-2026-11-12" > "$RUNNER_TEMP/source-release.json"
+          files=(README.md relink-helpers.sh pxe-tools-static-helper-sources.tar pxe-tools-static-helper-relink-materials.tar.gz SHA256SUMS)
+          for file in "${files[@]}"; do
+            gh release download sources-2026-11-12 --repo "$GITHUB_REPOSITORY" \
+              --pattern "$file" --dir "$RUNNER_TEMP/source-offer"
+          done
+      - name: Verify pinned offer without R2 credentials
+        env:
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+        run: |
+          python3 packaging/ci/publish-source-offer.py "$RUNNER_TEMP/source-offer" \
+            "$RUNNER_TEMP/source-release.json" --endpoint "$R2_ENDPOINT" --verify-only
+      - name: Publish and verify source objects only
+        env:
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          python3 packaging/ci/publish-source-offer.py "$RUNNER_TEMP/source-offer" \
+            "$RUNNER_TEMP/source-release.json" --endpoint "$R2_ENDPOINT"

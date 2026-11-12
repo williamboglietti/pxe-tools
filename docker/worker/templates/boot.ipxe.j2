@@ -1,0 +1,58 @@
+#!ipxe
+# {{ ansible_managed }}
+# Spec H — Script iPXE chainloadé depuis pxelinux (BIOS) ou GRUB EFI (UEFI).
+#
+# iPXE charge ce script via HTTP (rapide vs TFTP). Pour chaque distro/version
+# enabled+downloaded dans os_images, on propose un menuentry. L'admin sélectionne
+# au boot — kernel/initrd ensuite téléchargés en HTTP natif.
+#
+# Variables iPXE auto-fournies :
+#   ${net0/mac}   = MAC du premier NIC
+#   ${ip}         = IP attribuée par DHCP
+#   ${buildarch}  = i386, x86_64, arm32, arm64
+
+set orch_ip {{ pxe_ip }}
+set base http://${orch_ip}/netboot
+
+# Spec D : mapping buildarch iPXE (i386/x86_64/arm32/arm64) → arch Debian
+# (i386/amd64/armhf/arm64). Sert à servir le bon kernel/initrd selon le
+# firmware (UEFI x86_64 vs UEFI ARM64).
+set arch {{ pxe_default_arch }}
+iseq ${buildarch} arm64 && set arch arm64 ||
+iseq ${buildarch} x86_64 && set arch amd64 ||
+iseq ${buildarch} i386 && set arch i386 ||
+
+:menu
+menu PXE Tools — Sélection du système à installer
+{% for version in pxe_debian_versions %}
+item debian-{{ version }} Debian {{ version }} — installation automatique
+{% endfor %}
+item rescue Mode récupération (Debian {{ pxe_debian_default_version }})
+item shell Console iPXE (debug)
+item exit Quitter (boot disque local)
+choose --default debian-{{ pxe_debian_default_version }} --timeout 30000 selected || goto exit
+goto ${selected}
+
+{% for version in pxe_debian_versions %}
+:debian-{{ version }}
+echo Démarrage de l'installation Debian {{ version }}...
+kernel ${base}/{{ version }}/${arch}/linux {{ pxe_kernel_opts }} auto=true priority=critical url=http://${orch_ip}/preseed.php?mac=${net0/mac} interface=auto netcfg/dhcp_timeout=30 BOOTIF=01-${net0/mac}
+initrd ${base}/{{ version }}/${arch}/initrd.gz
+initrd --name firmware ${base}/{{ version }}/${arch}/firmware.cpio.gz
+boot || goto menu
+
+{% endfor %}
+:rescue
+echo Démarrage en mode récupération Debian {{ pxe_debian_default_version }}...
+kernel ${base}/{{ pxe_debian_default_version }}/${arch}/linux {{ pxe_kernel_opts }} rescue/enable=true
+initrd ${base}/{{ pxe_debian_default_version }}/${arch}/initrd.gz
+initrd --name firmware ${base}/{{ pxe_debian_default_version }}/${arch}/firmware.cpio.gz
+boot || goto menu
+
+:shell
+echo Console iPXE — tapez "exit" pour revenir au menu, "reboot" pour relancer.
+shell
+goto menu
+
+:exit
+exit

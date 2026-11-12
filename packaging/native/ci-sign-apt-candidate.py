@@ -32,6 +32,9 @@ def main() -> None:
     parser.add_argument('--valid-days', type=int, default=7)
     parser.add_argument('--previous', type=Path, help='previous signed snapshot to retain')
     parser.add_argument('--public-key-output', type=Path, help='new path for the exported public key only')
+    parser.add_argument('--source-commit')
+    parser.add_argument('--build-run-id')
+    parser.add_argument('--approved-package-sha256')
     args = parser.parse_args()
     primary = args.primary_fingerprint.upper()
     signing = args.signing_fingerprint.upper()
@@ -85,6 +88,12 @@ def main() -> None:
                           '--valid-days', str(args.valid_days), '--passphrase-file', str(password_file)]
             if args.previous is not None:
                 build_args += ['--previous', str(args.previous)]
+            provenance = (args.source_commit, args.build_run_id, args.approved_package_sha256)
+            if any(value is not None for value in provenance):
+                if not all(value is not None for value in provenance):
+                    raise ValueError('complete build provenance is required')
+                build_args += ['--source-commit', args.source_commit, '--build-run-id', args.build_run_id,
+                               '--approved-package-sha256', args.approved_package_sha256]
             run(build_args)
             release = args.destination / 'dists/stable/InRelease'
             status = run(common + ['--status-fd', '1', '--verify', str(release)]).decode('utf-8')

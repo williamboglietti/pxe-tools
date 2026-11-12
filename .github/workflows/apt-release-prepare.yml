@@ -1,27 +1,16 @@
-name: APT release preparation
+name: Publish signed APT repository
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Published product release tag
-        required: true
-        type: string
-      package_asset:
-        description: Exact amd64 Debian package asset name
-        required: true
-        type: string
-      previous_run:
-        description: Previous successful preparation run ID (empty for a first candidate)
-        required: false
-        type: string
+  schedule:
+    - cron: '17 3 */2 * *'
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: apt-release-preparation
+  group: pxe-apt-publication
   cancel-in-progress: false
 
 jobs:
@@ -30,75 +19,162 @@ jobs:
     environment: production
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.release_tag }}
-      PACKAGE_ASSET: ${{ inputs.package_asset }}
-      PREVIOUS_RUN: ${{ inputs.previous_run }}
-      PRIMARY_FINGERPRINT: CD8B4493876B4FBD1009FE2DB195E5DE026807EC
-      SIGNING_FINGERPRINT: 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+    outputs:
+      ready: ${{ steps.manifest.outputs.ready }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y apt-utils dpkg-dev gnupg python3
-          npm ci --prefix packaging/cloudflare
-      - name: Retrieve and verify published release asset
+      - name: Detect approved release
+        id: manifest
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
-          [[ "$PACKAGE_ASSET" =~ ^pxe-tools_[A-Za-z0-9.+~_-]+_amd64\.deb$ ]]
-          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/candidate"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$PACKAGE_ASSET" --dir "$RUNNER_TEMP/package"
-          python3 packaging/native/verify-release-asset.py --release-json "$RUNNER_TEMP/release.json" \
-            --tag "$RELEASE_TAG" --asset "$RUNNER_TEMP/package/$PACKAGE_ASSET"
-      - name: Retrieve previous preparation when requested
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "$PREVIOUS_RUN" ]]; then
-            [[ "$PREVIOUS_RUN" =~ ^[0-9]+$ ]]
-            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREVIOUS_RUN" | jq -e \
-              '.path == ".github/workflows/apt-release-prepare.yml" and .head_branch == "main" and .event == "workflow_dispatch" and .conclusion == "success"' > /dev/null
-            gh run download "$PREVIOUS_RUN" --repo "$GITHUB_REPOSITORY" --name pxe-apt-snapshot --dir "$RUNNER_TEMP/previous"
-            test -d "$RUNNER_TEMP/previous/snapshot"
+          if [[ ! -f packaging/ci/release-manifest.json ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+              echo 'No approved release configured; no renewal necessary.'
+              printf 'ready=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo 'No approved release manifest is present.' >&2
+            exit 1
           fi
-      - name: Sign candidate using the existing CI subkey
+          printf 'ready=true\n' >> "$GITHUB_OUTPUT"
+      - name: Install repository verification tools
+        if: steps.manifest.outputs.ready == 'true'
+        run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg gpgv python3
+      - name: Test signing, R2 safety and source offer using fixtures
+        if: steps.manifest.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+          PXE_CI_SIGNING_FIXTURE=1 bash tests/integration/test_ci_signing_candidate.sh
+          PXE_R2_PUBLISH_FIXTURE=1 python3 tests/integration/test_r2_publish.py
+      - name: Retrieve the approved immutable package
+        if: steps.manifest.outputs.ready == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          manifest=packaging/ci/release-manifest.json
+          version=$(jq -er '.version | select(type == "string")' "$manifest")
+          tag=$(jq -er '.release_tag | select(type == "string")' "$manifest")
+          source=$(jq -er '.source_commit | select(type == "string")' "$manifest")
+          run_id=$(jq -er '.build_run_id | select(type == "string")' "$manifest")
+          asset=$(jq -er '.package_asset | select(type == "string")' "$manifest")
+          [[ "$version" =~ ^[0-9][A-Za-z0-9.+~_-]{0,100}$ ]]
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          [[ "$source" =~ ^[0-9a-f]{40}$ && "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$asset" =~ ^pxe-tools_[A-Za-z0-9._-]+_amd64\.deb$ ]]
+          tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          git merge-base --is-ancestor "$source" "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/candidate"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/build-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" > "$RUNNER_TEMP/build-jobs.json"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/package"
+          python3 packaging/ci/verify-approved-release.py --manifest "$manifest" \
+            --release-json "$RUNNER_TEMP/release.json" --build-json "$RUNNER_TEMP/build-run.json" \
+            --build-jobs-json "$RUNNER_TEMP/build-jobs.json" \
+            --package "$RUNNER_TEMP/package/$asset" --version-file packaging/ci/release-version.txt \
+            --tag-commit "$tag_commit"
+          # First publication must compare exact bytes to the CI build. Once
+          # GitHub's temporary artifact expires, renew only if the existing
+          # public InRelease cryptographically proves this same build/package.
+          mkdir -p "$RUNNER_TEMP/build-artifact"
+          if gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name pxe-debian-package --dir "$RUNNER_TEMP/build-artifact"; then
+            test "$(cat "$RUNNER_TEMP/build-artifact/source-commit.txt")" = "$source"
+            cmp "$RUNNER_TEMP/package/$asset" "$RUNNER_TEMP/build-artifact/$asset"
+            test "$(cat "$RUNNER_TEMP/build-artifact/package.sha256")" = "$(jq -er '.package_sha256' "$manifest")"
+          else
+            curl --proto '=https' --silent --show-error --fail --max-time 60 --user-agent 'curl/8.14.1' \
+              https://packages.pxetools.com/apt/dists/stable/InRelease --output "$RUNNER_TEMP/prior-InRelease"
+            python3 packaging/ci/verify-published-provenance.py \
+              --inrelease "$RUNNER_TEMP/prior-InRelease" --keyring packaging/ci/pxe-tools-public.gpg \
+              --manifest "$manifest" --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
+              --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+          fi
+          printf '%s\n' "$asset" > "$RUNNER_TEMP/package-asset.txt"
+      - name: Sign and verify the approved package
+        if: steps.manifest.outputs.ready == 'true'
         shell: bash
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
           APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
         run: |
           set -euo pipefail
-          args=()
-          if [[ -n "$PREVIOUS_RUN" ]]; then
-            args+=(--previous "$RUNNER_TEMP/previous/snapshot")
-          fi
+          asset=$(cat "$RUNNER_TEMP/package-asset.txt")
+          source=$(jq -er '.source_commit' packaging/ci/release-manifest.json)
+          run_id=$(jq -er '.build_run_id' packaging/ci/release-manifest.json)
+          sha=$(jq -er '.package_sha256' packaging/ci/release-manifest.json)
           python3 packaging/native/ci-sign-apt-candidate.py \
-            "$RUNNER_TEMP/package/$PACKAGE_ASSET" "$RUNNER_TEMP/candidate/snapshot" \
-            --primary-fingerprint "$PRIMARY_FINGERPRINT" --signing-fingerprint "$SIGNING_FINGERPRINT" \
-            --public-key-output "$RUNNER_TEMP/candidate/public.gpg" "${args[@]}"
-      - name: Validate static assets and rehearse Cloudflare deployment
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 packaging/native/prepare-static-apt.py "$RUNNER_TEMP/candidate/snapshot" "$RUNNER_TEMP/static-assets" \
-            --keyring "$RUNNER_TEMP/candidate/public.gpg" --primary-fingerprint "$PRIMARY_FINGERPRINT" \
-            --signing-fingerprint "$SIGNING_FINGERPRINT"
-          packaging/cloudflare/node_modules/.bin/wrangler deploy --config packaging/cloudflare/wrangler.jsonc \
-            --assets "$RUNNER_TEMP/static-assets" --dry-run
-      - name: Retain signed preparation temporarily
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+            "$RUNNER_TEMP/package/$asset" "$RUNNER_TEMP/candidate/snapshot" \
+            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
+            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB \
+            --source-commit "$source" --build-run-id "$run_id" --approved-package-sha256 "$sha" \
+            --public-key-output "$RUNNER_TEMP/candidate/public.gpg"
+      - name: Retain signed snapshot for publication
+        if: steps.manifest.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pxe-apt-snapshot
           path: ${{ runner.temp }}/candidate/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 30
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pxe-apt-snapshot
+          path: ${{ runner.temp }}/candidate
+      - name: Retrieve the pinned corresponding-source offer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-offer"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/sources-2026-11-12" > "$RUNNER_TEMP/source-release.json"
+          files=(README.md relink-helpers.sh pxe-tools-static-helper-sources.tar pxe-tools-static-helper-relink-materials.tar.gz SHA256SUMS)
+          for file in "${files[@]}"; do
+            gh release download sources-2026-11-12 --repo "$GITHUB_REPOSITORY" --pattern "$file" --dir "$RUNNER_TEMP/source-offer"
+          done
+          python3 packaging/ci/publish-source-offer.py "$RUNNER_TEMP/source-offer" \
+            "$RUNNER_TEMP/source-release.json" --endpoint "$R2_ENDPOINT" --verify-only
+      - name: Publish immutable objects and commit InRelease last
+        shell: bash
+        env:
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+          version=$(jq -er '.version | select(type == "string")' packaging/ci/release-manifest.json)
+          sha=$(jq -er '.package_sha256 | select(type == "string")' packaging/ci/release-manifest.json)
+          source=$(jq -er '.source_commit | select(type == "string")' packaging/ci/release-manifest.json)
+          run_id=$(jq -er '.build_run_id | select(type == "string")' packaging/ci/release-manifest.json)
+          [[ "$version" =~ ^[0-9][A-Za-z0-9.+~_-]{0,100}$ && "$sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$source" =~ ^[0-9a-f]{40}$ && "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          python3 packaging/ci/publish-r2-snapshot.py "$RUNNER_TEMP/candidate/snapshot" \
+            packaging/ci/pxe-tools-public.gpg --sources-dir "$RUNNER_TEMP/source-offer" \
+            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
+            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB \
+            --expected-version "$version" --expected-sha256 "$sha" \
+            --source-commit "$source" --build-run-id "$run_id" --endpoint "$R2_ENDPOINT"

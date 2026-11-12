@@ -1,0 +1,22 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PXE Tools">
+  <!-- Favicon PXE Tools : « boot depuis le reseau ». Squircle bleu (charte
+       Apple-HIG du projet) + fleche de demarrage montant d'une ligne de noeuds
+       reseau. (Pas de double-tiret ni d'accents ici : commentaire XML strict.) -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f95f5"/>
+      <stop offset="1" stop-color="#0066d6"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <!-- réseau : 3 nœuds reliés -->
+  <g fill="#fff">
+    <circle cx="19" cy="49" r="3.6"/>
+    <circle cx="32" cy="49" r="3.6"/>
+    <circle cx="45" cy="49" r="3.6"/>
+  </g>
+  <path d="M19 49 H45" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+  <!-- boot : flèche montante -->
+  <path d="M32 42 V17 M22 27 L32 16 L42 27" fill="none" stroke="#fff"
+        stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

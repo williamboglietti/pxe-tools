@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Config "early" embarquée dans grubx64.efi via grub-mkimage -c
+# Charge la config dynamique générée par grub.php (qui détecte la MAC du
+# client et renvoie soit une config tailored, soit chainload sur grub.cfg).
+#
+# Spec D — On forwarde aussi l'arch native du binaire GRUB (${grub_cpu}) à
+# grub.php via query string. Le binaire grubnetx64.efi est compilé pour
+# x86_64-efi → ${grub_cpu}=x86_64. Idem grubnetaa64.efi → arm64. Cela permet
+# à grub.php de servir le bon kernel /netboot/<distro>/<arch>/ DÈS le
+# premier boot (machine inconnue), sans dépendre d'un default_arch global
+# en settings DB.
+
+set net_default_server={{ pxe_ip }}
+configfile (http,{{ pxe_ip }})/grub.php?mac=${net_default_mac}&arch=${grub_cpu}

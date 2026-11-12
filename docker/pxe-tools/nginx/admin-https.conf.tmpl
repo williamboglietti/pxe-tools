@@ -1,0 +1,48 @@
+# UI admin — HTTPS listener sur ${ADMIN_PORT} si https_enabled='on'.
+# Variables substituées au boot par /opt/pxe-tools/init/render-nginx-conf.sh :
+#   ${ADMIN_PORT}      port HTTPS admin (default 8443)
+#
+# Quand HTTPS est désactivé, render-nginx-conf.sh retire cette configuration.
+
+server {
+    listen ${ADMIN_PORT} ssl default_server;
+    listen [::]:${ADMIN_PORT} ssl default_server;
+    server_name _;
+    root /app/public;
+    index index.php;
+
+    ssl_certificate     /var/lib/pxe-tools/tls/cert.pem;
+    ssl_certificate_key /var/lib/pxe-tools/tls/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/admin-access.log main;
+    error_log  /var/log/nginx/admin-error.log;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    location ~ /\. { deny all; }
+    location ~ ^/(src|db|worker\.py|README\.md)(/|$) { deny all; }
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_read_timeout 60s;
+    }
+
+    location ~* \.(css|js|png|jpg|svg|woff2?)$ {
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+}

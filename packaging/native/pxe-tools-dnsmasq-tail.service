@@ -1,0 +1,9 @@
+[Unit]
+Description=PXE Tools DHCP and TFTP event watcher
+Requires=pxe-tools-dnsmasq.service pxe-tools-nginx.service
+After=pxe-tools-dnsmasq.service pxe-tools-nginx.service
+[Service]
+Type=simple
+EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+ExecStart=/bin/sh /opt/pxe-tools/native/dnsmasq-tail.sh
+Restart=on-failure

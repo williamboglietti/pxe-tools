@@ -1,0 +1,1374 @@
+#!/bin/sh
+# Discovery boot script — exécuté par early_command du discovery preseed
+# Debian d-i. Collecte hardware via sysfs + binaires static (dmidecode,
+# smartctl) téléchargés depuis le serveur PXE. POST l'inventaire à l'API
+# puis poll /api/discovery-action pour décider poweroff/reboot/wait.
+#
+# IMPORTANT : tourne dans busybox ash de l'installateur Debian. Pas de
+# bashisms, tout en POSIX. Pas d'apt/apk dispo : tout outil doit être
+# soit dans busybox, soit téléchargé en static depuis /static-bin/.
+# Chaque étape ping le serveur (?phase=X) pour traçabilité dans nginx
+# access.log + le terminal d'événements de la machine.
+
+ORCH_IP="{{ pxe_ip }}"
+API="http://$ORCH_IP/api/discovery"
+STATIC_BIN_BASE="http://$ORCH_IP/static-bin"
+
+# ping_phase : envoie un GET vers l'API avec ?phase=X pour tracer la progression
+# dans nginx access.log. Silencieux, ne fait jamais échouer le script.
+ping_phase() {
+    wget -q -O /dev/null "$API?phase=$1&mac=${2:-unknown}" 2>/dev/null || true
+}
+
+ping_phase "loaded" "?"
+
+# ---- MAC de l'interface principale ------------------------------------------
+# Source de vérité : BOOTIF=01-aa-bb-cc-dd-ee-ff dans /proc/cmdline (passé par
+# grub.php via la kernel cmdline). C'est la MAC vue par le firmware PXE — donc
+# la MEME que celle stubbée par grub.php côté DB. Sans ça, sur multi-NIC, le
+# kernel peut élire une autre interface comme route default et on POSTerait
+# /api/discovery avec un MAC ≠ stub → doublon dans la table machines.
+MAC=""
+MAIN_IF=""
+BOOTIF_RAW=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null | grep '^BOOTIF=' | head -1 | cut -d= -f2)
+if [ -n "$BOOTIF_RAW" ]; then
+    # Format PXELINUX : 01-aa-bb-cc-dd-ee-ff (préfixe 01 = type Ethernet, séparateurs '-')
+    BOOTIF_MAC=$(echo "$BOOTIF_RAW" | sed 's/^01[-:]//' | tr '-' ':' | tr 'A-Z' 'a-z')
+    case "$BOOTIF_MAC" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f])
+            MAC="$BOOTIF_MAC"
+            # Trouve l'iface locale qui porte cette MAC (utile pour speed/etc.)
+            for iface in $(ls /sys/class/net/ 2>/dev/null); do
+                [ "$iface" = "lo" ] && continue
+                a=$(cat /sys/class/net/"$iface"/address 2>/dev/null | tr 'A-Z' 'a-z')
+                if [ "$a" = "$MAC" ]; then
+                    MAIN_IF="$iface"
+                    break
+                fi
+            done
+            ;;
+    esac
+fi
+
+# Fallback 1 : interface de la route par défaut (pré-fix historique)
+if [ -z "$MAIN_IF" ]; then
+    MAIN_IF=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+fi
+# Fallback 2 : première interface non-lo (dernier recours, ordre indéterministe)
+if [ -z "$MAIN_IF" ]; then
+    MAIN_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$' | head -1)
+fi
+[ -z "$MAC" ] && MAC=$(cat /sys/class/net/"$MAIN_IF"/address 2>/dev/null)
+[ -z "$MAC" ] && MAC="00:00:00:00:00:00"
+
+ping_phase "mac_${BOOTIF_RAW:+bootif}${BOOTIF_RAW:-fallback}" "$MAC"
+
+echo "Discovery: interface=$MAIN_IF mac=$MAC"
+
+# ---- Hardware via sysfs (dmidecode pas dispo en d-i) -----------------------
+# /sys/class/dmi/id/ expose tous les champs DMI sans avoir besoin de dmidecode.
+read_dmi() {
+    f="/sys/class/dmi/id/$1"
+    [ -r "$f" ] || { echo "n/a"; return; }
+    out=$(cat "$f" 2>/dev/null | head -1 | tr -d '\r')
+    [ -z "$out" ] && out="n/a"
+    # échappe " et \ pour le JSON
+    echo "$out" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+VENDOR=$(read_dmi sys_vendor)
+PRODUCT=$(read_dmi product_name)
+SERIAL=$(read_dmi product_serial)
+BIOS_VENDOR=$(read_dmi bios_vendor)
+BIOS_VERSION=$(read_dmi bios_version)
+BOARD_VENDOR=$(read_dmi board_vendor)
+BOARD_NAME=$(read_dmi board_name)
+
+# dmidecode static — utilisé ensuite pour fréquences CPU (SMBIOS Type 4)
+# et modules mémoire (Type 17). dmidecode n'est pas dans Debian d-i busybox,
+# on le télécharge depuis /static-bin/ (pattern identique à smartctl/badblocks
+# pour disktest.sh). Si le binaire n'est pas servi (404) ou échoue à exécuter,
+# DMIDECODE reste vide et on tombe sur les fallbacks sysfs.
+DMIDECODE=""
+if wget -q -O /tmp/dmidecode "$STATIC_BIN_BASE/dmidecode" 2>/dev/null; then
+    chmod +x /tmp/dmidecode 2>/dev/null
+    if /tmp/dmidecode --version >/dev/null 2>&1; then
+        DMIDECODE=/tmp/dmidecode
+    fi
+fi
+ping_phase "dmidecode_${DMIDECODE:+ok}${DMIDECODE:-na}" "$MAC"
+
+CPU_MODEL=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g')
+[ -z "$CPU_MODEL" ] && CPU_MODEL="n/a"
+CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+[ -z "$CPU_CORES" ] && CPU_CORES=0
+
+# Sockets physiques réellement présents. Les tables SMBIOS peuvent contenir
+# des emplacements vides : compter tous les blocs Type 4 surestime le matériel.
+CPU_SOCKETS=""
+CPU_SOCKETS=$(for pkg in /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id; do
+    [ -r "$pkg" ] && cat "$pkg"
+done | awk '/^[0-9]+$/' | sort -u | wc -l | tr -d ' ')
+case "$CPU_SOCKETS" in ''|0|*[!0-9]*) CPU_SOCKETS="" ;; esac
+if [ -z "$CPU_SOCKETS" ]; then
+    CPU_SOCKETS=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2); print $2; exit}')
+fi
+case "$CPU_SOCKETS" in ''|0|*[!0-9]*) CPU_SOCKETS="" ;; esac
+if [ -z "$CPU_SOCKETS" ] && [ -n "$DMIDECODE" ]; then
+    CPU_SOCKETS=$("$DMIDECODE" -t processor 2>/dev/null | grep -c 'Status: Populated')
+fi
+case "$CPU_SOCKETS" in ''|*[!0-9]*) CPU_SOCKETS=0 ;; esac
+
+# Fréquences CPU (max nominal + current). dmidecode Type 4 prioritaire car
+# stable et indépendant du gouverneur cpufreq. Fallback sysfs cpufreq +
+# /proc/cpuinfo "cpu MHz". Multi-socket : on prend le 1er processeur listé.
+CPU_MAX_MHZ=null
+CPU_CURRENT_MHZ=null
+if [ -n "$DMIDECODE" ]; then
+    cpu_speeds=$("$DMIDECODE" -t processor 2>/dev/null | awk '
+        /^Processor Information$/ { in_p = 1; max = ""; cur = ""; next }
+        in_p && /^[A-Z]/ {
+            if (max != "" || cur != "") { print max "|" cur; exit }
+            in_p = 0; next
+        }
+        in_p && /Max Speed:/ {
+            line = $0
+            sub(/^[^:]*:[ \t]+/, "", line)
+            sub(/[ \t]*MHz.*/, "", line)
+            max = line; next
+        }
+        in_p && /Current Speed:/ {
+            line = $0
+            sub(/^[^:]*:[ \t]+/, "", line)
+            sub(/[ \t]*MHz.*/, "", line)
+            cur = line; next
+        }
+        END { if (in_p && (max != "" || cur != "")) print max "|" cur }
+    ')
+    if [ -n "$cpu_speeds" ]; then
+        m=${cpu_speeds%%|*}
+        c=${cpu_speeds##*|}
+        case "$m" in ''|*[!0-9]*) ;; *) CPU_MAX_MHZ=$m ;; esac
+        case "$c" in ''|*[!0-9]*) ;; *) CPU_CURRENT_MHZ=$c ;; esac
+    fi
+fi
+# Fallback sysfs cpufreq (KHz → MHz) si dmidecode n'a rien donné
+if [ "$CPU_MAX_MHZ" = "null" ]; then
+    cf=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
+    case "$cf" in ''|*[!0-9]*) ;; *) [ "$cf" -gt 0 ] 2>/dev/null && CPU_MAX_MHZ=$((cf / 1000)) ;; esac
+fi
+if [ "$CPU_CURRENT_MHZ" = "null" ]; then
+    cm=$(awk -F': ' '/^cpu MHz/{print int($2); exit}' /proc/cpuinfo 2>/dev/null)
+    case "$cm" in ''|*[!0-9]*) ;; *) [ "$cm" -gt 0 ] 2>/dev/null && CPU_CURRENT_MHZ=$cm ;; esac
+fi
+MEMORY_KB=$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null)
+[ -z "$MEMORY_KB" ] && MEMORY_KB=0
+KERNEL=$(uname -r 2>/dev/null)
+[ -z "$KERNEL" ] && KERNEL="n/a"
+# Spec D : architecture matériel (x86_64, aarch64, armv7l, ...) — utilisé par
+# preseed.php pour servir le bon kernel/initrd /netboot/<version>/<arch>/.
+CPU_ARCH=$(uname -m 2>/dev/null)
+[ -z "$CPU_ARCH" ] && CPU_ARCH="n/a"
+BOOT_MODE="BIOS"
+[ -d /sys/firmware/efi ] && BOOT_MODE="UEFI"
+
+# CPU virt support : vmx (Intel VT-x) ou svm (AMD-V), null sinon
+CPU_VIRT="null"
+if grep -qE '^flags.*\bvmx\b' /proc/cpuinfo 2>/dev/null; then
+    CPU_VIRT='"vmx"'
+elif grep -qE '^flags.*\bsvm\b' /proc/cpuinfo 2>/dev/null; then
+    CPU_VIRT='"svm"'
+fi
+
+# TPM : présent ? quelle version ? (tpm_version_major retourne 1 ou 2)
+TPM_PRESENT="false"
+TPM_VERSION="null"
+if [ -d /sys/class/tpm/tpm0 ]; then
+    TPM_PRESENT="true"
+    v=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)
+    [ -n "$v" ] && TPM_VERSION="$v"
+fi
+
+# Secure Boot : lit /sys/firmware/efi/efivars/SecureBoot-* (5e octet = 0/1)
+# Format efivar : 4 octets attributes + N octets data. Pour SecureBoot, data = 1 octet.
+SECURE_BOOT="null"
+if [ "$BOOT_MODE" = "UEFI" ]; then
+    sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+    if [ -n "$sb_file" ] && [ -r "$sb_file" ]; then
+        # od retourne les octets ; on prend le 5e (index 4 après les 4 octets attributes)
+        sb_byte=$(od -An -t u1 "$sb_file" 2>/dev/null | awk '{print $5; exit}')
+        case "$sb_byte" in
+            1) SECURE_BOOT="true" ;;
+            0) SECURE_BOOT="false" ;;
+        esac
+    fi
+fi
+
+ping_phase "hw_done" "$MAC"
+
+# ---- Modules mémoire via dmidecode (SMBIOS Type 17) ------------------------
+# DMIDECODE est le binaire static téléchargé en haut. Si vide (download
+# échoué), MEMORY_JSON reste vide et l'UI affichera juste la taille totale
+# via /proc/meminfo (spec-card RAM existante).
+MEMORY_JSON=""
+if [ -n "$DMIDECODE" ]; then
+    # Parse `dmidecode -t memory` (Type 17 Memory Device). awk en une passe :
+    # détecte les blocs "Memory Device", extrait les champs tab-indentés,
+    # skip les slots vides ("No Module Installed" / "Unknown"), émet un JSON
+    # array fragment par module avec size en MB + speeds numériques.
+    MEMORY_JSON=$("$DMIDECODE" -t memory 2>/dev/null | awk '
+        function escape(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+        function num(s,   m, n) {
+            n = 0
+            if (match(s, /[0-9]+/)) n = substr(s, RSTART, RLENGTH) + 0
+            return n
+        }
+        function emit() {
+            if (size == "" || size == "No Module Installed" || size == "Unknown") return
+            size_mb = 0
+            if (size ~ /GB|GiB/) size_mb = num(size) * 1024
+            else if (size ~ /MB|MiB/) size_mb = num(size)
+            speed_n  = num(speed);    if (speed_n  == 0) speed_n  = "null"
+            cspeed_n = num(cfgspeed); if (cspeed_n == 0) cspeed_n = "null"
+            if (!first) printf ",\n"
+            first = 0
+            printf "    {\"locator\":\"%s\",\"size_mb\":%d,\"type\":\"%s\",\"form_factor\":\"%s\",\"speed_mts\":%s,\"configured_speed_mts\":%s,\"manufacturer\":\"%s\",\"part_number\":\"%s\",\"serial\":\"%s\"}",
+                escape(locator), size_mb, escape(type), escape(form),
+                speed_n, cspeed_n, escape(manuf), escape(partnum), escape(serial)
+        }
+        BEGIN { in_dev = 0; first = 1 }
+        /^Memory Device$/ {
+            in_dev = 1
+            size = ""; type = ""; speed = ""; form = ""; locator = ""
+            manuf = ""; partnum = ""; serial = ""; cfgspeed = ""
+            next
+        }
+        in_dev && /^[A-Z]/ { emit(); in_dev = 0 }
+        in_dev && /^\t/ {
+            line = $0
+            sub(/^\t+/, "", line)
+            sub(/^[ \t]+/, "", line)
+            n = index(line, ":")
+            if (n == 0) next
+            k = substr(line, 1, n - 1)
+            v = substr(line, n + 1)
+            sub(/^[ \t]+/, "", v)
+            sub(/[ \t]+$/, "", v)
+            if (k == "Size")                       size = v
+            else if (k == "Type")                  type = v
+            else if (k == "Speed")                 speed = v
+            else if (k == "Form Factor")           form = v
+            else if (k == "Locator")               locator = v
+            else if (k == "Manufacturer")          manuf = v
+            else if (k == "Part Number")           partnum = v
+            else if (k == "Serial Number")         serial = v
+            else if (k == "Configured Memory Speed") cfgspeed = v
+        }
+        END { if (in_dev) emit() }
+    ')
+fi
+ping_phase "memory_done" "$MAC"
+
+# ---- Diagnostic /sys/block (drivers Alpine SATA/NVMe baked-in) -------------
+# L'image discovery Alpine embarque les drivers SATA/NVMe dans son initramfs,
+# donc /sys/block est peuplé dès le boot (pas de udev wait nécessaire).
+# Le ping blockdevs reste pour traçabilité dans nginx access.log.
+
+BLK_LIST=""
+for blk in /sys/block/*; do
+    [ -e "$blk" ] || continue
+    n=$(basename "$blk")
+    sz=$(cat "$blk/size" 2>/dev/null)
+    BLK_LIST="$BLK_LIST$n=${sz:-?},"
+done
+[ -z "$BLK_LIST" ] && BLK_LIST="empty"
+ping_phase "blockdevs_$BLK_LIST" "$MAC"
+
+# ---- smartctl static : best-effort fetch -----------------------------------
+# Si le binaire est servi par le serveur PXE, on l'utilise pour collecter
+# verdict + attributs SMART. Sinon, fallback sysfs (mode='sysfs', verdict='unknown').
+SMARTCTL=""
+if wget -q -O /tmp/smartctl "$STATIC_BIN_BASE/smartctl" 2>/dev/null; then
+    chmod +x /tmp/smartctl 2>/dev/null
+    if /tmp/smartctl --version >/dev/null 2>&1; then
+        SMARTCTL=/tmp/smartctl
+    fi
+fi
+ping_phase "smartctl_${SMARTCTL:+ok}${SMARTCTL:-na}" "$MAC"
+
+# Helpers SMART : extraient un attribut SATA par ID depuis `smartctl -A`
+# (sortie texte stable). Retourne "" si non trouvé. Pour NVMe, on lit les
+# lignes "key: value" du health log.
+smart_sata_attr() {
+    # $1=device $2=attr_id (ex: 9 pour Power_On_Hours)
+    "$SMARTCTL" -A "$1" 2>/dev/null \
+        | awk -v id="$2" '$1 == id { print $10; exit }'
+}
+smart_nvme_kv() {
+    # $1=device $2=label (ex: "Power On Hours")
+    "$SMARTCTL" -A "$1" 2>/dev/null \
+        | awk -v lbl="$2" 'BEGIN{IGNORECASE=1}
+            { line=$0 }
+            tolower(line) ~ tolower(lbl) ":" {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                gsub(/[,[:space:]]+/, " ", line)
+                # Garde la 1ère occurrence numérique
+                n=split(line,a," ")
+                for (i=1;i<=n;i++) if (a[i] ~ /^[0-9]+$/) { print a[i]; exit }
+                exit
+            }'
+}
+
+# ---- BEGIN MEDIA METADATA COLLECTORS --------------------------------------
+# Seulement sysfs et blkid -p : ne monte aucun FS et ne modifie aucune zone MMC.
+# Les racines peuvent être remplacées par les fixtures, sans matériel réel.
+MEDIA_SYS_ROOT=${PXE_DISCOVERY_SYS_ROOT:-/sys}
+MEDIA_SYS_BLOCK="$MEDIA_SYS_ROOT/block"
+media_json_escape() {
+    LC_ALL=C awk '
+        BEGIN { for (i=1; i<32; i++) controls=controls sprintf("%c", i) }
+        {
+            if (NR>1) printf "\\n"
+            for (i=1; i<=length($0); i++) {
+                c=substr($0,i,1)
+                if (c=="\\") printf "\\\\"
+                else if (c=="\"") printf "\\\""
+                else if (index(controls,c)>0) printf "\\u%04x", index(controls,c)
+                else printf "%s",c
+            }
+        }'
+}
+media_nullable_string() {
+    if [ -z "$1" ]; then printf 'null'; else
+        printf '"'; printf '%s' "$1" | media_json_escape; printf '"'
+    fi
+}
+media_sysfs_string() {
+    [ -r "$1" ] && cat "$1" 2>/dev/null
+}
+media_register() {
+    media_reg=$(media_sysfs_string "$1")
+    case "$media_reg" in ''|*[!0-9a-fA-F]*) return ;; esac
+    [ "$(printf '%s' "$media_reg" | wc -c)" -eq 32 ] && printf '%s' "$media_reg"
+}
+media_size_bytes() {
+    media_sectors=$(media_sysfs_string "$1")
+    case "$media_sectors" in ''|*[!0-9]*) printf 'null'; return ;; esac
+    media_sectors=$(printf '%s' "$media_sectors" | sed 's/^0*//')
+    media_sectors=${media_sectors:-0}
+    # sysfs `size` est toujours exprimé en secteurs de 512 octets, même 4Kn.
+    if [ "$media_sectors" -le 18014398509481983 ] 2>/dev/null; then
+        printf '%s' "$((media_sectors * 512))"
+    else printf 'null'; fi
+}
+media_timeout_available() {
+    [ -z "${MEDIA_TIMEOUT_KIND:-}" ] || return 0
+    if command -v timeout >/dev/null 2>&1; then MEDIA_TIMEOUT_KIND=native
+    elif command -v busybox >/dev/null 2>&1 && busybox timeout 1 true >/dev/null 2>&1; then MEDIA_TIMEOUT_KIND=busybox
+    elif command -v sleep >/dev/null 2>&1; then MEDIA_TIMEOUT_KIND=watchdog
+    else return 1; fi
+}
+media_timeout() {
+    media_timeout_available || return 127
+    case "$MEDIA_TIMEOUT_KIND" in
+        native) timeout "$@" ;;
+        busybox) busybox timeout "$@" ;;
+        watchdog)
+            # Le BusyBox d-i ne possède pas toujours l'applet timeout. Le timer
+            # ne garde aucun descripteur stdout ouvert après la fin du probe.
+            # Tous les PID signalés sont des enfants de ce seul sous-shell.
+            (
+                media_deadline=$1; shift
+                "$@" &
+                media_command_pid=$!
+                (
+                    media_timer_pid=""
+                    trap 'if [ -n "$media_timer_pid" ]; then kill "$media_timer_pid" 2>/dev/null; wait "$media_timer_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+                    sleep "$media_deadline" & media_timer_pid=$!
+                    wait "$media_timer_pid" || exit 0
+                    kill -TERM "$media_command_pid" 2>/dev/null || exit 0
+                    sleep 1 & media_timer_pid=$!
+                    wait "$media_timer_pid" || exit 0
+                    kill -KILL "$media_command_pid" 2>/dev/null || true
+                ) </dev/null >/dev/null 2>&1 &
+                media_watchdog_pid=$!
+                trap 'kill -TERM "$media_watchdog_pid" "$media_command_pid" 2>/dev/null; exit 143' HUP INT TERM
+                wait "$media_command_pid" 2>/dev/null
+                media_command_rc=$?
+                kill -TERM "$media_watchdog_pid" 2>/dev/null || true
+                wait "$media_watchdog_pid" 2>/dev/null || true
+                trap - HUP INT TERM
+                exit "$media_command_rc"
+            )
+            ;;
+    esac
+}
+media_export_value() {
+    printf '%s\n' "$MEDIA_PROBE_EXPORT" | awk -v key="$1" '
+        index($0,key "=")==1 { print substr($0,length(key)+2); exit }'
+}
+media_blkid_mode() {
+    [ -z "${MEDIA_BLKID_MODE+x}" ] || return
+    MEDIA_BLKID_MODE=unavailable
+    media_blkid_help=$(media_timeout 5 blkid --help 2>&1)
+    case "$media_blkid_help" in
+        *--probe*)
+            case "$media_blkid_help" in *--output*) MEDIA_BLKID_MODE=export ;; esac
+            ;;
+        *BusyBox*blkid*) MEDIA_BLKID_MODE=quoted ;;
+    esac
+}
+media_blkid_quoted_export() {
+    # BusyBox : /dev/sda: LABEL="..." UUID="..." TYPE="...".
+    # Parser de champs cités seulement ; jamais eval, jamais un scan global.
+    LC_ALL=C awk '
+        {
+            line=$0; sub(/^[^:]*:[[:space:]]*/, "", line)
+            while (length(line)>0) {
+                sub(/^[[:space:]]+/, "", line)
+                if (!match(line,/^[A-Z_0-9]+="/)) break
+                key=substr(line,1,RLENGTH-2); line=substr(line,RLENGTH+1)
+                value=""; closed=0
+                for (i=1;i<=length(line);i++) {
+                    c=substr(line,i,1)
+                    if (c=="\"") { closed=1; line=substr(line,i+1); break }
+                    if (c=="\\" && i<length(line)) {
+                        nextc=substr(line,i+1,1)
+                        if (nextc=="\\" || nextc=="\"") { c=nextc; i++ }
+                    }
+                    value=value c
+                }
+                if (!closed) break
+                if (key=="TYPE" || key=="UUID" || key=="PARTUUID" || key=="LABEL")
+                    printf "%s=%s\n", key,value
+            }
+        }'
+}
+media_probe_filesystem() {
+    MEDIA_PROBE_EXPORT=""
+    MEDIA_PROBE_STATUS="unavailable"
+    MEDIA_PROBE_JSON='{"fstype":null,"uuid":null,"partuuid":null,"label":null}'
+    media_fs=""; media_uuid=""; media_partuuid=""; media_label=""
+    if command -v blkid >/dev/null 2>&1 && media_timeout_available; then
+        media_blkid_mode
+        case "$MEDIA_BLKID_MODE" in
+            export)
+                MEDIA_PROBE_EXPORT=$(media_timeout 5 blkid -p -o export "$1" 2>/dev/null)
+                media_probe_rc=$?
+                ;;
+            quoted)
+                media_quoted_result=$(media_timeout 5 blkid "$1" 2>/dev/null)
+                media_probe_rc=$?
+                MEDIA_PROBE_EXPORT=$(printf '%s\n' "$media_quoted_result" | media_blkid_quoted_export)
+                ;;
+            *) return ;;
+        esac
+        case "$media_probe_rc" in
+            0) MEDIA_PROBE_STATUS="available" ;;
+            2) MEDIA_PROBE_STATUS="available"; MEDIA_PROBE_EXPORT="" ;;
+            *) MEDIA_PROBE_STATUS="error"; MEDIA_PROBE_EXPORT="" ;;
+        esac
+        media_fs=$(media_export_value TYPE)
+        media_uuid=$(media_export_value UUID)
+        media_partuuid=$(media_export_value PART_ENTRY_UUID)
+        [ -n "$media_partuuid" ] || media_partuuid=$(media_export_value PARTUUID)
+        media_label=$(media_export_value LABEL)
+        MEDIA_PROBE_JSON="{\"fstype\":$(media_nullable_string "$media_fs"),\"uuid\":$(media_nullable_string "$media_uuid"),\"partuuid\":$(media_nullable_string "$media_partuuid"),\"label\":$(media_nullable_string "$media_label") }"
+    fi
+}
+media_region_json() {
+    media_region_size=$(media_size_bytes "$1/size")
+    media_force_ro=$(media_sysfs_string "$1/force_ro")
+    case "$media_force_ro" in 0|1) ;; *) media_force_ro=null ;; esac
+    printf '{"name":%s,"path":%s,"parent_path":%s,"size_bytes":%s,"force_ro":%s,"protected":true}' \
+        "$(media_nullable_string "$2")" "$(media_nullable_string "/dev/$2")" \
+        "$(media_nullable_string "/dev/$3")" \
+        "$media_region_size" "$media_force_ro"
+}
+media_collect_mmc() {
+    MEDIA_MMC_JSON=null
+    MEDIA_MMC_STATUS="not_applicable"
+    case "$2" in mmcblk[0-9]*) ;; *) return ;; esac
+    media_mmc_index=${2#mmcblk}
+    case "$media_mmc_index" in ''|*[!0-9]*) return ;; esac
+    MEDIA_MMC_STATUS="unavailable"
+    media_mmc_cid=$(media_register "$1/device/cid")
+    media_mmc_csd=$(media_register "$1/device/csd")
+    [ -n "$media_mmc_cid" ] && MEDIA_MMC_STATUS="available"
+    media_mmc_regions=""
+    media_region_sep=""
+    media_regions_seen=""
+    for media_region in "$MEDIA_SYS_BLOCK/$2"boot* "$MEDIA_SYS_BLOCK/$2"gp* "$MEDIA_SYS_BLOCK/$2"rpmb; do
+        [ -e "$media_region" ] || continue
+        media_region_name=$(basename "$media_region")
+        media_region_suffix=${media_region_name#"$2"}
+        case "$media_region_suffix" in
+            boot*) media_region_index=${media_region_suffix#boot} ;;
+            gp*) media_region_index=${media_region_suffix#gp} ;;
+            rpmb) media_region_index=0 ;;
+            *) continue ;;
+        esac
+        case "$media_region_index" in ''|*[!0-9]*) continue ;; esac
+        media_region_real=$(readlink -f "$media_region" 2>/dev/null)
+        [ -z "$media_region_real" ] || media_regions_seen="$media_regions_seen|$media_region_real|"
+        media_mmc_regions="$media_mmc_regions$media_region_sep$(media_region_json "$media_region" "$media_region_name" "$2")"
+        media_region_sep=","
+    done
+    # Les noyaux récents publient RPMB comme caractère sur le bus mmc_rpmb.
+    # L'index RPMB n'est pas une preuve de parenté : contrôler le chemin sysfs.
+    media_parent_real=$(readlink -f "$1" 2>/dev/null)
+    media_card_real=$(readlink -f "$1/device" 2>/dev/null)
+    if [ -n "$media_parent_real" ]; then
+        for media_region in "$MEDIA_SYS_ROOT/bus/mmc_rpmb/devices/"* "$MEDIA_SYS_ROOT/class/rpmb/"*; do
+            [ -e "$media_region" ] || continue
+            media_region_real=$(readlink -f "$media_region" 2>/dev/null)
+            case "$media_region_real" in
+                "$media_parent_real/"*) ;;
+                *)
+                    [ -n "$media_card_real" ] || continue
+                    case "$media_region_real" in "$media_card_real/"*) ;; *) continue ;; esac
+                    ;;
+            esac
+            case "$media_regions_seen" in *"|$media_region_real|"*) continue ;; esac
+            media_region_name=$(basename "$media_region")
+            case "$media_region_name" in
+                mmcblk[0-9]*rpmb) media_char_index=${media_region_name#mmcblk}; media_char_index=${media_char_index%rpmb} ;;
+                rpmb[0-9]*) media_char_index=${media_region_name#rpmb} ;;
+                *) continue ;;
+            esac
+            case "$media_char_index" in ''|*[!0-9]*) continue ;; esac
+            [ ! -e "$MEDIA_SYS_BLOCK/$media_region_name" ] || continue
+            media_mmc_regions="$media_mmc_regions$media_region_sep$(media_region_json "$media_region" "$media_region_name" "$2")"
+            media_regions_seen="$media_regions_seen|$media_region_real|"
+            media_region_sep=","
+        done
+    fi
+    MEDIA_MMC_JSON="{\"type\":$(media_nullable_string "$(media_sysfs_string "$1/device/type")"),\"name\":$(media_nullable_string "$(media_sysfs_string "$1/device/name")"),\"cid\":$(media_nullable_string "$media_mmc_cid"),\"csd\":$(media_nullable_string "$media_mmc_csd"),\"manfid\":$(media_nullable_string "$(media_sysfs_string "$1/device/manfid")"),\"oemid\":$(media_nullable_string "$(media_sysfs_string "$1/device/oemid")"),\"date\":$(media_nullable_string "$(media_sysfs_string "$1/device/date")"),\"fwrev\":$(media_nullable_string "$(media_sysfs_string "$1/device/fwrev")"),\"life_time\":$(media_nullable_string "$(media_sysfs_string "$1/device/life_time")"),\"pre_eol_info\":$(media_nullable_string "$(media_sysfs_string "$1/device/pre_eol_info")"),\"hardware_regions\":[$media_mmc_regions]}"
+}
+media_collect_disk_metadata() {
+    media_collect_mmc "$1" "$2"
+    media_probe_filesystem "/dev/$2"
+    MEDIA_FILESYSTEM_JSON=$MEDIA_PROBE_JSON
+    MEDIA_FILESYSTEM_STATUS=$MEDIA_PROBE_STATUS
+    MEDIA_PARTITIONS_JSON=""
+    media_part_sep=""
+    for media_part in "$1/"*; do
+        [ -r "$media_part/partition" ] || continue
+        media_part_name=$(basename "$media_part")
+        case "$media_part_name" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
+        media_part_number=$(media_sysfs_string "$media_part/partition" | sed 's/^0*//')
+        case "$media_part_number" in ''|*[!0-9]*) continue ;; esac
+        media_part_size=$(media_size_bytes "$media_part/size")
+        media_probe_filesystem "/dev/$media_part_name"
+        case "$MEDIA_PROBE_STATUS" in
+            error) MEDIA_FILESYSTEM_STATUS=error ;;
+            unavailable) [ "$MEDIA_FILESYSTEM_STATUS" = error ] || MEDIA_FILESYSTEM_STATUS=unavailable ;;
+        esac
+        MEDIA_PARTITIONS_JSON="$MEDIA_PARTITIONS_JSON$media_part_sep{\"name\":$(media_nullable_string "$media_part_name"),\"path\":$(media_nullable_string "/dev/$media_part_name"),\"number\":$media_part_number,\"size_bytes\":$media_part_size,\"fstype\":$(media_nullable_string "$media_fs"),\"uuid\":$(media_nullable_string "$media_uuid"),\"partuuid\":$(media_nullable_string "$media_partuuid"),\"label\":$(media_nullable_string "$media_label") }"
+        media_part_sep=","
+    done
+}
+media_is_usb_reader() {
+    [ "$transport" = usb ] || return 1
+    media_reader_text=$(printf '%s %s' "$vendor" "$model" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    case "$media_reader_text" in
+        *sd/mmc*|*sd_mmc*|*sdmmc*|*sd\ card*|*card\ reader*|*sd\ reader*|*memory\ card*|*cf\ reader*) return 0 ;;
+    esac
+    # Une série de lecteur USB générique ne désigne pas la carte insérée.
+    [ "$(media_sysfs_string "$blk/removable")" = 1 ] || return 1
+    case "$media_reader_text" in *generic*storage*) return 0 ;; esac
+    return 1
+}
+# ---- END MEDIA METADATA COLLECTORS ----------------------------------------
+
+DISKS_JSON=""
+sep=""
+for blk in "$MEDIA_SYS_BLOCK/"*; do
+    [ -e "$blk" ] || continue
+    name=$(basename "$blk")
+    # Filtre : on garde sd*, hd*, vd*, xvd*, nvme*, mmcblk*. Skip le reste.
+    # Les zones matérielles d'une eMMC (mmcblkXbootY, mmcblkXgpY, mmcblkXrpmb)
+    # partagent le numéro de série de mmcblkX : ce ne sont pas des disques.
+    case "$name" in
+        mmcblk*boot*|mmcblk*gp*|mmcblk*rpmb) continue ;;
+        sd*|hd*|vd*|xvd*|nvme*|mmcblk*) ;;
+        *) continue ;;
+    esac
+    [ -r "$blk/size" ] || continue
+    size_bytes=$(media_size_bytes "$blk/size")
+    case "$size_bytes" in null|0) continue ;; esac
+    model=$(cat "$blk/device/model" 2>/dev/null | sed 's/[[:space:]]*$//' | media_json_escape)
+    [ -z "$model" ] && model="n/a"
+    vendor=$(cat "$blk/device/vendor" 2>/dev/null | sed 's/[[:space:]]*$//' | media_json_escape)
+    [ -z "$vendor" ] && vendor=""
+    # Transport : déduit du chemin sysfs — un lecteur USB ne publie pas le CID
+    # de sa carte SD. Sa série de pont ne constitue pas l'identité de la carte.
+    realpath=$(readlink -f "$blk" 2>/dev/null)
+    transport="unknown"
+    case "$realpath" in
+        */nvme/*|*nvme*) transport="nvme" ;;
+        */usb*) transport="usb" ;;
+        */virtio*) transport="virtio" ;;
+        */ata*) transport="sata" ;;
+        */mmc*) transport="mmc" ;;
+    esac
+    usb_reader=false
+    media_is_usb_reader && usb_reader=true
+    serial=""
+    serial_source="none"
+    # Use the same sysfs candidates as the installation disk guard. Virtio
+    # may expose its serial directly on the block device, not its parent.
+    for serial_path in "$blk/device/serial" "$blk/serial" "$blk/device/device/serial"; do
+        candidate=$(cat "$serial_path" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        candidate_check=$(printf '%s' "$candidate" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        case "$candidate_check" in ''|0|UNKNOWN|N/A|NA|NONE|NULL|DEFAULT|"NOT AVAILABLE") continue ;; esac
+        serial="$candidate"
+        serial_source="sysfs"
+        break
+    done
+    # NVMe controller serial is an ABI attribute even when the namespace's
+    # device/serial symlink is not exposed by this kernel.
+    if [ -z "$serial" ]; then
+        nvme_ctrl=$(printf '%s' "$name" | sed -n 's/^\(nvme[0-9][0-9]*\)n[0-9][0-9]*$/\1/p')
+        if [ -n "$nvme_ctrl" ]; then
+            serial=$(cat "/sys/class/nvme/$nvme_ctrl/serial" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [ -n "$serial" ] && serial_source="sysfs-nvme"
+        fi
+    fi
+    serial_check=$(printf '%s' "$serial" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    case "$serial_check" in ''|0|UNKNOWN|N/A|NA|NONE|NULL|DEFAULT|"NOT AVAILABLE") serial=""; serial_source="none" ;; esac
+    # sysfs n'expose `device/serial` que pour NVMe/virtio — pour les disques
+    # SATA/SCSI (la quasi-totalité du parc) le fichier n'existe pas. Repli :
+    # « Serial Number » de smartctl -i (binaire statique déjà téléchargé pour
+    # les attributs SMART quelques lignes plus bas).
+    if [ "$usb_reader" = false ] && [ "$transport" != mmc ] && [ -z "$serial" ] && [ -n "$SMARTCTL" ] && [ -b "/dev/$name" ]; then
+        serial=$("$SMARTCTL" -i "/dev/$name" 2>/dev/null \
+            | sed -n 's/^[Ss]erial [Nn]umber:[[:space:]]*//p' | head -1 \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [ -n "$serial" ] && serial_source="smartctl"
+    fi
+    serial_value=$(printf '%s' "$serial" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    serial_status="valid"
+    case "$serial_value" in ''|0|UNKNOWN|N/A|NA|NONE|NULL|DEFAULT|"NOT AVAILABLE") serial_status="missing"; serial_value="" ;; esac
+    [ "$serial_source" = "none" ] && serial_status="missing"
+    serial_json=$(printf '%s' "$serial" | media_json_escape)
+    serial_value_json=$(printf '%s' "$serial_value" | media_json_escape)
+    firmware=$(cat "$blk/device/firmware_rev" 2>/dev/null | sed 's/[[:space:]]*$//' | media_json_escape)
+    [ -z "$firmware" ] && firmware="$(cat "$blk/device/rev" 2>/dev/null | sed 's/[[:space:]]*$//' | media_json_escape)"
+    rota=$(cat "$blk/queue/rotational" 2>/dev/null)
+    [ "$rota" = "0" ] && rota_json="false" || rota_json="true"
+    if [ "$transport" = usb ]; then
+        case "$serial_value" in GENERIC*|USB\ STORAGE*|STORAGE\ DEVICE*) usb_reader=true ;; esac
+        serial_nonzero=$(printf '%s' "$serial_value" | sed 's/^0X//; s/0//g')
+        if [ -n "$serial_value" ] && [ -z "$serial_nonzero" ]; then usb_reader=true; fi
+    fi
+    if [ "$usb_reader" = true ]; then
+        # Garder le champ brut historique à titre informatif, sans promouvoir
+        # une série de pont/lecteur en identité unique de la carte insérée.
+        serial_value_json=""
+        serial_source="none"; serial_status="missing"
+    fi
+    # Hyper-V synthetic SCSI disks may not expose a serial but do expose a
+    # stable VPD 0x83 NAA identifier. Keep it typed and only accept the exact
+    # tested Microsoft virtual-disk format; never treat it as a serial.
+    identity_kind="serial"
+    identity_value_json="$serial_value_json"
+    identity_source="$serial_source"
+    identity_status="$serial_status"
+    if [ "$serial_status" = "missing" ] && [ "$usb_reader" = false ] && [ "$transport" != mmc ] \
+        && [ "$vendor" = "Msft" ] && [ "$model" = "Virtual Disk" ]; then
+        wwid=$(cat "$blk/device/wwid" 2>/dev/null | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if printf '%s\n' "$wwid" | grep -Eq '^NAA\.[0-9A-F]{32}$' && [ "$wwid" != 'NAA.00000000000000000000000000000000' ]; then
+            identity_kind="wwid"
+            identity_value_json=$(printf '%s' "$wwid" | media_json_escape)
+            identity_source="sysfs-wwid"
+            identity_status="valid"
+        fi
+    fi
+    media_collect_disk_metadata "$blk" "$name"
+
+    # ---- SMART (verdict + attributs critiques) ----------------------------
+    smart_mode="sysfs"
+    smart_verdict="unknown"
+    smart_hours=""
+    smart_temp=""
+    smart_realloc=""
+    smart_pending=""
+    smart_crc=""
+    if [ "$usb_reader" = false ] && [ "$transport" != mmc ] && [ -n "$SMARTCTL" ] && [ -b "/dev/$name" ]; then
+        # Health overall : `smartctl -H` retourne PASSED/FAILED. Les "n/a" et
+        # erreurs (USB pont sans SMART, etc.) restent en "unknown".
+        h=$("$SMARTCTL" -H "/dev/$name" 2>/dev/null | awk -F': *' '/overall-health|SMART Health Status/ {print tolower($2); exit}')
+        case "$h" in
+            *passed*|ok)   smart_verdict="passed"; smart_mode="smartctl" ;;
+            *failed*)      smart_verdict="failed"; smart_mode="smartctl" ;;
+        esac
+        if [ "$smart_mode" = "smartctl" ]; then
+            case "$transport" in
+                nvme)
+                    smart_hours=$(smart_nvme_kv "/dev/$name" "Power On Hours")
+                    smart_temp=$("$SMARTCTL" -A "/dev/$name" 2>/dev/null \
+                        | awk -F': *' 'BEGIN{IGNORECASE=1}
+                            /^Temperature:/ { gsub(/[^0-9]/,"",$2); print $2; exit }')
+                    # NVMe : Available_Spare/Critical_Warning sont les indicateurs critiques
+                    smart_pending=$(smart_nvme_kv "/dev/$name" "Critical Warning")
+                    ;;
+                *)
+                    smart_hours=$(smart_sata_attr "/dev/$name" 9)
+                    smart_temp=$(smart_sata_attr "/dev/$name" 194)
+                    [ -z "$smart_temp" ] && smart_temp=$(smart_sata_attr "/dev/$name" 190)
+                    smart_realloc=$(smart_sata_attr "/dev/$name" 5)
+                    smart_pending=$(smart_sata_attr "/dev/$name" 197)
+                    smart_crc=$(smart_sata_attr "/dev/$name" 199)
+                    ;;
+            esac
+        fi
+    fi
+    # null-or-int helpers : valeurs numériques pour le JSON, null sinon
+    j_hours=${smart_hours:-null};   case "$j_hours"   in ''|*[!0-9]*) j_hours=null ;; esac
+    j_temp=${smart_temp:-null};     case "$j_temp"    in ''|*[!0-9]*) j_temp=null ;; esac
+    j_realloc=${smart_realloc:-null}; case "$j_realloc" in ''|*[!0-9]*) j_realloc=null ;; esac
+    j_pending=${smart_pending:-null}; case "$j_pending" in ''|*[!0-9]*) j_pending=null ;; esac
+    j_crc=${smart_crc:-null};       case "$j_crc"     in ''|*[!0-9]*) j_crc=null ;; esac
+
+    DISKS_JSON="$DISKS_JSON$sep    {\"name\":\"/dev/$name\",\"size_bytes\":$size_bytes,\"vendor\":\"$vendor\",\"model\":\"$model\",\"serial\":\"$serial_json\",\"identity\":{\"kind\":\"$identity_kind\",\"value\":\"$identity_value_json\",\"source\":\"$identity_source\",\"status\":\"$identity_status\"},\"firmware\":\"$firmware\",\"rota\":$rota_json,\"transport\":\"$transport\",\"smart\":{\"mode\":\"$smart_mode\",\"verdict\":\"$smart_verdict\",\"power_on_hours\":$j_hours,\"temperature_c\":$j_temp,\"reallocated\":$j_realloc,\"pending\":$j_pending,\"crc_errors\":$j_crc},\"mmc\":$MEDIA_MMC_JSON,\"partitions\":[$MEDIA_PARTITIONS_JSON],\"filesystem\":$MEDIA_FILESYSTEM_JSON,\"metadata_collection\":{\"filesystem_status\":\"$MEDIA_FILESYSTEM_STATUS\",\"mmc_status\":\"$MEDIA_MMC_STATUS\"}}"
+    sep=",
+"
+done
+
+ping_phase "disks_done" "$MAC"
+
+# ---- Indices d'un système déjà amorçable (lecture seule) -------------------
+# Ce résultat informe l'administrateur. Il n'active jamais à lui seul le boot
+# local : une partition EFI ou un ancien GRUB ne prouve pas qu'un OS fonctionne.
+BOOT_CANDIDATES_JSON=""
+BOOT_PROBE_AVAILABLE=false
+boot_sep=""
+boot_count=0
+boot_candidate_count=0
+if command -v blkid >/dev/null 2>&1 && media_timeout_available; then
+    media_blkid_mode
+    [ "$MEDIA_BLKID_MODE" = unavailable ] || BOOT_PROBE_AVAILABLE=true
+    mkdir -p /tmp/pxe-boot-probe
+    for disk in /sys/block/*; do
+        [ -e "$disk" ] || continue
+        disk_name=$(basename "$disk")
+        case "$disk_name" in mmcblk*boot*|mmcblk*gp*|mmcblk*rpmb) continue ;; sd*|hd*|vd*|xvd*|nvme*|mmcblk*) ;; *) continue ;; esac
+        for part_dir in "$disk"/*; do
+            [ -r "$part_dir/partition" ] || continue
+            part_name=$(basename "$part_dir")
+            case "$part_name" in *[!a-zA-Z0-9._-]*|'') continue ;; esac
+            part_dev="/dev/$part_name"
+            [ -b "$part_dev" ] || continue
+            boot_count=$((boot_count + 1))
+            [ "$boot_count" -gt 32 ] && break 2
+            media_probe_filesystem "$part_dev"
+            [ "$MEDIA_PROBE_STATUS" = available ] || continue
+            part_meta=$MEDIA_PROBE_EXPORT
+            part_fs=$(printf '%s\n' "$part_meta" | sed -n 's/^TYPE=//p' | head -1)
+            part_guid=$(printf '%s\n' "$part_meta" | sed -n 's/^PART_ENTRY_TYPE=//p' | head -1 | tr 'A-Z' 'a-z')
+            boot_kind=""
+            case "$part_guid" in
+                c12a7328-f81f-11d2-ba4b-00a0c93ec93b) boot_kind="efi-partition" ;;
+            esac
+            case "$part_fs" in ext2|ext3|ext4|vfat|fat|ntfs|xfs|btrfs)
+                boot_timeout=""
+                if command -v timeout >/dev/null 2>&1; then
+                    boot_timeout="timeout"
+                elif command -v busybox >/dev/null 2>&1 && busybox timeout 1 true >/dev/null 2>&1; then
+                    boot_timeout="busybox timeout"
+                fi
+                if [ -n "$boot_timeout" ]; then
+                    mount_opts=ro
+                    case "$part_fs" in ext2|ext3|ext4) mount_opts=ro,noload ;; esac
+                    if $boot_timeout 3 mount -o "$mount_opts" "$part_dev" /tmp/pxe-boot-probe 2>/dev/null; then
+                        if [ -f /tmp/pxe-boot-probe/etc/os-release ] || [ -f /tmp/pxe-boot-probe/usr/lib/os-release ]; then
+                            boot_kind="linux-os"
+                        elif [ -d /tmp/pxe-boot-probe/Windows/System32 ]; then
+                            boot_kind="windows-os"
+                        elif [ -d /tmp/pxe-boot-probe/EFI/BOOT ] || [ -d /tmp/pxe-boot-probe/EFI/Microsoft/Boot ]; then
+                            boot_kind="efi-loader"
+                        elif [ -f /tmp/pxe-boot-probe/boot/grub/grub.cfg ]; then
+                            boot_kind="grub-config"
+                        fi
+                        $boot_timeout 3 umount /tmp/pxe-boot-probe 2>/dev/null || true
+                    fi
+                fi
+                ;;
+            esac
+            if [ -n "$boot_kind" ] && [ "$boot_candidate_count" -lt 8 ]; then
+                BOOT_CANDIDATES_JSON="$BOOT_CANDIDATES_JSON$boot_sep    {\"device\":\"$part_dev\",\"kind\":\"$boot_kind\"}"
+                boot_candidate_count=$((boot_candidate_count + 1))
+                boot_sep=",
+"
+            fi
+        done
+    done
+fi
+ping_phase "boot_probe_done" "$MAC"
+
+# ---- Interfaces (type, driver, PCI vendor/device, speed, link, mtu) --------
+IFACES_JSON=""
+sep=""
+for iface in $(ls /sys/class/net/ 2>/dev/null); do
+    [ "$iface" = "lo" ] && continue
+    ifmac=$(cat /sys/class/net/"$iface"/address 2>/dev/null)
+    [ -z "$ifmac" ] && continue
+    # Speed en Mbps (-1 si pas de link). Lecture peut échouer si interface down.
+    speed=$(cat /sys/class/net/"$iface"/speed 2>/dev/null)
+    case "$speed" in
+        ''|-1) speed_json="null" ;;
+        *[!0-9]*) speed_json="null" ;;
+        *) speed_json="$speed" ;;
+    esac
+    # Type : wifi (présence dossier wireless), sinon valeur ARPHRD numérique
+    # → 1=ethernet, 24=fibre/InfiniBand, 32=infiniband. Tout le reste = "other".
+    if [ -d /sys/class/net/"$iface"/wireless ]; then
+        iftype="wifi"
+    else
+        arphrd=$(cat /sys/class/net/"$iface"/type 2>/dev/null)
+        case "$arphrd" in
+            1)  iftype="ethernet" ;;
+            24) iftype="fibre" ;;
+            32) iftype="infiniband" ;;
+            *)  iftype="other" ;;
+        esac
+    fi
+    # Driver + PCI vendor:device hex (extraits de device/uevent). Les iface
+    # non-PCI (USB, virtio bridge) auront pci_id="".
+    ifdriver=""
+    pci_id=""
+    if [ -r /sys/class/net/"$iface"/device/uevent ]; then
+        ifdriver=$(awk -F= '$1=="DRIVER"{print $2; exit}' /sys/class/net/"$iface"/device/uevent 2>/dev/null)
+        pci_id=$(awk -F= '$1=="PCI_ID"{print tolower($2); exit}' /sys/class/net/"$iface"/device/uevent 2>/dev/null)
+    fi
+    pci_vendor_id=""
+    pci_device_id=""
+    if [ -n "$pci_id" ]; then
+        pci_vendor_id=$(echo "$pci_id" | cut -d: -f1)
+        pci_device_id=$(echo "$pci_id" | cut -d: -f2)
+    fi
+    link=$(cat /sys/class/net/"$iface"/operstate 2>/dev/null)
+    [ -z "$link" ] && link="unknown"
+    mtu=$(cat /sys/class/net/"$iface"/mtu 2>/dev/null)
+    case "$mtu" in ''|*[!0-9]*) mtu_json=null ;; *) mtu_json=$mtu ;; esac
+    # Adresses IPv4/IPv6 attribuées à l'iface au moment du discovery (CIDR).
+    # Skip les link-local IPv6 (fe80::/10) car peu pertinentes en UI.
+    ipv4_arr=""; sep4=""
+    for cidr in $(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}'); do
+        ipv4_arr="$ipv4_arr$sep4\"$cidr\""; sep4=","
+    done
+    ipv6_arr=""; sep6=""
+    for cidr in $(ip -o -6 addr show "$iface" 2>/dev/null | awk '$4 !~ /^fe80:/ {print $4}'); do
+        ipv6_arr="$ipv6_arr$sep6\"$cidr\""; sep6=","
+    done
+
+    IFACES_JSON="$IFACES_JSON$sep    {\"name\":\"$iface\",\"mac\":\"$ifmac\",\"type\":\"$iftype\",\"driver\":\"$ifdriver\",\"pci_vendor_id\":\"$pci_vendor_id\",\"pci_device_id\":\"$pci_device_id\",\"speed_mbps\":$speed_json,\"link\":\"$link\",\"mtu\":$mtu_json,\"ipv4\":[$ipv4_arr],\"ipv6\":[$ipv6_arr]}"
+    sep=",
+"
+done
+
+ping_phase "ifaces_done" "$MAC"
+
+# ---- GPUs (cartes graphiques via lspci si dispo, sinon sysfs PCI) ----------
+GPUS_JSON=""
+sep=""
+if command -v lspci >/dev/null 2>&1; then
+    # Format lspci -mm : "00:02.0" "VGA compatible controller" "Intel..." "..."
+    lspci_out=$(lspci -mm 2>/dev/null | grep -iE '"(VGA|3D|Display) ')
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        slot=$(echo "$line" | awk '{print $1}')
+        # Champs entre guillemets : class, vendor, device
+        gvendor=$(echo "$line" | awk -F'"' '{print $4}' | sed 's/\\/\\\\/g; s/"/\\"/g')
+        gmodel=$(echo "$line" | awk -F'"' '{print $6}' | sed 's/\\/\\\\/g; s/"/\\"/g')
+        [ -z "$gvendor" ] && gvendor="n/a"
+        [ -z "$gmodel" ] && gmodel="n/a"
+        GPUS_JSON="$GPUS_JSON$sep    {\"slot\":\"$slot\",\"vendor\":\"$gvendor\",\"model\":\"$gmodel\"}"
+        sep=",
+"
+    done <<EOF_LSPCI
+$lspci_out
+EOF_LSPCI
+else
+    # Fallback sysfs : class 0x030000=VGA, 0x030200=3D, 0x038000=Display
+    for dev in /sys/bus/pci/devices/*; do
+        [ -e "$dev" ] || continue
+        class=$(cat "$dev/class" 2>/dev/null)
+        case "$class" in
+            0x0300*|0x0302*|0x0380*) ;;
+            *) continue ;;
+        esac
+        slot=$(basename "$dev")
+        # On retire le préfixe 0000: pour le slot
+        slot=$(echo "$slot" | sed 's/^0000://')
+        gvendor=$(cat "$dev/vendor" 2>/dev/null)
+        gdevice=$(cat "$dev/device" 2>/dev/null)
+        GPUS_JSON="$GPUS_JSON$sep    {\"slot\":\"$slot\",\"vendor\":\"$gvendor\",\"model\":\"$gdevice\"}"
+        sep=",
+"
+    done
+fi
+
+ping_phase "gpus_done" "$MAC"
+
+# ---- SONDE écrans (DRM/KMS) — mesure de faisabilité --------------------------
+# But : déterminer si /sys/class/drm est peuplé dans l'env discovery (= driver
+# KMS chargé) ALORS QUE l'initrd discovery omet le firmware non-libre. Si oui,
+# l'EDID/les modes du moniteur sont lisibles → résolution native récupérable.
+# Pour chaque connecteur : status, 1er mode (= natif si peuplé), nb de modes,
+# taille EDID en octets (0 = non exposé). Liste vide = DRM non peuplé (KMS absent
+# sans firmware) → la résolution ne sera pas dispo par cette voie sur ce GPU.
+# NB : le framebuffer courant (fb0) est vesafb 800x600 (vga=788), pas la capacité
+# réelle de l'écran — on le remonte juste pour contexte.
+DISPLAY_JSON=""
+sep=""
+disp_found=0
+for conn in /sys/class/drm/card*-*; do
+    [ -e "$conn" ] || continue
+    disp_found=1
+    cname=$(basename "$conn")
+    cstatus=$(cat "$conn/status" 2>/dev/null); [ -z "$cstatus" ] && cstatus="unknown"
+    first_mode=""
+    modes_count=0
+    if [ -r "$conn/modes" ]; then
+        first_mode=$(head -1 "$conn/modes" 2>/dev/null)
+        modes_count=$(wc -l < "$conn/modes" 2>/dev/null | tr -d ' ')
+    fi
+    [ -z "$first_mode" ] && first_mode=""
+    case "$modes_count" in ''|*[!0-9]*) modes_count=0 ;; esac
+    edid_bytes=0
+    [ -r "$conn/edid" ] && edid_bytes=$(wc -c < "$conn/edid" 2>/dev/null | tr -d ' ')
+    case "$edid_bytes" in ''|*[!0-9]*) edid_bytes=0 ;; esac
+    DISPLAY_JSON="$DISPLAY_JSON$sep    {\"connector\":\"$cname\",\"status\":\"$cstatus\",\"first_mode\":\"$first_mode\",\"modes_count\":$modes_count,\"edid_bytes\":$edid_bytes}"
+    sep=",
+"
+done
+# Framebuffer courant (contexte) : vesafb attendu (800,600) — pas la res écran.
+FB0_SIZE=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null | tr -d ' ')
+[ -z "$FB0_SIZE" ] && FB0_SIZE="n/a"
+ping_phase "displays_$([ "$disp_found" = "1" ] && echo "found_fb${FB0_SIZE}" || echo "none_fb${FB0_SIZE}")" "$MAC"
+
+# ---- USB devices via /sys/bus/usb/devices/ ---------------------------------
+# Skip les root hubs (idVendor=1d6b "Linux Foundation"). Garde tout le reste,
+# y compris HID (clavier/souris) — on filtrera côté UI si besoin. La classe
+# bDeviceClass est en hex dans sysfs (ex: "09" pour hub, "00" pour interface-defined).
+USB_JSON=""
+sep=""
+for dev in /sys/bus/usb/devices/*; do
+    [ -e "$dev/idVendor" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null)
+    pid=$(cat "$dev/idProduct" 2>/dev/null)
+    [ -z "$vid" ] && continue
+    # Skip Linux Foundation root hubs (présents pour chaque controller USB)
+    [ "$vid" = "1d6b" ] && continue
+    vendor_name=$(cat "$dev/manufacturer" 2>/dev/null | sed 's/[[:space:]]*$//' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    product_name=$(cat "$dev/product" 2>/dev/null | sed 's/[[:space:]]*$//' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    serial=$(cat "$dev/serial" 2>/dev/null | sed 's/[[:space:]]*$//' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    class=$(cat "$dev/bDeviceClass" 2>/dev/null)
+    speed=$(cat "$dev/speed" 2>/dev/null)
+    case "$speed" in ''|*[!0-9.]*) speed_json=null ;; *) speed_json=$speed ;; esac
+
+    USB_JSON="$USB_JSON$sep    {\"vid\":\"$vid\",\"pid\":\"$pid\",\"vendor_name\":\"$vendor_name\",\"product_name\":\"$product_name\",\"serial\":\"$serial\",\"class\":\"$class\",\"speed_mbps\":$speed_json}"
+    sep=",
+"
+done
+
+ping_phase "usb_done" "$MAC"
+
+# ---- Construire le JSON via cat heredoc (plus robuste que printf en ash) ---
+JSON_FILE=/tmp/discovery.json
+cat > "$JSON_FILE" <<EOF
+{
+  "mac": "$MAC",
+  "interface": "$MAIN_IF",
+  "inventory": {
+    "vendor": "$VENDOR",
+    "product": "$PRODUCT",
+    "serial": "$SERIAL",
+    "bios_vendor": "$BIOS_VENDOR",
+    "bios_version": "$BIOS_VERSION",
+    "board_vendor": "$BOARD_VENDOR",
+    "board_name": "$BOARD_NAME",
+    "cpu_model": "$CPU_MODEL",
+    "cpu_arch": "$CPU_ARCH",
+    "cpu_cores": $CPU_CORES,
+    "cpu_sockets": $CPU_SOCKETS,
+    "cpu_max_mhz": $CPU_MAX_MHZ,
+    "cpu_current_mhz": $CPU_CURRENT_MHZ,
+    "cpu_virt": $CPU_VIRT,
+    "memory_kb": $MEMORY_KB,
+    "kernel": "$KERNEL",
+    "boot_mode": "$BOOT_MODE",
+    "secure_boot": $SECURE_BOOT,
+    "tpm_present": $TPM_PRESENT,
+    "tpm_version": $TPM_VERSION
+  },
+  "disks": [
+$DISKS_JSON
+  ],
+  "boot_probe": {"available": $BOOT_PROBE_AVAILABLE, "candidates": [
+$BOOT_CANDIDATES_JSON
+  ]},
+  "interfaces": [
+$IFACES_JSON
+  ],
+  "gpus": [
+$GPUS_JSON
+  ],
+  "usb_devices": [
+$USB_JSON
+  ],
+  "memory_modules": [
+$MEMORY_JSON
+  ],
+  "display_probe": {
+    "fb0_virtual_size": "$FB0_SIZE",
+    "connectors": [
+$DISPLAY_JSON
+    ]
+  }
+}
+EOF
+
+ping_phase "json_built" "$MAC"
+
+# ---- BEGIN INVENTORY TRANSPORT -------------------------------------------
+# POST complet en priorité : les partitions/CID dépassent la limite de ligne
+# HTTP de nginx. Repli GET seulement pour les petits clients historiques.
+# Une MAC seule ne doit jamais remplacer silencieusement l'inventaire complet.
+post_inventory() {
+    posted=0
+    method="none"
+    inventory_bytes=$(wc -c < "$JSON_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$inventory_bytes" in ''|*[!0-9]*) method="payload_unreadable"; return ;; esac
+    if [ "$inventory_bytes" -gt 1048576 ]; then method="payload_too_large"; return; fi
+    if ! media_timeout_available; then method="timeout_unavailable"; return; fi
+    inventory_wget_help=$(wget --help 2>&1)
+    inventory_post_file=false
+    inventory_post_data=false
+    inventory_header=false
+    case "$inventory_wget_help" in *--post-file*) inventory_post_file=true ;; esac
+    case "$inventory_wget_help" in *--post-data*) inventory_post_data=true ;; esac
+    case "$inventory_wget_help" in *--header*) inventory_header=true ;; esac
+    inventory_b64=""
+    if command -v base64 >/dev/null 2>&1; then
+        inventory_b64=$(base64 "$JSON_FILE" 2>/dev/null | tr -d '\r\n' | tr '+/' '-_')
+    fi
+    inventory_form=""
+    if [ -n "$inventory_b64" ]; then
+        inventory_form="b64=$(printf '%s' "$inventory_b64" | sed 's/=/\%3D/g')"
+    fi
+    inventory_form_file="${JSON_FILE}.form"
+    if [ "$inventory_post_file" = true ] && [ -n "$inventory_form" ]; then
+        printf '%s' "$inventory_form" > "$inventory_form_file"
+    fi
+    for try in 1 2 3; do
+        if command -v curl >/dev/null 2>&1; then
+            if media_timeout 20 curl -fsS -X POST -H "Content-Type: application/json" --data-binary "@$JSON_FILE" "$API" >/dev/null 2>&1; then
+                posted=1; method="curl"; break
+            fi
+        fi
+        if [ "$inventory_post_file" = true ]; then
+            if [ "$inventory_header" = true ]; then
+                media_timeout 20 wget -q --post-file="$JSON_FILE" --header='Content-Type: application/json' -O /dev/null "$API" >/dev/null 2>&1
+            else
+                media_timeout 20 wget -q --post-file="$JSON_FILE" -O /dev/null "$API" >/dev/null 2>&1
+            fi
+            if [ "$?" -eq 0 ]; then posted=1; method="wget_post_file"; break; fi
+        fi
+        # Les arguments --post-data restent sous 64 KiB pour éviter ARG_MAX.
+        if [ "$inventory_post_data" = true ] && [ "$inventory_bytes" -le 65536 ]; then
+            inventory_data=$(cat "$JSON_FILE")
+            if [ "$inventory_header" = true ]; then
+                media_timeout 20 wget -q --post-data="$inventory_data" --header='Content-Type: application/json' -O /dev/null "$API" >/dev/null 2>&1
+            else
+                media_timeout 20 wget -q --post-data="$inventory_data" -O /dev/null "$API" >/dev/null 2>&1
+            fi
+            if [ "$?" -eq 0 ]; then posted=1; method="wget_post_data"; break; fi
+        fi
+        # Compat d-i : formulaire b64 (pas de JSON perdu sous Content-Type form).
+        # URL-safe évite + et / ; le padding = reste encodé en %3D.
+        if [ -n "$inventory_form" ] && [ "$(printf '%s' "$inventory_form" | wc -c)" -le 1048576 ]; then
+            if [ "$inventory_post_file" = true ] && [ -r "$inventory_form_file" ]; then
+                if [ "$inventory_header" = true ]; then
+                    media_timeout 20 wget -q --post-file="$inventory_form_file" --header='Content-Type: application/x-www-form-urlencoded' -O /dev/null "$API" >/dev/null 2>&1
+                else
+                    media_timeout 20 wget -q --post-file="$inventory_form_file" -O /dev/null "$API" >/dev/null 2>&1
+                fi
+                if [ "$?" -eq 0 ]; then posted=1; method="wget_post_form"; break; fi
+            fi
+            if [ "$inventory_post_data" = true ] && [ "$(printf '%s' "$inventory_form" | wc -c)" -le 65536 ]; then
+                if [ "$inventory_header" = true ]; then
+                    media_timeout 20 wget -q --post-data="$inventory_form" --header='Content-Type: application/x-www-form-urlencoded' -O /dev/null "$API" >/dev/null 2>&1
+                else
+                    media_timeout 20 wget -q --post-data="$inventory_form" -O /dev/null "$API" >/dev/null 2>&1
+                fi
+                if [ "$?" -eq 0 ]; then posted=1; method="wget_post_form"; break; fi
+            fi
+        fi
+        inventory_get="$API?b64=$inventory_b64"
+        if [ -n "$inventory_b64" ] && [ "$(printf '%s' "$inventory_get" | wc -c)" -le 6000 ]; then
+            if media_timeout 20 wget -q -O /dev/null "$inventory_get" >/dev/null 2>&1; then
+                posted=1; method="wget_b64_short"; break
+            fi
+        fi
+        [ "$try" = 3 ] || sleep 2
+    done
+    [ ! -e "$inventory_form_file" ] || rm -f "$inventory_form_file"
+}
+post_inventory
+# ---- END INVENTORY TRANSPORT ---------------------------------------------
+
+ping_phase "post_${posted}_${method:-none}" "$MAC"
+
+# ---- Boucle de poll : machine en attente d'instruction ---------------------
+# Au lieu de poweroff inconditionnel, on poll /api/discovery-action toutes les
+# 5s. Le serveur retourne {"action":"wait"|"poweroff"|"reboot"} en fonction de
+# machines.next_action. L'admin déclenche l'action via l'UI.
+# Sécurité : timeout 1h (720 ticks de 5s) → poweroff de fallback pour éviter
+# une machine oubliée allumée.
+
+POLL_URL="http://$ORCH_IP/api/discovery-action?mac=$MAC"
+# Cadence interne (boucle d'affichage) : 1 tick = 1 seconde. Le countdown
+# se décrémente à chaque tick → animation fluide à l'écran.
+# Cadence API : POLL_INTERVAL=5 → on ne fetche que tous les 5 ticks pour
+# ne pas surcharger le serveur PXE. La réponse API resynchronise REMAINING.
+POLL_INTERVAL=5
+MAX_ATTEMPTS=3600
+ATTEMPTS=0
+TICKS_SINCE_POLL=0
+# Flag pour le redraw anti-flicker : reset terminal complet au 1er appel,
+# puis simple repositionnement du curseur en haut à gauche (\033[H) aux
+# suivants → les caractères s'écrasent en place, pas de clear visible.
+RENDERED_ONCE=0
+VT_SWITCHED=0
+
+# Récupère IP / hostname pour le banner (best-effort)
+IP_ADDR=$(ip -4 -o addr show 2>/dev/null | awk '!/127\.0\.0\.1/ {print $4; exit}' | cut -d/ -f1)
+IP_ADDR=${IP_ADDR:-"(DHCP en cours)"}
+
+# Banner sur l'écran machine pendant l'attente d'action.
+# Contraintes : d-i contrôle tty1 (dialog newt plein écran) — on ne peut pas
+# y écrire de façon persistante. Stratégie en 2 temps :
+#
+#  1. Écrire un banner ASCII sur /dev/tty4 (VT libre en d-i). User peut faire
+#     Ctrl+Alt+F4 pour le consulter à tout moment.
+#  2. Switcher automatiquement vers tty4 via chvt — download du binaire static
+#     depuis le serveur PXE (busybox d-i n'a pas chvt natif). Pattern identique
+#     à dmidecode/smartctl/badblocks (cf. STATIC_BIN_BASE).
+#
+# Si le download chvt échoue, fallback silencieux : banner reste sur tty4
+# (Ctrl+Alt+F4 manuel) et polling fonctionne côté serveur.
+
+# Mute les printk kernel sur la console (hotplug USB = KERN_INFO/6 polluait
+# le TUI tty4 quand un device était branché pendant le wait). console_loglevel=1
+# → seul KERN_EMERG s'affiche. Ringbuffer intact : `dmesg` reste exploitable
+# depuis tty1 si besoin de debug.
+echo 1 > /proc/sys/kernel/printk 2>/dev/null || true
+
+HAVE_CHVT=0
+if wget -q -O /tmp/chvt "$STATIC_BIN_BASE/chvt" 2>/dev/null; then
+    chmod +x /tmp/chvt 2>/dev/null
+    HAVE_CHVT=1
+    ping_phase "chvt_ok" "$MAC"
+else
+    ping_phase "chvt_404" "$MAC"
+fi
+
+# Centrage dynamique de la bannière selon la console réelle, SANS changer le mode
+# vidéo (on garde donc la détection de résolution via fb0). La bannière est
+# calibrée pour 800x600 (~100 colonnes x 37 lignes, police console 8x16) ; sur un
+# écran plus grand (ex. 1366x768 = ~170 col) on ajoute un delta de padding pour la
+# recentrer au lieu de la laisser collée en haut à gauche. Source de la taille :
+# stty (fiable, indépendant de la police) avec repli sur fb0 / police 8x16.
+B_COLS=0; B_ROWS=0
+_sz=$(stty -F /dev/tty4 size 2>/dev/null); set -- $_sz
+case "${1:-x}" in ''|*[!0-9]*) ;; *) case "${2:-x}" in ''|*[!0-9]*) ;; *) B_ROWS=$1; B_COLS=$2 ;; esac ;; esac
+if [ "${B_COLS:-0}" -le 0 ] 2>/dev/null; then
+    _w=${FB0_SIZE%,*}; _h=${FB0_SIZE#*,}
+    case "$_w" in ''|*[!0-9]*) _w=800 ;; esac
+    case "$_h" in ''|*[!0-9]*) _h=600 ;; esac
+    B_COLS=$((_w / 8)); B_ROWS=$((_h / 16))
+fi
+PADX=$(( (B_COLS - 100) / 2 )); [ "$PADX" -lt 0 ] && PADX=0
+PADY=$(( (B_ROWS - 37) / 2 )); [ "$PADY" -lt 0 ] && PADY=0
+LPAD=""; [ "$PADX" -gt 0 ] && LPAD=$(printf "%${PADX}s" "")
+
+render_status() {
+    MM=$((REMAINING / 60))
+    SS=$((REMAINING % 60))
+    # Escapes terminal en brut (jamais préfixés par le padding horizontal).
+    # Au 1er appel : reset complet (sortie d-i parasitée) + cache curseur.
+    # Sinon : cursor home → le contenu de hauteur fixe s'écrase en place.
+    if [ "$RENDERED_ONCE" -eq 0 ]; then
+        printf '\033c\033[2J\033[H\033[?25l' > /dev/tty4 2>/dev/null
+        RENDERED_ONCE=1
+    else
+        printf '\033[H' > /dev/tty4 2>/dev/null
+    fi
+    {
+        # PADY lignes vides en haut = centrage vertical.
+        _i=0; while [ "$_i" -lt "$PADY" ]; do echo; _i=$((_i + 1)); done
+        echo
+        echo
+        echo
+        echo
+        # The surrounding sed adds the outer centering for screens > 100 columns.
+        _heading_cols=$B_COLS
+        [ "$_heading_cols" -le 100 ] || _heading_cols=100
+        if [ "$_heading_cols" -ge 27 ]; then
+            _heading_pad=$(( (_heading_cols - 27) / 2 ))
+            printf '%*s%s\n' "$_heading_pad" '' '+-------------------------+'
+            printf '%*s%s\n' "$_heading_pad" '' '|        PXE Tools        |'
+            printf '%*s%s\n' "$_heading_pad" '' '+-------------------------+'
+        elif [ "$_heading_cols" -ge 9 ]; then
+            _heading_pad=$(( (_heading_cols - 9) / 2 ))
+            printf '%*s%s\n' "$_heading_pad" '' 'PXE Tools'
+        elif [ "$_heading_cols" -ge 3 ]; then
+            printf '%s\n' 'PXE'
+        else
+            printf '%s\n' 'P'
+        fi
+        echo
+        echo
+        echo "                  ================================================================"
+        if [ "$posted" -eq 1 ]; then
+            echo "                                     HARDWARE DISCOVERY TERMINE"
+        else
+            echo "                              ENVOI DE L'INVENTAIRE NON CONFIRME"
+        fi
+        echo "                  ================================================================"
+        echo
+        echo
+        echo
+        if [ "$posted" -eq 1 ]; then
+            echo "                    Machine identifiee et enregistree sur le serveur PXE :"
+        else
+            echo "                    L'inventaire n'a pas pu etre confirme par le serveur."
+        fi
+        echo
+        echo "                      MAC : $MAC"
+        echo "                      IP  : $IP_ADDR"
+        echo
+        if [ "$posted" -eq 1 ]; then
+            echo "                    En attente d'une action depuis l'interface admin :"
+        else
+            echo "                    Verifiez le reseau et relancez la decouverte."
+        fi
+        echo
+        echo "                      http://$ORCH_IP/machines"
+        echo
+        printf "                    Arret automatique de la machine dans : %02d:%02d\n" "$MM" "$SS"
+        echo
+        echo
+        echo
+        echo "                  ================================================================"
+        echo "                    (Ctrl+Alt+F1 pour revenir au menu d-i / Ctrl+Alt+F4 pour ici)"
+        echo "                  ================================================================"
+    } | sed "s/^/$LPAD/" > /dev/tty4 2>/dev/null || true
+    # Purge ce qui dépasse en hauteur (escape brut, hors padding horizontal).
+    printf '\033[J' > /dev/tty4 2>/dev/null
+    # Switch once on entry; repeated switches trap users who try Ctrl+Alt+F1.
+    if [ "$HAVE_CHVT" -eq 1 ] && [ "$VT_SWITCHED" -eq 0 ]; then
+        /tmp/chvt 4 2>/dev/null || true
+        VT_SWITCHED=1
+    fi
+}
+
+if [ "$posted" -eq 1 ]; then
+    echo "Inventaire posté. En attente d'instruction (poll $POLL_URL)..."
+else
+    echo "Envoi de l'inventaire non confirmé. Vérifiez le réseau et relancez la découverte."
+fi
+
+FRESH_POLL=0
+ACTION=""
+REMAINING=0
+while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
+    # Fetch API uniquement toutes les POLL_INTERVAL secondes (le countdown
+    # interpole localement entre 2 fetches → animation fluide à 1s sans
+    # surcharger le serveur PXE). Premier tick : fetch immédiat.
+    if [ "$ATTEMPTS" -eq 0 ] || [ "$TICKS_SINCE_POLL" -ge "$POLL_INTERVAL" ]; then
+        RESP=$(wget -qO- "$POLL_URL" 2>/dev/null)
+        ACTION=$(echo "$RESP" | sed -n 's/.*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        REMAINING_API=$(echo "$RESP" | sed -n 's/.*"remaining_seconds"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+        REMAINING=${REMAINING_API:-$REMAINING}
+        TICKS_SINCE_POLL=0
+        FRESH_POLL=1
+    else
+        FRESH_POLL=0
+    fi
+
+    render_status
+
+    # Les actions side-effect (poweroff/reboot) ne se déclenchent que sur
+    # une réponse API fraîche, jamais sur un tick d'interpolation locale.
+    if [ "$FRESH_POLL" -eq 1 ]; then
+        case "$ACTION" in
+            poweroff)
+                echo "Action reçue : poweroff"
+                ping_phase "action_poweroff" "$MAC"
+                sleep 2
+                poweroff -f 2>/dev/null
+                halt -p 2>/dev/null
+                halt -f 2>/dev/null
+                exit 0
+                ;;
+            reboot|install)
+                echo "Action reçue : reboot"
+                ping_phase "action_reboot" "$MAC"
+                sleep 2
+                reboot -f 2>/dev/null
+                halt -p 2>/dev/null
+                exit 0
+                ;;
+            disktest)
+                # Test de disque enchaîné SANS reboot (chemin in-session) : on
+                # exécute disktest.sh dans cette session d-i (même environnement
+                # que le boot dédié), puis on reprend la boucle d'attente — la
+                # fenêtre serveur est réarmée par disktest-end. Si post_action
+                # vaut reboot/poweroff, disktest.sh ne rend jamais la main.
+                echo "Action reçue : disktest (enchaînement sans reboot)"
+                ping_phase "action_disktest" "$MAC"
+                if wget -q -O /tmp/dt-insession.sh "http://$ORCH_IP/disktest.sh" 2>/dev/null; then
+                    DT_IN_SESSION=1 sh /tmp/dt-insession.sh || true
+                else
+                    ping_phase "disktest_sh_404_insession" "$MAC"
+                fi
+                # Retour à l'attente : re-poll immédiat (la fenêtre/countdown
+                # vient du serveur) + redessin plein écran du banner d'attente
+                # (le banner disktest a pris le tty4 pendant le test).
+                ACTION=""
+                ATTEMPTS=0
+                TICKS_SINCE_POLL=$POLL_INTERVAL
+                RENDERED_ONCE=0
+                VT_SWITCHED=0
+                ;;
+            wait|"")
+                # Continue à attendre
+                ;;
+            *)
+                echo "Action inconnue ignorée : $ACTION"
+                ;;
+        esac
+    fi
+
+    # Décrément local pour faire vivre le countdown chaque seconde entre
+    # deux polls API (le prochain poll réaligne sur la valeur serveur).
+    [ "$REMAINING" -gt 0 ] && REMAINING=$((REMAINING - 1))
+
+    sleep 1
+    ATTEMPTS=$((ATTEMPTS + 1))
+    TICKS_SINCE_POLL=$((TICKS_SINCE_POLL + 1))
+done
+
+# Timeout sécurité : poweroff de fallback
+echo "Timeout 1h dépassé sans action → poweroff de sécurité"
+ping_phase "action_timeout_poweroff" "$MAC"
+poweroff -f 2>/dev/null
+halt -p 2>/dev/null
+halt -f 2>/dev/null
+
+# Toujours exit 0 pour ne jamais faire échouer le early_command
+exit 0

@@ -1,0 +1,1 @@
+/command/with-contenv /opt/pxe-tools/init/bootstrap-render-startup.sh

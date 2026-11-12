@@ -29,9 +29,17 @@ def command(*args: str, cwd: Path | None = None, pass_fds: tuple[int, ...] = ())
 def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
           valid_days: int = 7, ansible_package: Path | None = None, *,
           release_candidate: bool = False, passphrase_file: Path | None = None,
-          previous: Path | None = None) -> None:
+          previous: Path | None = None, source_commit: str | None = None,
+          build_run_id: str | None = None, approved_package_sha256: str | None = None) -> None:
     if release_candidate and ansible_package is not None:
         raise ValueError('the optional production module is not prepared')
+    provenance = (source_commit, build_run_id, approved_package_sha256)
+    if any(value is not None for value in provenance):
+        if (not release_candidate or not all(value is not None for value in provenance)
+                or not re.fullmatch(r'[a-f0-9]{40}', source_commit or '')
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', build_run_id or '')
+                or not re.fullmatch(r'[a-f0-9]{64}', approved_package_sha256 or '')):
+            raise ValueError('complete approved build provenance is required')
     for candidate in (package, ansible_package):
         if candidate is not None and (not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file()):
             raise ValueError('each package must be an absolute regular file')
@@ -78,6 +86,8 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                     digest.update(block)
                     target.write(block)
             copied = pool / f'pxe-tools-{digest.hexdigest()}.deb'
+            if expected == 'pxe-tools' and approved_package_sha256 is not None and digest.hexdigest() != approved_package_sha256:
+                raise ValueError('package differs from approved build provenance')
             if copied.exists():
                 raise ValueError('the same package was supplied twice')
             os.rename(partial, copied)
@@ -106,11 +116,14 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             raise RuntimeError('APT package index is empty')
         (index / 'Packages').write_bytes(packages)
         (index / 'Packages.gz').write_bytes(gzip.compress(packages, mtime=0))
-        by_hash = index / 'by-hash/SHA256'
-        by_hash.mkdir(parents=True)
-        for name in ('Packages', 'Packages.gz'):
-            data = (index / name).read_bytes()
-            (by_hash / hashlib.sha256(data).hexdigest()).write_bytes(data)
+        # APT chooses the strongest advertised digest (typically SHA512).
+        # Serving only SHA256 silently falls back to the mutable path.
+        for algorithm in ('sha256', 'sha512'):
+            by_hash = index / 'by-hash' / algorithm.upper()
+            by_hash.mkdir(parents=True)
+            for name in ('Packages', 'Packages.gz'):
+                data = (index / name).read_bytes()
+                (by_hash / hashlib.new(algorithm, data).hexdigest()).write_bytes(data)
         now = datetime.now(timezone.utc)
         settings = {
             'Origin': 'PXE Tools' if release_candidate else 'PXE Tools local test',
@@ -130,7 +143,13 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             raise RuntimeError('unexpected APT Release metadata')
         # apt-ftparchive does not emit Valid-Until from its Release options.
         expires = format_datetime(now + timedelta(days=valid_days), usegmt=True)
-        release = f'Valid-Until: {expires}\n'.encode('ascii') + release
+        provenance_fields = ''
+        if source_commit is not None:
+            provenance_fields = (f'X-PXE-Source-Commit: {source_commit}\n'
+                                 f'X-PXE-Build-Run: {build_run_id}\n'
+                                 f'X-PXE-Package-SHA256: {approved_package_sha256}\n'
+                                 f'X-PXE-Package-Version: {versions["pxe-tools"]}\n')
+        release = (f'Valid-Until: {expires}\n' + provenance_fields).encode('ascii') + release
         (release_dir / 'Release').write_bytes(release)
         common = ['gpg', '--homedir', str(gnupg_home), '--batch', '--no-tty',
                   '--local-user', fingerprint.upper() + '!', '--digest-algo', 'SHA256']
@@ -212,10 +231,14 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                         raise ValueError('previous package does not match its signed index')
             # Only immutable, content-addressed objects are carried forward. Old
             # mutable Release and Packages paths must never overwrite the new ones.
-            for relative, pattern in (
-                    ('pool/main/p/pxe-tools', r'pxe-tools-([0-9a-f]{64})\.deb'),
-                    ('dists/stable/main/binary-amd64/by-hash/SHA256', r'([0-9a-f]{64})')):
+            for relative, pattern, algorithm, optional in (
+                    ('pool/main/p/pxe-tools', r'pxe-tools-([0-9a-f]{64})\.deb', 'sha256', False),
+                    ('dists/stable/main/binary-amd64/by-hash/SHA256', r'([0-9a-f]{64})', 'sha256', False),
+                    ('dists/stable/main/binary-amd64/by-hash/SHA512', r'([0-9a-f]{128})', 'sha512', True)):
                 source = previous_path(relative)
+                # Older approved snapshots contain SHA256 only.
+                if optional and not source.exists() and not source.is_symlink():
+                    continue
                 if source.is_symlink() or not source.is_dir():
                     raise ValueError('previous snapshot lacks immutable objects')
                 target = stage / relative
@@ -225,7 +248,7 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                     if not match or item.is_symlink() or not item.is_file():
                         raise ValueError('invalid previous immutable object')
                     with item.open('rb') as old:
-                        digest = hashlib.file_digest(old, 'sha256').hexdigest()
+                        digest = hashlib.file_digest(old, algorithm).hexdigest()
                     if digest != match.group(1):
                         raise ValueError('previous immutable object has an invalid digest')
                     dest = target / item.name

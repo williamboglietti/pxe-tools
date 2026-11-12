@@ -1,0 +1,114 @@
+# PXE Tools : appliance unique (interface, worker et services PXE).
+# Choisir explicitement une image locale avant le démarrage. Le réseau hôte
+# donne accès aux interfaces et ports de la machine ; l’administrateur doit
+# choisir et confirmer la configuration réseau avant d’activer le proxy DHCP.
+# Les volumes sont propres au projet Compose et conservés après `down`.
+name: pxe-tools-public
+
+services:
+  pxe-tools:
+    # L’image doit être choisie explicitement ; aucune image privée implicite.
+    image: ${PXE_TOOLS_IMAGE:?Choisir explicitement une image locale de test}
+    pull_policy: ${PXE_TOOLS_PULL_POLICY:-never}
+    restart: unless-stopped
+
+    # network_mode: host requis pour DHCP broadcast L2 (dnsmasq) sur l'interface
+    # physique ET pour exposer directement nginx :80/:8443 sans port mapping.
+    # Conséquence : ports nginx/dnsmasq écoutent sur l'IP de l'host, pas dans
+    # un namespace Docker isolé.
+    network_mode: host
+
+    cap_add:
+      - NET_RAW          # WoL : raw socket UDP + dnsmasq DHCP raw packets
+      - NET_BROADCAST    # WoL : SO_BROADCAST sur 255.255.255.255
+      - NET_ADMIN        # bind-interfaces dnsmasq
+      - NET_BIND_SERVICE # bind ports privilégiés 67/68/69
+
+    volumes:
+      # DB SQLite + data.json + preseed-base.cfg + cert TLS
+      - pxe_data:/var/lib/pxe-tools
+      # Configuration persistante et secrets chiffrants : db.conf, master.key
+      # et future clé privée du worker. À sauvegarder avec pxe_data.
+      - pxe_conf:/etc/pxe-tools
+      # MOK keypair (cert signature GRUB EFI). Volume séparé pour pouvoir
+      # regénérer/restaurer indépendamment de pxe_data.
+      - pxe_mok:/etc/pxe-tools/mok
+      # Artefacts PXE persistants : netboot Debian (~1.5 GB), preseeds rendus,
+      # GRUB EFI signé, lpxelinux. Volumes privés au container mais persistants
+      # entre restarts pour éviter le re-download Debian de 30-60 min.
+      - pxe_http:/srv/http
+      - pxe_tftp:/srv/tftp
+      # Le runtime Ansible et ses données sont ajoutés séparément si nécessaire.
+
+    environment:
+      # === Configuration immuable (templates Debian, kernel opts, bootloaders) ===
+      # Ces variables n'ont pas de raison d'être modifiées par l'admin courant —
+      # elles servent à overrider le comportement par défaut de l'image. Si un
+      # jour il y a besoin de les exposer dans l'UI, elles iront en DB via Setting.
+      DEBIAN_DEFAULT_VERSION: ${DEBIAN_DEFAULT_VERSION:-trixie}
+      DEBIAN_ARCH: ${DEBIAN_ARCH:-amd64}
+      DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://deb.debian.org/debian}
+      KERNEL_OPTS: ${KERNEL_OPTS:-language=fr country=FR locale=fr_FR.UTF-8 keymap=fr ipv6.disable=1}
+      BIOS_BOOTLOADER: ${BIOS_BOOTLOADER:-lpxelinux.0}
+      UEFI_BOOTLOADER: ${UEFI_BOOTLOADER:-grubnetx64.efi}
+      UEFI_ENABLED: ${UEFI_ENABLED:-true}
+
+      # === TLS (Spec A) ===
+      TLS_CN: ${TLS_CN:-pxe-tools.local}
+
+      # === Auth (Lot 3 Spec B) ===
+      # 'local' (default) : login form + bcrypt + sessions PHP via wizard d'init.
+      # 'authentik'       : forward-auth, lit X-Forwarded-User. Nécessite un
+      #                     proxy en amont (nginx auth_request, Authentik outpost,
+      #                     Authelia, Caddy forward_auth, etc.). Voir
+      #                     docker/pxe-tools/nginx/admin-authentik.conf.example.
+      AUTH_MODE: ${AUTH_MODE:-local}
+      # Obligatoire en mode authentik : adresses/CIDR des seuls reverse proxies
+      # qui authentifient et remplacent les en-têtes d'identité du client.
+      AUTHENTIK_TRUSTED_PROXY_CIDRS: ${AUTHENTIK_TRUSTED_PROXY_CIDRS:-}
+
+      # === Ports admin (Spec A.10) ===
+      # Override quand 8443/8080 sont déjà occupés sur l'host (Caddy, Traefik, etc.).
+      # Le port PXE 80 reste fixe (firmwares PXE nécessitent le port HTTP standard).
+      ADMIN_PORT: ${ADMIN_PORT:-8443}
+      ADMIN_HTTP_PORT: ${ADMIN_HTTP_PORT:-8080}
+
+      # === Worker tuning ===
+      WORKER_POLL_S: ${WORKER_POLL_S:-5}
+      ANSIBLE_REPO_URL: ${ANSIBLE_REPO_URL:-}
+      PXE_GIT_SSH_KEY: ${PXE_GIT_SSH_KEY:-}
+
+      # === Secrets preseed (rendus par worker dans les preseeds clients) ===
+      # Pas dans la DB : ce sont des secrets globaux Ansible-managed, pas des
+      # settings utilisateur. Le wizard ne les expose pas.
+      ROOT_PASSWORD_HASH: ${ROOT_PASSWORD_HASH:-}
+      ANSIBLE_SSH_PUBKEY: ${ANSIBLE_SSH_PUBKEY:-}
+      # === Note ===
+      # Les 5 vars dnsmasq (PXE_INTERFACE, DHCP_MODE, ORCHESTRATOR_IP,
+      # DHCP_PROXY_NETWORK, DHCP_PROXY_NETMASK) étaient passées ici pour
+      # éviter le crash de render-dnsmasq-conf au 1er boot. Depuis le fix
+      # mai 2026 (render-dnsmasq-conf écrit un stub si DB vide), elles sont
+      # gérées exclusivement via le wizard /init/welcome puis /settings.
+
+    healthcheck:
+      # Script qui adapte le probe HTTP/HTTPS selon la setting https_enabled
+      # (lit /etc/pxe-tools/db.conf + sqlite3 settings, fallback HTTPS si la DB
+      # n'est pas encore initialisée). Voir docker/pxe-tools/init/healthcheck.sh.
+      test: ["CMD-SHELL", "/opt/pxe-tools/init/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # 600s : au 1er boot, bootstrap-download-debian peut télécharger ~1.5 GB
+      # (kernel/initrd/firmware pour 2 versions Debian). Géré par worker.py via
+      # init_jobs en background — les longruns nginx/php-fpm/dnsmasq démarrent
+      # avant la fin du download, donc /healthz répond rapidement, mais on laisse
+      # une marge confortable pour les premiers démarrages très lents.
+      start_period: 600s
+
+# No shared legacy volume names: importing existing data is a separate operation.
+volumes:
+  pxe_data: {}
+  pxe_conf: {}
+  pxe_mok: {}
+  pxe_http: {}
+  pxe_tftp: {}

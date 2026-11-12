@@ -1,0 +1,63 @@
+# {{ ansible_managed }}
+# Preseed pour les tests de disque (SMART + badblocks).
+# But : netcfg DHCP, atteindre partman/early_command (drivers chargés),
+# exécuter disktest.sh, suivre l'instruction post_action (reboot|poweroff). Ne PAS installer Debian.
+
+# Localisation (évite les questions interactives)
+d-i debian-installer/locale string fr_FR.UTF-8
+d-i keyboard-configuration/xkb-keymap select fr
+d-i debian-installer/language string fr
+d-i debian-installer/country string FR
+
+# Réseau — DHCP auto sur la première interface
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string disktest
+d-i netcfg/get_domain string lan
+d-i netcfg/dhcp_timeout string 30
+d-i netcfg/disable_autoconfig boolean false
+
+# Mirror Debian — utilisé par anna-install pour télécharger les udebs drivers SATA/NVMe
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+
+# Clock — non-interactif
+d-i clock-setup/utc boolean true
+d-i time/zone string Europe/Paris
+d-i clock-setup/ntp boolean true
+
+# Comptes — user dummy (on n'install pas)
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string DiskTest
+d-i passwd/username string disktest
+d-i passwd/user-password password disktest
+d-i passwd/user-password-again password disktest
+d-i user-setup/encrypt-home boolean false
+d-i user-setup/allow-password-weak boolean true
+
+# apt-setup minimal
+d-i apt-setup/contrib boolean false
+d-i apt-setup/non-free boolean false
+d-i apt-setup/non-free-firmware boolean true
+d-i apt-setup/services-select multiselect security, updates
+
+# === Disktest boot — déclenchement du script ===
+#
+# preseed/early_command : ping de "boot started"
+d-i preseed/early_command string \
+    wget -q "http://{{ pxe_ip }}/api/disktest-progress?test_id=0&line=preseed_early_loaded" -O /dev/null || true
+
+# partman/early_command : drivers SATA/NVMe chargés → /sys/block peuplé.
+# disktest.sh récupère le job via /api/disktest-job?mac=, télécharge smartctl/badblocks,
+# exécute les tests par disque, POST results + end, applique post_action (reboot|poweroff).
+#
+# Hardening Spec A : log explicite via /api/disktest-progress en cas de 404 ou run failed,
+# avant le poweroff de fallback.
+d-i partman/early_command string \
+    if wget -q http://{{ pxe_ip }}/disktest.sh -O /tmp/dt.sh 2>/dev/null; then \
+        ORCH_IP={{ pxe_ip }} sh /tmp/dt.sh || wget -q "http://{{ pxe_ip }}/api/disktest-progress?test_id=0&line=disktest_sh_run_failed" -O /dev/null 2>/dev/null; \
+    else \
+        wget -q "http://{{ pxe_ip }}/api/disktest-progress?test_id=0&line=disktest_sh_404" -O /dev/null 2>/dev/null; \
+    fi; \
+    poweroff -f || halt -p || true

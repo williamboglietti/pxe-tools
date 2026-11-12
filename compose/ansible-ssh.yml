@@ -1,0 +1,10 @@
+# Optional trusted SSH identities for the same appliance; no service is added.
+services:
+  pxe-tools:
+    volumes:
+      - type: bind
+        source: ${PXE_ANSIBLE_SSH_DIR:?Choisir un dossier SSH préparé et vérifié}
+        target: /home/ansible/.ssh
+        read_only: true
+        bind:
+          create_host_path: false

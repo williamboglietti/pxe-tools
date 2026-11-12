@@ -53,7 +53,9 @@ test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
 prepare="$root/packaging/native/prepare-static-apt.py"
 python3 "$prepare" "$fixture/next" "$fixture/static" --keyring "$fixture/public.gpg" \
-    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1 || {
+    cat "$fixture/static.log" >&2; exit 1;
+}
 cmp "$old_index" "$fixture/static/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
 gpgv --keyring "$fixture/static/pxe-tools-archive-keyring.gpg" "$fixture/static/dists/stable/InRelease" > /dev/null 2>&1
 if [[ "${PXE_STATIC_WRANGLER:-}" == 1 ]]; then
@@ -79,6 +81,21 @@ if python3 "$prepare" "$fixture/extra-static" "$fixture/static-extra" --keyring 
     echo 'Unexpected extra file unexpectedly staged' >&2; exit 1
 fi
 test ! -e "$fixture/static-extra"
+cp -a "$fixture/next" "$fixture/tampered-package"
+package_to_corrupt=$(find "$fixture/tampered-package/pool" -name '*.deb' -print -quit)
+printf corrupt >> "$package_to_corrupt"
+if python3 "$prepare" "$fixture/tampered-package" "$fixture/static-package-bad" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-package-bad.log" 2>&1; then
+    echo 'Modified package unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-package-bad"
+cp -a "$fixture/next" "$fixture/symlink-static"
+ln -s "$fixture/passphrase" "$fixture/symlink-static/unexpected-link"
+if python3 "$prepare" "$fixture/symlink-static" "$fixture/static-symlink" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-symlink.log" 2>&1; then
+    echo 'Symlink unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-symlink"
 if python3 "$prepare" "$fixture/next" "$fixture/next/nested-output" --keyring "$fixture/public.gpg" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-nested.log" 2>&1; then
     echo 'Output inside snapshot unexpectedly accepted' >&2; exit 1

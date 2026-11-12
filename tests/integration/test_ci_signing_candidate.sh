@@ -50,6 +50,47 @@ python3 "$helper" "$fixture/package-next.deb" "$fixture/next" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 --previous "$fixture/good" > "$fixture/next.log" 2>&1
 cmp "$old_index" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
 test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
+gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
+prepare="$root/packaging/native/prepare-static-apt.py"
+python3 "$prepare" "$fixture/next" "$fixture/static" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1
+cmp "$old_index" "$fixture/static/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+gpgv --keyring "$fixture/static/pxe-tools-archive-keyring.gpg" "$fixture/static/dists/stable/InRelease" > /dev/null 2>&1
+if [[ "${PXE_STATIC_WRANGLER:-}" == 1 ]]; then
+    "$root/packaging/cloudflare/node_modules/.bin/wrangler" deploy \
+        --config "$root/packaging/cloudflare/wrangler.jsonc" --assets "$fixture/static" --dry-run
+fi
+cp -a "$fixture/next" "$fixture/tampered-static"
+printf corrupt >> "$fixture/tampered-static/dists/stable/main/binary-amd64/Packages"
+if python3 "$prepare" "$fixture/tampered-static" "$fixture/static-bad" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-bad.log" 2>&1; then
+    echo 'Modified signed index unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-bad"
+if python3 "$prepare" "$fixture/next" "$fixture/static-wrong-key" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint 1111111111111111111111111111111111111111 > "$fixture/static-wrong-key.log" 2>&1; then
+    echo 'Wrong signer unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-wrong-key"
+cp -a "$fixture/next" "$fixture/extra-static"
+printf 'private fixture' > "$fixture/extra-static/unexpected-secret.txt"
+if python3 "$prepare" "$fixture/extra-static" "$fixture/static-extra" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-extra.log" 2>&1; then
+    echo 'Unexpected extra file unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-extra"
+if python3 "$prepare" "$fixture/next" "$fixture/next/nested-output" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-nested.log" 2>&1; then
+    echo 'Output inside snapshot unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/next/nested-output"
+cp -a "$fixture/next" "$fixture/oversized-static"
+truncate -s 26214401 "$fixture/oversized-static/pool/main/p/pxe-tools/pxe-tools-$(printf '%064d' 0).deb"
+if python3 "$prepare" "$fixture/oversized-static" "$fixture/static-oversized" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-oversized.log" 2>&1; then
+    echo 'Oversized asset unexpectedly staged' >&2; exit 1
+fi
+test ! -e "$fixture/static-oversized"
 APT_SIGNING_KEY="$(cat "$fixture/full.asc")" python3 "$helper" "$fixture/package.deb" "$fixture/with-primary" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/full.log" 2>&1 && {
     echo 'Secret primary key unexpectedly accepted' >&2; exit 1;

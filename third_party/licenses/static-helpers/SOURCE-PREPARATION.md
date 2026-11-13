@@ -34,7 +34,7 @@ The archive is available at the release directory below.
 Release distribution must include the matching source and relink materials
 alongside the binaries. The immutable source offer and direct download links are documented at:
 
-https://packages.pxetools.com/sources/static-helpers/2026-11-12/README.md
+https://github.com/williamboglietti/pxe-tools/releases/tag/sources-2026-11-12
 
 The release must include all five files and must retain them for at least as
 long as the corresponding binaries are distributed:

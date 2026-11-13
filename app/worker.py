@@ -360,6 +360,9 @@ def run_image_delete(job: dict) -> None:
             _read_image_delete_signal(process, b'COMMITTED\n')
             if process.wait(timeout=10) != 0:
                 raise ValueError('deletion child failed')
+            with db_connect() as db:
+                if db.execute('SELECT 1 FROM os_images WHERE id=?', (image_id,)).fetchone() is not None:
+                    raise ValueError('image deletion was not committed')
         # Once the SQL row is gone, remove only this job's staged files.
         cleanup_committed(fd, job_id)
         update_init_job(job_id, status='success', message='Image et fichiers locaux supprimés.',

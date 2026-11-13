@@ -60,9 +60,7 @@ chmod 0644 "$MOK_DIR/MOK.pem" "$MOK_DIR/MOK.der"
 if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
     python3 "$(dirname "${BASH_SOURCE[0]}")/publish-public-mok.py" "$MOK_DIR" "$HTTP_ROOT"
 else
-    mkdir -p "$HTTP_ROOT"
-    cp "$MOK_DIR/MOK.der" "$HTTP_ROOT/MOK.der"
-    chmod 0644 "$HTTP_ROOT/MOK.der"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/atomic_publish.py" "$MOK_DIR/MOK.der" "$HTTP_ROOT/MOK.der"
 fi
 
 echo "[bootstrap-mok] OK"

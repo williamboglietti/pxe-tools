@@ -25,7 +25,8 @@ if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
         python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" tftp "$directory"
     done
 fi
-mkdir -p "$TFTP_ROOT/pxelinux.cfg" "$TFTP_ROOT/grub" "$HTTP_ROOT" "$PXE_TOOLS_DATA_DIR"
+python3 "$BOOTSTRAP_SCRIPTS_DIR/atomic_publish.py" --prepare-menu "$TFTP_ROOT"
+mkdir -p "$TFTP_ROOT/grub" "$HTTP_ROOT" "$PXE_TOOLS_DATA_DIR"
 
 render() {
     local src="$1" dst="$2"

@@ -31,6 +31,8 @@
 set -eu
 
 TFTP_ROOT="${TFTP_ROOT:-/srv/tftp}"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BOOTSTRAP_SCRIPTS_DIR="${BOOTSTRAP_SCRIPTS_DIR:-$SCRIPT_DIR}"
 DB_PATH=$(python3 "${PXE_APP_DIR:-/app}/database_selection.py") || exit 1
 if [ -e /etc/pxe-tools/db.conf ] && [ ! -f "$DB_PATH" ]; then
     echo '[render-per-mac] Base SQLite configurée absente ; menus existants conservés.' >&2
@@ -51,6 +53,14 @@ if [ -z "$ORCH_IP" ]; then
     echo "[render-per-mac] ORCHESTRATOR_IP absent (DB + env) → skip"
     exit 0
 fi
+python3 - "$ORCH_IP" <<'PY'
+import ipaddress, sys
+try:
+    if ipaddress.ip_address(sys.argv[1]).version != 4:
+        raise ValueError('expected IPv4')
+except ValueError:
+    raise SystemExit('[render-per-mac] invalid PXE IPv4 address')
+PY
 
 KERNEL_OPTS="${KERNEL_OPTS:-language=fr country=FR locale=fr_FR.UTF-8 keymap=fr ipv6.disable=1}"
 # DEBIAN_DEFAULT_VERSION is a codename (e.g. trixie), not an os_images.distro.
@@ -85,6 +95,7 @@ resolve_netboot_path() {
              ORDER BY version_full DESC LIMIT 1" 2>/dev/null || true)
     fi
     if [ -n "$rvf" ]; then
+        case "$rvf" in *[!a-zA-Z0-9._+-]*|*..*) echo '[render-per-mac] version invalide' >&2; return 1 ;; esac
         echo "$rdistro/$rvf/$rarch"
     else
         # Fallback layout legacy (pré-v2 ; peut ne pas exister sur disque mais
@@ -107,26 +118,20 @@ if [ -f "$DB_PATH" ]; then
      ORDER BY version_full DESC LIMIT 1" 2>/dev/null || true)
 fi
 if [ -n "$DEFAULT_VERSION" ]; then
+    case "$DEFAULT_VERSION" in *[!a-zA-Z0-9._+-]*|*..*) echo '[render-per-mac] version invalide' >&2; exit 1 ;; esac
     DEFAULT_NETBOOT_PATH="debian/$DEFAULT_VERSION/$DEFAULT_ARCH"
 else
     DEFAULT_NETBOOT_PATH="debian/$DEFAULT_ARCH"
 fi
 
-mkdir -p "$PXELINUX_DIR"
-
-# Permissions : permet à www-data (PHP-FPM, qui supprime un fichier per-MAC
-# lors de Machine::delete) d'unlink dans ce dossier. Sans le write bit sur
-# le DIRECTORY, www-data ne peut PAS supprimer un fichier même si le fichier
-# lui-même est writable. Idempotent (chgrp/chmod sans effet si déjà ok).
-chgrp www-data "$PXELINUX_DIR" 2>/dev/null || true
-chmod g+w "$PXELINUX_DIR" 2>/dev/null || true
-
-# Cleanup : enlève les anciens fichiers 01-<MAC> avant regénération.
-# Évite les fichiers orphelins pour des machines supprimées.
-find "$PXELINUX_DIR" -maxdepth 1 -name '01-*' -type f -delete 2>/dev/null || true
+# The TFTP root and lock are prepared by root; www-data can unlink menus but
+# cannot replace the lock. Hold it through the DB read and all publications.
+python3 "$BOOTSTRAP_SCRIPTS_DIR/atomic_publish.py" --prepare-menu "$TFTP_ROOT"
+exec 9>"$TFTP_ROOT/.pxe-menu.lock"
+flock -w 10 -x 9
 
 if [ ! -f "$DB_PATH" ]; then
-    echo "[render-per-mac] DB absente → seul pxelinux.cfg/default reste servi"
+    echo "[render-per-mac] DB absente → menus existants conservés"
     exit 0
 fi
 
@@ -137,18 +142,28 @@ fi
 # install_config_json est extrait via json_extract pour récupérer le couple
 # (distro, version_full) du snapshot d'install. NULL si snapshot vide ou clé
 # absente (legacy preset sans version_full → resolve_netboot_path fallback latest).
-count=0
-sqlite3 "$DB_PATH" \
+batch=$(mktemp -d "$TFTP_ROOT/.pxe-menu-batch.XXXXXXXX")
+cleanup_batch() { rm -f -- "$batch"/*; rmdir -- "$batch" 2>/dev/null || true; }
+trap cleanup_batch EXIT
+trap 'exit 1' HUP INT TERM
+sqlite3 -cmd '.timeout 5000' -json "$DB_PATH" \
     "SELECT mac, hostname, status, rescue_mode, local_boot_source,
             COALESCE(json_extract(install_config_json, '\$.distro'), '') AS m_distro,
             COALESCE(json_extract(install_config_json, '\$.version_full'), '') AS m_version_full
-     FROM machines" \
-    2>/dev/null | \
-while IFS='|' read -r mac hostname status rescue_mode local_boot_source m_distro m_version_full; do
+     FROM machines" > "$batch/rows.json"
+python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-pxe-menu-rows.py" \
+    "$batch/rows.json" > "$batch/rows.txt"
+count=0
+while IFS='|' read -r mac hostname_encoded status rescue_mode local_boot_source m_distro m_version_full; do
     [ -z "$mac" ] && continue
+    hostname=$(printf '%s' "$hostname_encoded" | base64 -d)
     # Normalise MAC : lowercase + tirets (au cas où la DB aurait des colons)
     mac_lc=$(echo "$mac" | tr 'A-Z:' 'a-z-')
+    if ! printf '%s\n' "$mac_lc" | grep -Eq '^([0-9a-f]{2}-){5}[0-9a-f]{2}$'; then
+        echo '[render-per-mac] invalid MAC; refusing unsafe output path' >&2; exit 1
+    fi
     out="$PXELINUX_DIR/01-$mac_lc"
+    temporary="$batch/01-$mac_lc"
 
     # Path netboot per-machine : utilisé dans les sections qui consomment
     # le snapshot d'install (configured/installing/reinstall). Les autres
@@ -157,7 +172,7 @@ while IFS='|' read -r mac hostname status rescue_mode local_boot_source m_distro
 
     # rescue_mode=1 override tout
     if [ "$rescue_mode" = "1" ]; then
-        cat > "$out" <<EOF
+        cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} en mode rescue
 DEFAULT rescue
@@ -183,7 +198,7 @@ EOF
 
     case "$routing_status" in
         wiping)
-            cat > "$out" <<EOF
+            cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} en cours de wipe
 DEFAULT wipe
@@ -197,7 +212,7 @@ LABEL wipe
 EOF
             ;;
         testing)
-            cat > "$out" <<EOF
+            cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} en cours de tests disque
 DEFAULT disktest
@@ -213,7 +228,7 @@ EOF
         configured|installing)
             # Installation via preseed.php?mac=$mac (qui sert le preseed
             # généré depuis machine.install_config_json).
-            cat > "$out" <<EOF
+            cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} → installation auto
 DEFAULT install
@@ -236,7 +251,7 @@ EOF
             # par la BIOS, ce qui fonctionne indépendamment du firmware.
             # Workaround historique : débrancher l'Ethernet au démarrage forçait
             # la BIOS à skip PXE et booter local correctement.
-            cat > "$out" <<EOF
+            cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} déjà installée → boot local (chain.c32 hd0)
 DEFAULT localboot
@@ -256,7 +271,7 @@ EOF
         *)
             # discovered, inventorying, unknown, failed → on retombe sur
             # le menu discovery (sonde hardware + ack /api/discovery).
-            cat > "$out" <<EOF
+            cat > "$temporary" <<EOF
 # Géré par pxe-tools-worker (NE PAS éditer)
 # Machine ${hostname:-$mac} status=${status:-unknown} → discovery
 DEFAULT discovery
@@ -272,6 +287,13 @@ EOF
     esac
     count=$((count + 1))
     echo "[render-per-mac] $out (status=$status, hostname=${hostname:-?})"
+done < "$batch/rows.txt"
+
+# All rows and generated files are valid before any existing menu is changed.
+for menu in "$batch"/01-*; do
+    [ -f "$menu" ] || continue
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/atomic_publish.py" "$menu" "$PXELINUX_DIR/${menu##*/}"
 done
+python3 "$BOOTSTRAP_SCRIPTS_DIR/atomic_publish.py" --clean-menu "$PXELINUX_DIR" "$batch"
 
 echo "[render-per-mac] done"

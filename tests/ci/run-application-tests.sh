@@ -70,6 +70,7 @@ bash tests/integration/test_clean_release_checkout.sh
 echo '::endgroup::'
 
 echo '::group::Protected image deletion and crash recovery'
+PXE_APPLIANCE_HTTP_FIXTURE_TEST=1 python3 tests/integration/test_appliance_http_fixture.py
 PXE_IMAGE_DELETE_TEST=1 python3 tests/integration/test_image_delete_worker.py
 PXE_DOCKER_HTTP_TEST=1 python3 tests/integration/test_docker_http_tree.py
 echo '::endgroup::'

@@ -214,7 +214,7 @@ done
                 health=docker('exec',app,'curl','-sS','--max-time','2','http://127.0.0.1/healthz',check=False)
                 return result.returncode==0 and health.returncode==0
             wait_for(ready,90,'appliance services')
-            config=docker('exec',app,'cat','/etc/pxe-tools/dnsmasq.conf').stdout
+            config=docker('exec',app,'cat','/var/lib/pxe-tools-native/rendered/dnsmasq.conf').stdout
             if 'dhcp-range=192.0.2.0,proxy,255.255.255.0' not in config:
                 raise RuntimeError('actual proxy DHCP configuration not active')
             docker('exec','-e','TFTP_ROOT=/var/lib/pxe-tools/tftp',app,'bash',

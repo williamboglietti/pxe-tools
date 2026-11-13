@@ -59,6 +59,7 @@ python3 tests/unit/test_configure_secure_runtime.py
 python3 tests/unit/test_restored_publication_guard.py
 python3 tests/unit/test_publish_public_mok.py
 python3 tests/unit/test_native_runtime_paths.py
+python3 tests/integration/test_native_dnsmasq_private_config.py
 python3 tests/unit/test_native_image_path_guard.py
 python3 tests/integration/test_native_package_permissions.py
 bash tests/integration/test_clean_release_checkout.sh

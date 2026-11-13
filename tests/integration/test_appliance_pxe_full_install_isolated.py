@@ -13,10 +13,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import time
+from appliance_http_fixture import prepare_http_fixture
 
 ROOT=Path(__file__).resolve().parents[2]
 if os.environ.get('PXE_L2_ISOLATED_TEST') != '1' or os.geteuid() != 0:
@@ -84,6 +86,7 @@ def main():
         fixture=root/'fixture'; fixture.mkdir(mode=0o755)
         data,conf,http,tftp=(root/x for x in ('data','conf','http','tftp'))
         for directory in (data,conf,http,tftp):directory.mkdir(mode=0o755)
+        prepare_http_fixture(http)
         (conf/'master.key').write_bytes(os.urandom(32));(conf/'master.key').chmod(0o600)
         (conf/'db.conf').write_text(json.dumps({'driver':'sqlite','path':'/var/lib/pxe-tools/chosen.sqlite'}))
         (conf/'db.conf').chmod(0o600)
@@ -148,7 +151,6 @@ def main():
                 return (fixture/'ready').exists()
             wait_for(mirror_ready,600,'authenticated fixture mirror')
             for item in ('linux','initrd.gz'):
-                import shutil
                 shutil.copyfile(fixture/item,netboot/item)
             mounts += ['--mount',f'type=bind,src={fixture},dst=/fixture-data',
                        '--mount',f'type=bind,src={nginx_file},dst=/etc/nginx/conf.d/pxe.conf,readonly',

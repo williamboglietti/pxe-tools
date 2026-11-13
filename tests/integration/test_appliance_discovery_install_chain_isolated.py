@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from appliance_http_fixture import prepare_http_fixture
 
 ROOT=Path(__file__).resolve().parents[2]
 if os.environ.get('PXE_L2_ISOLATED_TEST') != '1' or os.geteuid() != 0:
@@ -84,6 +85,7 @@ def main():
         fixture=root/'fixture'; fixture.mkdir(mode=0o755)
         data,conf,http,tftp=(root/x for x in ('data','conf','http','tftp'))
         for directory in (data,conf,http,tftp):directory.mkdir(mode=0o755)
+        prepare_http_fixture(http)
         (conf/'master.key').write_bytes(os.urandom(32));(conf/'master.key').chmod(0o600)
         (conf/'db.conf').write_text(json.dumps({'driver':'sqlite','path':'/var/lib/pxe-tools/chosen.sqlite'}))
         (conf/'db.conf').chmod(0o600)
@@ -139,7 +141,6 @@ done
         discover_script=discover_script.replace(marker,probe+marker)
         discover_template=root/'discover.sh.j2';discover_template.write_text(discover_script)
         import shutil
-        shutil.copytree(ROOT/'docker/pxe-tools/static-bin',http/'static-bin')
         docker('run','--rm','--network','none','--mount',f'type=bind,src={root},dst=/fixture-data',
                '--entrypoint','qemu-img',image,'create','-f','qcow2','/fixture-data/fixture.qcow2','12G')
         mounts=[]

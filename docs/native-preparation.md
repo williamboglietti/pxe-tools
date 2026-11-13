@@ -86,6 +86,19 @@ est conservé avec le trousseau. Un trousseau configuré explicitement via
 trousseau pour les autres versions du paquet. Aucun échec de signature n'est
 contourné. La prise en charge complète d'Ubuntu reste à valider avant annonce.
 
+Pour le démarrage de clients Debian depuis un hôte Ubuntu, le shim Ubuntu ne
+fait pas confiance à la signature Debian du noyau. Le worker prépare donc un
+couple shim et MokManager Debian, sans installer leurs paquets ni modifier les
+sources APT du système : il utilise un état APT temporaire et un trousseau
+Debian explicite, valide les métadonnées et paquets, exige que les deux paquets
+aient été construits avec la même version de shim, puis compare le shim au
+fichier netboot couvert par les sommes de l'installateur Debian. Une erreur de
+signature, de fraîcheur, de contenu ou de correspondance interrompt la mise à
+jour avant remplacement du couple précédent. Pendant le bref remplacement des
+deux fichiers, un client pourrait subir un échec de démarrage ; il ne faut pas
+désactiver Secure Boot pour contourner cet échec. Si les archives Debian ne
+sont pas disponibles, le renouvellement du couple ne peut pas être vérifié.
+
 Avant de servir les fichiers de démarrage Debian, PXE Tools vérifie la
 signature de `InRelease`, la fraîcheur des champs authentifiés, puis les
 empreintes des fichiers. Si `Valid-Until` existe, une date expirée est

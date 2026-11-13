@@ -39,6 +39,7 @@ echo '::endgroup::'
 echo '::group::Debian preseed, signed bootloaders and disk guards'
 python3 tests/unit/test_preseed_install_invariants.py
 python3 tests/unit/test_grub_sbat_distribution.py
+python3 tests/unit/test_debian_shim_acquisition.py
 echo '::endgroup::'
 
 echo '::group::Signed Debian netboot freshness and integrity'

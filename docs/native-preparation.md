@@ -29,24 +29,37 @@ Hyper-V ; la procédure d'enrôlement varie selon le matériel.
 
 ## Mise à niveau et conservation des données
 
-La mise à niveau est refusée si les services PXE Tools sont encore actifs. Dans
-une fenêtre de maintenance, arrêtez-les avant la mise à niveau. Sur une
-installation héritée, ne redémarrez pas encore : les anciens chemins peuvent être
-refusés par les nouvelles protections et demandent une migration explicite, non
-encore automatisée ni validée de bout en bout. Préservez tous les fichiers et une
-sauvegarde cohérente vérifiée, ainsi que le paquet précédent pour un retour arrière.
-Après validation des chemins de votre instance, redémarrez les services appropriés :
+La mise à niveau est refusée si les services PXE Tools sont encore actifs. Avant
+de commencer, prévoyez une fenêtre d'arrêt, une sauvegarde chiffrée vérifiée et
+conservez le paquet de la version précédente ainsi que les chemins et la
+configuration existants pour préparer un éventuel retour arrière. La remise en
+service et le retour arrière doivent être vérifiés pour votre instance.
+
+Arrêtez les services dans la fenêtre de maintenance, puis mettez le paquet à
+niveau :
 
 ```sh
 sudo systemctl stop pxe-tools.target pxe-tools-admin.target pxe-tools-worker.service pxe-tools-dnsmasq-tail.service pxe-tools-nginx.service pxe-tools-pxe-http.service pxe-tools-php.service pxe-tools-dnsmasq.service pxe-tools-init.service
 sudo apt install --only-upgrade pxe-tools
-# Vérifier et, si nécessaire, migrer explicitement les anciens chemins avant reprise.
-sudo systemctl start pxe-tools-admin.target
-sudo systemctl is-active pxe-tools-init.service pxe-tools-php.service pxe-tools-nginx.service pxe-tools-worker.service
-curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/
-# Si le réseau PXE avait déjà été configuré et doit être réactivé :
-sudo systemctl start pxe-tools.target
 ```
+
+Une installation neuve reçoit les chemins protégés décrits ci-dessous lors de
+la configuration du paquet. Pour une instance existante, la mise à niveau ne
+crée ni ne migre automatiquement ces chemins. Si elle utilise encore des
+répertoires ou des parents modifiables par le service web, l'initialisation
+refuse de démarrer. Ne relancez pas les services avant d'avoir examiné les
+chemins et la configuration et préparé une reprise adaptée. La migration en
+place n'est pas encore validée ; conservez les données et chemins d'origine et
+ne les écrasez pas pour tenter de forcer le démarrage.
+
+Après une reprise préparée et vérifiée pour votre instance, contrôlez
+individuellement les services utilisés, notamment `pxe-tools-init.service`,
+`pxe-tools-php.service`, `pxe-tools-nginx.service` et
+`pxe-tools-worker.service`, avec `systemctl status` et leurs journaux. L'état
+actif de `pxe-tools-admin.target` ne suffit pas à confirmer leur démarrage.
+Vérifiez aussi `pxe-tools-pxe-http.service` et `pxe-tools-dnsmasq.service` si
+le réseau PXE doit être réactivé. Ne réactivez ce réseau qu'après contrôle et
+confirmation explicite.
 
 La suppression et la purge préservent les données sous `/var/lib/pxe-tools`, la
 configuration et les clés sous `/etc/pxe-tools`, ainsi que les journaux. Une
@@ -87,8 +100,9 @@ répertoires TFTP, HTTP, de rendus ou MOK, ou leurs parents, sont modifiables pa
 le service web, l'initialisation et les tâches natives refusent les écritures
 privilégiées jusqu'à leur migration explicite.
 Une migration demande une fenêtre d'arrêt et une sauvegarde chiffrée vérifiée
-selon [la procédure de restauration](backup-restore.md). Restaurez une copie
-dans les nouveaux emplacements protégés, sans écraser les anciens ; confirmez
+selon [la procédure de restauration](backup-restore.md), qui décrit une cible
+neuve et ne constitue pas une procédure de migration en place validée.
+Préparez une copie dans des emplacements protégés, sans écraser les anciens ; confirmez
 la correspondance clé privée/certificat et l'empreinte de la MOK avec une
 référence administrateur indépendante ou les clients déjà enrôlés. L'ancien
 parent étant modifiable par le service web, sa seule présence n'établit pas

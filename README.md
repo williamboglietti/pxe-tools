@@ -50,7 +50,9 @@ client concerné avant d'utiliser le chargeur signé par cette instance.
 ## Données et limites
 
 La base SQLite, la clé de chiffrement et les fichiers persistants doivent être
-sauvegardés ensemble. Une désinstallation du paquet conserve les données.
+sauvegardés ensemble. Une procédure de [sauvegarde chiffrée et restauration
+en veille](docs/backup-restore.md) est disponible en ligne de commande. Une
+désinstallation du paquet conserve les données.
 MySQL et MariaDB sont actuellement désactivés : une configuration existante
 est conservée mais n'est pas migrée automatiquement.
 

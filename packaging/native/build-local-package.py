@@ -18,7 +18,8 @@ CONTROL = '''Package: {package_name}
 Version: {version}
 Architecture: amd64
 Maintainer: {maintainer}
-Depends: adduser, ca-certificates, cpio, curl, debian-archive-keyring, dnsmasq-base, gettext-base, git, gpgv, grub-efi-amd64-bin, grub-efi-amd64-signed, iproute2, ipxe, mokutil, nginx, openssh-client, openssl, php-cli | php8.4-cli | php8.3-cli | php8.2-cli, php-curl | php8.4-curl | php8.3-curl | php8.2-curl, php-fpm | php8.4-fpm | php8.3-fpm | php8.2-fpm, php-sqlite3 | php8.4-sqlite3 | php8.3-sqlite3 | php8.2-sqlite3, pxelinux, python3 (>= 3.11), python3-jinja2, python3-nacl, sbsigntool, shim-signed, sqlite3, sshpass, syslinux-common, syslinux-efi, systemd, util-linux, wget, xz-utils, 7zip | p7zip-full
+Pre-Depends: python3 (>= 3.11)
+Depends: adduser, ca-certificates, cpio, curl, debian-archive-keyring, dnsmasq-base, gettext-base, git, gpgv, grub-efi-amd64-bin, grub-efi-amd64-signed, iproute2, ipxe, mokutil, nginx, openssh-client, openssl, php-cli | php8.4-cli | php8.3-cli | php8.2-cli, php-curl | php8.4-curl | php8.3-curl | php8.2-curl, php-fpm | php8.4-fpm | php8.3-fpm | php8.2-fpm, php-sqlite3 | php8.4-sqlite3 | php8.3-sqlite3 | php8.2-sqlite3, pxelinux, python3-jinja2, python3-nacl, sbsigntool, shim-signed, sqlite3, sshpass, syslinux-common, syslinux-efi, systemd, util-linux, wget, xz-utils, 7zip | p7zip-full
 Section: admin
 Priority: optional
 Description: {description}
@@ -28,12 +29,17 @@ Description: {description}
 PREINST = '''#!/bin/sh
 set -eu
 if [ "$1" = install ]; then
-    for path in /opt/pxe-tools /usr/lib/pxe-tools; do
-        if [ -e "$path" ] || [ -L "$path" ]; then
-            echo "pxe-tools-local-test: existing $path preserved; installation refused" >&2
-            exit 1
-        fi
-    done
+    if [ -e /opt/pxe-tools ] || [ -L /opt/pxe-tools ]; then
+        echo 'pxe-tools-local-test: existing /opt/pxe-tools preserved; installation refused' >&2
+        exit 1
+    fi
+    if [ -e /usr/lib/pxe-tools ] || [ -L /usr/lib/pxe-tools ]; then
+        # Old versions may leave only interpreter caches after purge. Refuse
+        # anything unknown before removing those narrowly recognised files.
+        python3 - /usr/lib/pxe-tools <<'PXE_CACHE_CLEANUP'
+@@PXE_CACHE_CLEANUP@@
+PXE_CACHE_CLEANUP
+    fi
 fi
 if [ "$1" = upgrade ] && [ -d /run/systemd/system ]; then
     for unit in pxe-tools.target pxe-tools-admin.target pxe-tools-worker.service pxe-tools-dnsmasq-tail.service pxe-tools-nginx.service pxe-tools-pxe-http.service pxe-tools-php.service pxe-tools-dnsmasq.service pxe-tools-init.service; do
@@ -111,7 +117,9 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
                                  'This package is intended for isolated test environments.'))
         (control/'control').write_text(CONTROL.format(version=version, package_name=package_name,
                                                        maintainer=maintainer, description=description, details=details))
-        for name, text in [('preinst',PREINST),('postinst',POSTINST),('prerm',PRERM),('postrm',POSTRM)]:
+        cleanup = (ROOT/'packaging/native/prune-package-cache.py').read_text()
+        preinst = PREINST.replace('@@PXE_CACHE_CLEANUP@@', cleanup)
+        for name, text in [('preinst',preinst),('postinst',POSTINST),('prerm',PRERM),('postrm',POSTRM)]:
             p=control/name; p.write_text(text.replace('pxe-tools-local-test', package_name)); p.chmod(0o755)
         copy_tree(ROOT/'app', root/'usr/lib/pxe-tools/app')
         copy_tree(ROOT/'docker/worker/scripts', root/'opt/pxe-tools/scripts')

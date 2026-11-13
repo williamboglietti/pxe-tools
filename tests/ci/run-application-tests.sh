@@ -12,6 +12,12 @@ echo '::group::First boot and master key preservation'
 python3 tests/test_master_key_bootstrap.py
 echo '::endgroup::'
 
+echo '::group::Encrypted offline recovery and standby restore'
+PXE_OFFLINE_RECOVERY_TEST=1 python3 tests/integration/test_offline_recovery_archive.py
+PXE_RECOVERY_ASSET_TEST=1 python3 tests/integration/test_recovery_asset_trees.py
+python3 tests/unit/test_prune_package_cache.py
+echo '::endgroup::'
+
 echo '::group::Concurrent image selection and real onboarding HTTP'
 php tests/unit/test_wizard_image_race.php
 PXE_WIZARD_RACE_ISOLATED=1 python3 tests/integration/test_wizard_image_race_http.py

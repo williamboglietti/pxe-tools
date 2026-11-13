@@ -46,6 +46,8 @@ class RendererTests(unittest.TestCase):
         builder_spec.loader.exec_module(builder)
         package = Path(self.work.name) / 'fixture.deb'
         builder.build(package, '0.1.0~bindingtest')
+        pre_depends = subprocess.check_output(['dpkg-deb', '--field', str(package), 'Pre-Depends'], text=True).strip()
+        self.assertIn('python3 (>= 3.11)', pre_depends)
         payload = subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(package)])
         with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
             template = archive.extractfile('./usr/lib/pxe-tools/native/pxe.conf').read().decode()

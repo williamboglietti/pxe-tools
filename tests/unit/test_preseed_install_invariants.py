@@ -81,6 +81,14 @@ if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
                     self.assertEqual(result.returncode, expected_status)
                     self.assertEqual(int(count.read_text()), expected_calls)
 
+    def test_install_completion_carries_current_action_token(self):
+        token = 'a' * 64
+        output = self.render({'distro': 'debian'}, running_action_token=token)
+        self.assertIn("-H 'Authorization: Bearer " + token + "'", output)
+        self.assertIn('/api/install-end?mac=', output)
+        without_action = self.render({'distro': 'debian'})
+        self.assertNotIn('/api/install-end?mac=', without_action)
+
     def test_signed_boot_packages_are_added_only_for_debian_uefi_amd64(self):
         config = {'distro': 'debian', 'codename': 'trixie',
                   'advanced': {'packages': {'pkgsel_include': ['sudo', 'curl']}}}

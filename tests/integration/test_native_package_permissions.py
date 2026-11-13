@@ -57,6 +57,12 @@ def main():
                                 assert member.mode in (0o644, 0o755), (name, mask, member.name, oct(member.mode))
                             else:
                                 raise AssertionError(('unsupported package item', member.name))
+                            if member.isfile() and command == '--ctrl-tarfile' and member.name.rsplit('/', 1)[-1] in ('preinst', 'postinst', 'prerm', 'postrm'):
+                                assert member.mode == 0o755, member.name
+                            if (name == 'base' and command == '--fsys-tarfile' and member.isfile()
+                                    and (member.name.startswith('./usr/lib/pxe-tools/static-bin/') and not member.name.endswith('.md')
+                                         or member.name.startswith(('./opt/pxe-tools/scripts/', './opt/pxe-tools/init/', './opt/pxe-tools/native/')) and member.name.endswith('.sh'))):
+                                assert member.mode == 0o755, member.name
         assert unsafe_dir.stat().st_mode & 0o777 == 0o777
         assert unsafe_file.stat().st_mode & 0o777 == 0o666
         assert unsafe_conf.stat().st_mode & 0o777 == 0o666

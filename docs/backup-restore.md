@@ -10,7 +10,9 @@ chacune une confirmation explicite et ne peuvent pas encore être dissociées.
 Les fichiers HTTP, TFTP, les certificats TLS, les clés MOK et les données du
 module Ansible sont des choix séparés. Chacun peut contenir des données
 sensibles. Les surcharges systemd, les certificats stockés ailleurs, les anciens
-MOK et les fichiers extérieurs aux chemins choisis ne sont pas inclus.
+MOK et les fichiers extérieurs aux chemins choisis ne sont pas inclus. Les paramètres
+réseau locaux tels que `/var/lib/pxe-tools-native/network.env` sont à inventorier
+et à reconfigurer séparément après examen, sans recopier aveuglément les chemins.
 Inventoriez-les séparément ; ne considérez pas l'archive comme complète si
 votre instance en dépend. MySQL/MariaDB ne sont pas pris en charge.
 
@@ -35,9 +37,9 @@ python3 /usr/lib/pxe-tools/app/cli/recovery-backup.py export \
   --confirm-stopped --include-accounts --include-inventory \
   --include-secrets --include-master-key \
   --db-config /etc/pxe-tools/db.conf --include-db-config --confirm-db-config-matches \
-  --mok-dir /etc/pxe-tools/mok --include-mok \
-  --http-root /var/lib/pxe-tools/http --include-http \
-  --tftp-root /var/lib/pxe-tools/tftp --include-tftp \
+  --mok-dir /var/lib/pxe-tools-native/mok --include-mok \
+  --http-root /var/lib/pxe-tools-http --include-http \
+  --tftp-root /var/lib/pxe-tools-tftp --include-tftp \
   --tls-root /var/lib/pxe-tools/tls --include-tls
 ```
 
@@ -48,10 +50,20 @@ et non modifiable par d'autres. La correspondance entre la base, sa clé et le
 fichier de configuration reste à confirmer par l'administrateur. Sans MOK
 restaurée, les clients Secure Boot déjà enrôlés peuvent nécessiter un nouvel
 enrôlement. Le lien natif prédéfini `http/static-bin` est exclu : le paquet le
-recrée au démarrage. Tous les autres liens symboliques, les fichiers spéciaux et les permissions
-spéciales sont refusés, à l’export comme à la restauration. Une ancienne archive
-contenant de tels liens ne peut pas être restaurée par cette version ; conservez
-la source et examinez ces liens avant une nouvelle sauvegarde.
+recrée au démarrage. Les alias netboot générés par les téléchargeurs sont conservés uniquement sous
+la forme `netboot/<codename>/<arch> -> ../<distro>/<version>/<arch>` : la cible
+doit être un répertoire inclus contenant `linux` et `initrd.gz`. Leur archive
+utilise le format 4 ; les lecteurs plus anciens la refusent. Tous les autres
+liens symboliques, les fichiers spéciaux et les permissions spéciales sont
+refusés, à l’export comme à la restauration. Une ancienne archive contenant des
+liens non pris en charge ne peut pas être restaurée par cette version ;
+conservez la source et examinez ces liens avant une nouvelle sauvegarde.
+
+Les chemins HTTP, MOK et TFTP indiqués sont ceux des nouvelles installations natives
+protégées. Une installation antérieure peut encore utiliser respectivement
+`/var/lib/pxe-tools/http`, `/etc/pxe-tools/mok` et `/var/lib/pxe-tools/tftp` : identifiez les chemins
+effectivement configurés et sélectionnez-les explicitement à l'export. Aucune
+donnée de l'ancienne instance n'est déplacée ni supprimée par la sauvegarde.
 
 Pour inclure les données du complément Ansible natif, ajouter explicitement
 `--ansible-root /var/lib/pxe-tools-ansible --include-ansible`. Cette sélection
@@ -86,6 +98,7 @@ test ! -e /etc/pxe-tools && test ! -L /etc/pxe-tools
 test ! -e /var/lib/pxe-tools && test ! -L /var/lib/pxe-tools
 mkdir /etc/pxe-tools /var/lib/pxe-tools
 apt install --no-install-recommends pxe-tools gpg gpg-agent
+python3 /usr/lib/pxe-tools/native/configure-secure-tftp.py
 install -d -m 0700 /root/pxe-restore
 python3 /usr/lib/pxe-tools/app/cli/recovery-backup.py restore \
   --input /root/pxe-backups/instance.gpg \
@@ -113,16 +126,37 @@ sont toujours vides, installer la copie en veille :
 ```sh
 set -eu
 test -z "$(ls -A /etc/pxe-tools)" && test -z "$(ls -A /var/lib/pxe-tools)"
+test -z "$(ls -A /var/lib/pxe-tools-http)" && test -z "$(ls -A /var/lib/pxe-tools-tftp)"
+# Contrôler uniquement les arbres HTTP/TFTP effectivement sélectionnés :
+python3 /usr/lib/pxe-tools/app/cli/check-restored-publication.py \
+  --http /root/pxe-restore/standby/http --tftp /root/pxe-restore/standby/tftp
 install -m 0600 /root/pxe-restore/standby/master.key /etc/pxe-tools/master.key
 install -m 0600 /root/pxe-restore/standby/database.sqlite /var/lib/pxe-tools/pxe-tools.sqlite
 # Si ces éléments ont été sélectionnés :
-cp -a /root/pxe-restore/standby/http /root/pxe-restore/standby/tftp /root/pxe-restore/standby/tls /var/lib/pxe-tools/
-mkdir /etc/pxe-tools/mok
-cp -a /root/pxe-restore/standby/MOK.key /root/pxe-restore/standby/MOK.pem /root/pxe-restore/standby/MOK.der /etc/pxe-tools/mok/
+cp -a /root/pxe-restore/standby/http/. /var/lib/pxe-tools-http/
+cp -a /root/pxe-restore/standby/tls /var/lib/pxe-tools/
+cp -a /root/pxe-restore/standby/tftp/. /var/lib/pxe-tools-tftp/
+mkdir -m 0700 /var/lib/pxe-tools-native/mok
+cp -a /root/pxe-restore/standby/MOK.key /root/pxe-restore/standby/MOK.pem /root/pxe-restore/standby/MOK.der /var/lib/pxe-tools-native/mok/
+cmp /root/pxe-restore/standby/MOK.der /var/lib/pxe-tools-native/mok/MOK.der
+# Synchroniser les fichiers restaurés avant de démarrer ou redémarrer la machine.
+sync
 systemctl start pxe-tools-admin.target
+systemctl is-active pxe-tools-init.service pxe-tools-php.service pxe-tools-nginx.service pxe-tools-worker.service
+curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/
 ```
 
-Si un des composants optionnels n'a pas été exporté, adaptez la copie et
+Le contrôle refuse les chemins ou fichiers non détenus par root, les liens autres
+que les alias netboot validés ci-dessus, et
+les permissions d'écriture accordées au groupe ou à d'autres utilisateurs, y
+compris sur les répertoires parents. Pour TFTP seulement, il accepte l'écriture
+de groupe sur `pxelinux.cfg` et `.pxe-menu.lock` : ces deux éléments sont repris
+par le worker pour le groupe web lors du rendu. Les autres éléments doivent aussi
+être lisibles, et les répertoires traversables, par les services web et TFTP. Il ne corrige rien : conservez l'archive et
+examinez la copie en veille si un refus survient. Maintenez cette copie et ses
+parents à l'abri des écritures non autorisées jusqu'à la fin de la copie.
+
+Si un des composants optionnels n'a pas été exporté, adaptez le contrôle, la copie et
 vérifiez ses conséquences avant de démarrer. La configuration SQLite archivée
 peut contenir l'ancien chemin : elle est conservée pour inspection, mais n'est
 pas recopiée dans cet exemple. Le démarrage régénère une configuration pour
@@ -130,6 +164,10 @@ le chemin natif par défaut. Un chemin personnalisé doit être vérifié et ada
 manuellement. L'outil conserve les permissions ordinaires des arbres, pas leurs
 propriétaires, ACL, attributs étendus ou liens physiques. Vérifiez les droits et
 la concordance entre les données et la clé avant de passer en production.
+Le programme de préparation des chemins protégés refuse les répertoires ou le
+marqueur existants : il ne doit pas être relancé sur une instance déjà installée.
+Pour une ancienne MOK, comparer aussi l'empreinte du certificat exporté à celle
+de l'instance d'origine ; une nouvelle clé ne doit pas être générée à sa place.
 
 Si l'arbre `ansible` a été inclus, restaurez-le séparément après installation du
 complément et vérification des chemins. Le compte du complément peut avoir un
@@ -138,8 +176,8 @@ le module, sans réutiliser aveuglément des UID/GID numériques. Vérifiez en
 particulier les permissions et l'usage des clés SSH avant de reprendre des tâches.
 
 Utilisez sur la destination une version du paquet qui reconnaît les catégories
-sélectionnées. La bêta précédente peut refuser les archives contenant TLS ou
-Ansible ; conservez une copie du paquet compatible avec vos sauvegardes.
+sélectionnées. Les versions précédentes peuvent refuser les archives contenant TLS,
+Ansible ou les alias netboot ; conservez une copie du paquet compatible avec vos sauvegardes.
 
 Connectez-vous avec le compte restauré, revoyez les paramètres réseau et les
 fichiers de démarrage, puis confirmez explicitement toute activation PXE. Les

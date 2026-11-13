@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import stat
 import tarfile
@@ -34,6 +35,22 @@ def safe_asset_name(name: str) -> tuple[str, ...]:
     if parts[0] not in TREE_CATEGORIES.values():
         raise BackupError('unknown asset category')
     return parts
+
+
+def netboot_alias_target(name: str, target: str, kinds: dict[str, str]) -> str:
+    """Validate the only permitted generated link, without resolving any link."""
+    parts = safe_asset_name(name)
+    pattern = r'[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}'
+    match = re.fullmatch(r'\.\./(' + pattern + r')/(' + pattern + r')/(' + pattern + r')', target)
+    if (len(parts) != 4 or parts[:2] != ('http', 'netboot') or not match
+            or any(not re.fullmatch(pattern, item) or '..' in item for item in (*parts[2:], *match.groups()))
+            or match.group(3) != parts[3]):
+        raise BackupError('invalid generated netboot alias')
+    destination = '/'.join(('http', 'netboot', *match.groups()))
+    if (kinds.get(destination) != 'dir' or kinds.get(destination + '/linux') != 'file'
+            or kinds.get(destination + '/initrd.gz') != 'file'):
+        raise BackupError('netboot alias target is incomplete or not a directory')
+    return destination
 
 
 def _info(info: os.stat_result) -> tuple:
@@ -110,7 +127,10 @@ def inspect_tree(path: Path, prefix: str) -> dict[str, tuple]:
                     # followed or restored as a potentially unsafe link.
                     if prefix == 'http' and not relative and name == 'static-bin' and target == '/usr/lib/pxe-tools/static-bin':
                         continue
-                    raise BackupError('symbolic links are not supported in asset trees')
+                    if prefix == 'http' and len(asset_name.split('/')) == 4 and asset_name.startswith('http/netboot/'):
+                        records[asset_name] = ('link', _info(info), target)
+                    else:
+                        raise BackupError('symbolic links are not supported in asset trees')
                 else:
                     raise BackupError('special files are not supported in asset trees')
                 if len(records) > MAX_ASSET_ENTRIES:
@@ -118,6 +138,10 @@ def inspect_tree(path: Path, prefix: str) -> dict[str, tuple]:
             if _info(os.fstat(fd)) != _info(root_info):
                 raise BackupError('asset directory changed during inspection')
         walk(root_fd, '')
+        kinds = {name: value[0] for name, value in records.items()}
+        for name, (kind, _, target) in records.items():
+            if kind == 'link':
+                netboot_alias_target(name, target, kinds)
     finally:
         os.close(root_fd)
     return records
@@ -158,6 +182,12 @@ def add_tree(tar: tarfile.TarFile, path: Path, prefix: str, records: dict[str, t
                         tar.addfile(info, stream)
                         if _info(os.fstat(stream.fileno())) != saved:
                             raise BackupError('asset changed during capture')
+                elif kind == 'link':
+                    if os.readlink(parts[-1], dir_fd=parent_fd) != target:
+                        raise BackupError('asset link changed during capture')
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = target
+                    tar.addfile(info)
                 else:
                     raise BackupError('invalid asset entry')
             finally:

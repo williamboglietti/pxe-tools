@@ -4,6 +4,7 @@
 import os
 import fcntl
 import pwd
+import shutil
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -117,6 +118,28 @@ class MenuSafety(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         with closing(sqlite3.connect(self.database)) as db, db:
             self.assertIsNotNone(db.execute('SELECT id FROM machines WHERE id=3').fetchone())
+
+    def test_restored_tftp_menu_can_be_rendered_and_deleted(self):
+        self.assertEqual(self.render().returncode, 0)
+        restored = self.root/'restored-tftp'
+        shutil.copytree(self.tftp, restored)
+        subprocess.run(['python3', str(ROOT/'app/cli/check-restored-publication.py'),
+                        '--tftp', str(restored)], check=True)
+        self.tftp = restored
+        self.env['TFTP_ROOT'] = str(restored)
+        result = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        menu = restored/'pxelinux.cfg'/'01-02-00-00-00-00-01'
+        self.assertTrue(menu.is_file())
+        code = ("require $argv[1].'/app/src/Db.php'; "
+                "require $argv[1].'/app/src/Models/Machine.php'; "
+                "\\Admin\\Models\\Machine::delete((int)$argv[2]);")
+        result = subprocess.run(['runuser', '-u', 'www-data', '--', 'php', '-r', code,
+                                 '--', str(ROOT), '1'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(menu.exists())
+        self.assertEqual(self.render().returncode, 0)
+        self.assertFalse(menu.exists())
 
     def test_failed_database_delete_restores_the_existing_menu(self):
         result = self.render()

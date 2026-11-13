@@ -80,6 +80,24 @@ def main():
         assert (restored/'http/preseed example.php').read_text()=='fixture-generated-secret'
         assert (restored/'tftp/pxelinux.cfg/default').stat().st_mode & 0o777 == 0o640
         assert (restored/'tftp').stat().st_mode & 0o777 == 0o750
+        # Version 4 accepts only generated relative aliases to complete in-tree images.
+        initrd=http/'netboot/debian/13/amd64/initrd.gz'; initrd.write_bytes(b'fixture-initrd')
+        alias=http/'netboot/trixie/amd64'; alias.symlink_to('../debian/13/amd64')
+        alias_archive=root/'alias.gpg'; alias_output=root/'alias-restored'
+        export_recovery(db,key,alias_archive,password,**flags,**options)
+        restore_recovery(alias_archive,alias_output,password)
+        assert json.loads((alias_output/'manifest.json').read_text())['version']==4
+        assert os.readlink(alias_output/'http/netboot/trixie/amd64')=='../debian/13/amd64'
+        assert (alias_output/'http/netboot/trixie/amd64/initrd.gz').read_bytes()==b'fixture-initrd'
+        # The CI tmpfs is bounded: these v4 fixtures are no longer needed.
+        shutil.rmtree(alias_output); alias_archive.unlink()
+        alias.unlink()
+        for n, target in enumerate(('/etc', '../../outside', '../debian/13/arm64',
+                                     '../trixie/amd64/amd64', '../debian/unknown/amd64')):
+            alias.symlink_to(target)
+            rejected(lambda:export_recovery(db,key,root/('bad-alias-%s.gpg' % n),password,**flags,**options))
+            alias.unlink()
+        initrd.unlink()
         tampered=root/'tampered-assets.gpg'; shutil.copyfile(archive,tampered)
         with tampered.open('r+b') as stream:
             stream.seek(tampered.stat().st_size//2); byte=stream.read(1); stream.seek(-1,1); stream.write(bytes([byte[0]^1]))
@@ -174,6 +192,22 @@ def main():
             target=root/(variant+'-hostile-output')
             rejected(lambda:restore_recovery(encrypted,target,password))
             assert not target.exists() and not (root/'escape').exists()
+        # A forged v4 alias cannot point outside or at an incomplete image.
+        for n, link_target in enumerate(('/etc', '../../../etc', '../debian/13/arm64', '../debian/13/amd64')):
+            plain=root/('forged-alias-%d.tar' % n)
+            with tarfile.open(plain,'w') as tar:
+                v4={**manifest, 'version':4}
+                for name,data in (('manifest.json',json.dumps(v4).encode()),('master.key',key.read_bytes()),('database.sqlite',db.read_bytes())):
+                    member=tarfile.TarInfo(name); member.size=len(data); tar.addfile(member,io.BytesIO(data))
+                for name in ('http','http/netboot','http/netboot/trixie'):
+                    member=tarfile.TarInfo(name); member.type=tarfile.DIRTYPE; tar.addfile(member)
+                member=tarfile.TarInfo('http/netboot/trixie/amd64'); member.type=tarfile.SYMTYPE
+                member.linkname=link_target; tar.addfile(member)
+            encrypted=root/('forged-alias-%d.gpg' % n)
+            with _gpg_home() as home: encrypt_file(plain,encrypted,password,home)
+            target=root/('forged-alias-%d-output' % n)
+            rejected(lambda:restore_recovery(encrypted,target,password))
+            assert not target.exists()
         with patch('backup.recovery.MAX_ASSET_ENTRIES',2):
             rejected(lambda:restore_recovery(archive,root/'too-many',password))
         assert not (root/'too-many').exists()

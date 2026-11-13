@@ -36,6 +36,10 @@ def main() -> int:
     export.add_argument('--include-http', action='store_true')
     export.add_argument('--tftp-root', type=Path, help='explicit TFTP asset directory')
     export.add_argument('--include-tftp', action='store_true')
+    export.add_argument('--tls-root', type=Path, help='explicit TLS certificate and key directory')
+    export.add_argument('--include-tls', action='store_true')
+    export.add_argument('--ansible-root', type=Path, help='explicit optional Ansible data directory')
+    export.add_argument('--include-ansible', action='store_true')
     restore = commands.add_parser('restore', help='authenticate into a new private, inactive directory')
     restore.add_argument('--input', type=Path, required=True)
     restore.add_argument('--output-dir', type=Path, required=True)
@@ -45,7 +49,9 @@ def main() -> int:
             or args.confirm_db_config_matches != args.include_db_config
             or args.include_mok != (args.mok_dir is not None)
             or args.include_http != (args.http_root is not None)
-            or args.include_tftp != (args.tftp_root is not None)):
+            or args.include_tftp != (args.tftp_root is not None)
+            or args.include_tls != (args.tls_root is not None)
+            or args.include_ansible != (args.ansible_root is not None)):
         parser.error('optional components require their paths and explicit confirmations')
     try:
         if args.passphrase_fd is not None:
@@ -68,11 +74,13 @@ def main() -> int:
                             confirm_db_config_matches=args.confirm_db_config_matches,
                             mok_dir=args.mok_dir, include_mok=args.include_mok,
                             http_root=args.http_root, include_http=args.include_http,
-                            tftp_root=args.tftp_root, include_tftp=args.include_tftp)
-            print('Encrypted offline database and key archive created; other instance files are not included.')
+                            tftp_root=args.tftp_root, include_tftp=args.include_tftp,
+                            tls_root=args.tls_root, include_tls=args.include_tls,
+                            ansible_root=args.ansible_root, include_ansible=args.include_ansible)
+            print('Encrypted offline archive created; only explicitly selected components are included.')
         else:
             restore_recovery(args.input, args.output_dir, passphrase)
-            print('Database and key restored to a new offline directory; no service was started.')
+            print('Standby database and selected files restored to a new directory; no service was started.')
         return 0
     except (BackupError, OSError, EOFError, UnicodeError) as error:
         print('Recovery operation failed: ' + str(error), file=sys.stderr)

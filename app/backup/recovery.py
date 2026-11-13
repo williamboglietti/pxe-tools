@@ -2,7 +2,8 @@
 """Experimental encrypted SQLite + master-key backup into a new offline directory.
 
 A full database contains accounts, machine data, secrets and active job/token
-state. This intentionally does not filter it, migrate it or start any service.
+state. Restore prepares an inactive copy and invalidates transient operations;
+it does not migrate an existing installation or start any service.
 Inputs and their parent directories must be trusted and the source stopped.
 """
 from __future__ import annotations
@@ -214,15 +215,20 @@ def export_recovery(database: Path, key: Path, destination: Path, passphrase: by
                     confirm_db_config_matches: bool = False,
                     mok_dir: Path | None = None, include_mok: bool = False,
                     http_root: Path | None = None, include_http: bool = False,
-                    tftp_root: Path | None = None, include_tftp: bool = False) -> None:
+                    tftp_root: Path | None = None, include_tftp: bool = False,
+                    tls_root: Path | None = None, include_tls: bool = False,
+                    ansible_root: Path | None = None, include_ansible: bool = False) -> None:
     """Export all four sensitive categories; no selective filtering is claimed."""
     if any(value is not True for value in (confirm_stopped, include_accounts, include_inventory,
                                            include_secrets, include_master_key)):
         raise BackupError('stopped source and all sensitive categories require explicit confirmation')
     if (type(include_db_config) is not bool or type(confirm_db_config_matches) is not bool or type(include_mok) is not bool
-            or type(include_http) is not bool or type(include_tftp) is not bool
+            or type(include_http) is not bool or type(include_tftp) is not bool or type(include_tls) is not bool
+            or type(include_ansible) is not bool
             or include_db_config != (db_config is not None) or include_mok != (mok_dir is not None)
             or include_http != (http_root is not None) or include_tftp != (tftp_root is not None)
+            or include_tls != (tls_root is not None)
+            or include_ansible != (ansible_root is not None)
             or confirm_db_config_matches != include_db_config):
         raise BackupError('optional files and their explicit confirmations must be selected together')
     try:
@@ -232,7 +238,8 @@ def export_recovery(database: Path, key: Path, destination: Path, passphrase: by
         config_path = Path(db_config) if db_config is not None else None
         mok_path = Path(mok_dir) if mok_dir is not None else None
         options = _read_options(config_path, mok_path)
-        roots = {name: Path(path) for name, path in (('http_files', http_root), ('tftp_files', tftp_root))
+        roots = {name: Path(path) for name, path in (('http_files', http_root), ('tftp_files', tftp_root),
+                 ('tls_files', tls_root), ('ansible_files', ansible_root))
                  if path is not None}
         records = {}
         for name, path in roots.items():
@@ -385,6 +392,40 @@ def _unpack_authenticated(plain: Path, root: Path) -> tuple[list[str], dict, dic
             directories, files, links)
 
 
+def _prepare_standby(database: Path) -> None:
+    """Make the authenticated copy inert before publishing it to the operator.
+
+    The original archive stays unchanged. Unknown schemas or missing columns
+    fail closed instead of publishing a partially neutralised database.
+    """
+    updates = (
+        "UPDATE settings SET value='0' WHERE key='wizard_completed'",
+        "INSERT OR IGNORE INTO settings(key,value) VALUES('wizard_completed','0')",
+        "UPDATE settings SET value='off' WHERE key='dhcp_proxy_enabled'",
+        "INSERT OR IGNORE INTO settings(key,value) VALUES('dhcp_proxy_enabled','off')",
+        "UPDATE actions SET token=lower(hex(randomblob(32)))",
+        "UPDATE boot_sessions SET token=lower(hex(randomblob(32)))",
+        "UPDATE actions SET status='aborted', ended_at=CURRENT_TIMESTAMP WHERE status NOT IN ('success','failed','cancelled','aborted') OR status IS NULL",
+        "UPDATE init_jobs SET status='failed', message='Interrupted by standby restore' WHERE status NOT IN ('success','failed','skipped','cancelled','aborted') OR status IS NULL",
+        "UPDATE installations SET install_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE install_status NOT IN ('success','failed','aborted','cancelled') OR install_status IS NULL",
+        "UPDATE installations SET ansible_status='aborted' WHERE ansible_status IS NOT NULL AND ansible_status NOT IN ('success','failed','aborted','cancelled','no_role','skipped')",
+        "UPDATE wipes SET wipe_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE wipe_status NOT IN ('success','failed','aborted','cancelled') OR wipe_status IS NULL",
+        "UPDATE disk_tests SET job_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE job_status NOT IN ('success','failed','aborted','cancelled') OR job_status IS NULL",
+        "UPDATE discoveries SET discovery_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE discovery_status NOT IN ('success','failed','aborted','cancelled') OR discovery_status IS NULL",
+        "UPDATE task_phases SET status='aborted', ended_at=CURRENT_TIMESTAMP WHERE status NOT IN ('success','failed','skipped','cancelled','aborted') OR status IS NULL",
+        "UPDATE os_images SET status='failed', error_msg='Interrupted by standby restore' WHERE status NOT IN ('downloaded','failed') OR status IS NULL",
+        "UPDATE machines SET next_action=NULL, awaiting_action_until=NULL, rescue_mode=0",
+    )
+    with closing(sqlite3.connect(database, timeout=5)) as db:
+        db.execute('PRAGMA trusted_schema=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
+        with db:
+            for statement in updates:
+                db.execute(statement)
+        if db.execute('PRAGMA integrity_check').fetchone() != ('ok',) or db.execute('PRAGMA foreign_key_check').fetchone() is not None:
+            raise BackupError('standby database integrity check failed')
+
+
 def restore_recovery(archive: Path, destination: Path, passphrase: bytes) -> None:
     """Authenticate and restore into a new private, inactive directory only."""
     try:
@@ -402,6 +443,7 @@ def restore_recovery(archive: Path, destination: Path, passphrase: bytes) -> Non
                     os.chmod(plain, 0o600)
                     _decrypt_bounded(source, output, passphrase, home)
                 names, directories, files, links = _unpack_authenticated(plain, root)
+                _prepare_standby(root/'database.sqlite')
                 # Exclusive directory creation cannot replace an existing path.
                 # A crash after this point can leave a partial private directory.
                 destination.mkdir(mode=0o700)

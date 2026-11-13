@@ -44,8 +44,9 @@ sudo systemctl start pxe-tools.target
 La suppression et la purge préservent les données sous `/var/lib/pxe-tools`, la
 configuration et les clés sous `/etc/pxe-tools`, ainsi que les journaux. Une
 sauvegarde cohérente doit couvrir ensemble la base, la clé de chiffrement, les
-fichiers persistants et, si elle doit être réutilisée, la clé MOK. La restauration
-complète et la migration ne sont pas encore validées de bout en bout.
+fichiers persistants et, si elle doit être réutilisée, la clé MOK. Une procédure
+[de sauvegarde chiffrée et de restauration en veille](backup-restore.md) est
+disponible pour SQLite ; la migration guidée reste à développer.
 
 SQLite est la seule base prise en charge. Une configuration MySQL/MariaDB
 existante est refusée avant connexion ; elle et ses données sont conservées,

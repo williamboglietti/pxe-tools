@@ -14,7 +14,8 @@ MAX_ASSET_BYTES = 6 * 1024 * 1024 * 1024
 MAX_ASSET_ENTRIES = 20000
 MAX_PATH_BYTES = 200
 MAX_LINK_BYTES = 100
-TREE_CATEGORIES = {'http_files': 'http', 'tftp_files': 'tftp'}
+TREE_CATEGORIES = {'http_files': 'http', 'tftp_files': 'tftp', 'tls_files': 'tls',
+                   'ansible_files': 'ansible'}
 
 
 def _safe_text(value: str, limit: int) -> bool:
@@ -114,6 +115,11 @@ def inspect_tree(path: Path, prefix: str) -> dict[str, tuple]:
                     records[asset_name] = ('file', _info(info), '')
                 elif stat.S_ISLNK(info.st_mode):
                     target = os.readlink(name, dir_fd=fd)
+                    # The native package recreates this fixed link at startup.
+                    # It points outside the selected tree and must never be
+                    # followed or restored as a potentially unsafe link.
+                    if prefix == 'http' and not relative and name == 'static-bin' and target == '/usr/lib/pxe-tools/static-bin':
+                        continue
                     safe_link_target(asset_name, target)
                     records[asset_name] = ('link', _info(info), target)
                 else:

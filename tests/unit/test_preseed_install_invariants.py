@@ -45,6 +45,42 @@ class PreseedInvariants(unittest.TestCase):
             self.assertEqual(int((data / 'http.status').read_text()), expected_status)
             return result.stdout
 
+    def test_machine_ready_retries_only_connection_failures_and_stops(self):
+        output = self.render({'distro': 'debian'})
+        def decoded(path):
+            matches = re.findall(r'echo "([A-Za-z0-9+/=]+)" \| base64 -d > ' + re.escape(path), output)
+            self.assertEqual(len(matches), 1)
+            return base64.b64decode(matches[0]).decode()
+        script = decoded('/usr/local/sbin/pxe-machine-ready')
+        unit = decoded('/etc/systemd/system/pxe-machine-ready.service')
+        self.assertIn('ExecStart=/usr/local/sbin/pxe-machine-ready\n', unit)
+        self.assertIn('TimeoutStartSec=250\n', unit)
+        self.assertIn('http://192.0.2.1/api/machine-ready?mac=02:00:00:00:00:01', script)
+        with tempfile.TemporaryDirectory(prefix='pxe-ready-') as tmp:
+            root = Path(tmp)
+            curl = root / 'curl'
+            curl.write_text('''#!/bin/bash
+n=$(cat "$COUNT")
+n=$((n + 1))
+printf '%s' "$n" > "$COUNT"
+if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
+''')
+            sleep = root / 'sleep'
+            sleep.write_text('#!/bin/bash\nexit 0\n')
+            curl.chmod(0o755)
+            sleep.chmod(0o755)
+            runnable = root / 'ready'
+            runnable.write_text(script.replace('/usr/bin/curl', str(curl)).replace('/bin/sleep', str(sleep)))
+            for failures, code, expected_status, expected_calls in [(2, 7, 0, 3), (100, 7, 7, 24),
+                                                                    (100, 22, 22, 1), (100, 28, 28, 1)]:
+                with self.subTest(code=code, failures=failures):
+                    count = root / 'count'
+                    count.write_text('0')
+                    env = dict(os.environ, COUNT=str(count), FAILURES=str(failures), CODE=str(code))
+                    result = subprocess.run(['/bin/bash', str(runnable)], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, expected_status)
+                    self.assertEqual(int(count.read_text()), expected_calls)
+
     def test_signed_boot_packages_are_added_only_for_debian_uefi_amd64(self):
         config = {'distro': 'debian', 'codename': 'trixie',
                   'advanced': {'packages': {'pkgsel_include': ['sudo', 'curl']}}}

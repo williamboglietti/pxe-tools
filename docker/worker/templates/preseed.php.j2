@@ -1428,6 +1428,17 @@ $late_command .= "    in-target /bin/sed -i 's/^#\\?PasswordAuthentication.*/Pas
 // Ansible comme signal de readiness avant `ansible-playbook`. Le contenu du
 // fichier .service est encodé base64 pour éviter les newlines littéraux qui
 // casseraient la directive preseed (qui exige des continuation backslashes).
+// Réessayer uniquement une connexion impossible (curl 7) : les erreurs HTTP et
+// les timeouts peuvent correspondre à une requête déjà traitée par le serveur.
+// Une limite de 24 essais évite une boucle infinie si le réseau reste absent.
+$pxe_machine_ready_script = "#!/usr/bin/env bash\n"
+                         .  "for attempt in {1..24}; do\n"
+                         .  "    /usr/bin/curl -fsS --connect-timeout 5 --max-time 10 'http://" . $pxe_ip_local . "/api/machine-ready?mac=" . $mac . "' && exit 0\n"
+                         .  "    status=\$?\n"
+                         .  "    if [ \"\$status\" -ne 7 ] || [ \"\$attempt\" -eq 24 ]; then exit \"\$status\"; fi\n"
+                         .  "    /bin/sleep 5\n"
+                         .  "done\n";
+$pxe_machine_ready_script_b64 = base64_encode($pxe_machine_ready_script);
 $pxe_machine_ready_unit = "[Unit]\n"
                        .  "Description=PXE Tools — signal machine ready post-reboot\n"
                        .  "After=network-online.target sshd.service\n"
@@ -1435,13 +1446,15 @@ $pxe_machine_ready_unit = "[Unit]\n"
                        .  "\n"
                        .  "[Service]\n"
                        .  "Type=oneshot\n"
-                       .  "ExecStart=/usr/bin/curl -fsS --max-time 10 'http://" . $pxe_ip_local . "/api/machine-ready?mac=" . $mac . "'\n"
+                       .  "ExecStart=/usr/local/sbin/pxe-machine-ready\n"
+                       .  "TimeoutStartSec=250\n"
                        .  "RemainAfterExit=yes\n"
                        .  "\n"
                        .  "[Install]\n"
                        .  "WantedBy=multi-user.target\n";
 $pxe_machine_ready_b64 = base64_encode($pxe_machine_ready_unit);
-$late_command .= "    in-target /bin/bash -c 'echo \"" . $pxe_machine_ready_b64 . "\" | base64 -d > /etc/systemd/system/pxe-machine-ready.service' ; \\\n"
+$late_command .= "    in-target /bin/bash -c 'echo \"" . $pxe_machine_ready_script_b64 . "\" | base64 -d > /usr/local/sbin/pxe-machine-ready && chmod 0755 /usr/local/sbin/pxe-machine-ready' ; \\\n"
+              .  "    in-target /bin/bash -c 'echo \"" . $pxe_machine_ready_b64 . "\" | base64 -d > /etc/systemd/system/pxe-machine-ready.service' ; \\\n"
               .  "    in-target /bin/systemctl enable pxe-machine-ready.service ; \\\n";
 
 // Les pourcentages de blocs réservés viennent exclusivement du plan de

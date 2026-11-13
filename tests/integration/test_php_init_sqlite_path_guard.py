@@ -40,7 +40,7 @@ class NativeInitSqlitePathGuard(unittest.TestCase):
             source = source.replace(original, str(replacement))
         self.script = self.root / 'php-init.sh'
         self.script.write_text(source)
-        self.env = dict(os.environ, PXE_APP_DIR=str(self.app))
+        self.env = dict(os.environ, PXE_APP_DIR=str(self.app), PXE_SERVICE_MANAGER='systemd')
         for name in ('PXE_DB_DRIVER', 'PXE_DB_PATH', 'ORCHESTRATOR_DB'):
             self.env.pop(name, None)
 
@@ -78,6 +78,12 @@ class NativeInitSqlitePathGuard(unittest.TestCase):
         with sqlite3.connect(database) as connection:
             self.assertEqual(connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='fixture'").fetchone(), ('fixture',))
+
+    def test_native_init_does_not_require_a_docker_http_volume(self):
+        self.env['HTTP_ROOT'] = str(self.root / 'missing-http-root')
+        result = self.run_init(self.data / 'native.sqlite')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / 'missing-http-root').exists())
 
     def test_restored_root_owned_database_remains_usable(self):
         database = self.data / 'restored.sqlite'

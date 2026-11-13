@@ -29,6 +29,7 @@ class ExternalDatabaseFailClosed(unittest.TestCase):
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: CONFIG.unlink(missing_ok=True))
         self.clean_env = dict(os.environ)
+        self.clean_env['PXE_SERVICE_MANAGER'] = 'systemd'
         for key in ('PXE_DB_DRIVER', 'PXE_DB_HOST', 'PXE_DB_PORT', 'PXE_DB_DATABASE',
                     'PXE_DB_USERNAME', 'PXE_DB_PASSWORD', 'PXE_DB_PATH', 'ORCHESTRATOR_DB'):
             self.clean_env.pop(key, None)

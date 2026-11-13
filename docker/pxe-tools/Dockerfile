@@ -130,7 +130,8 @@ COPY app/ /app/
 ARG APP_VERSION=0.1.0-dev
 RUN printf '%s\n' "$APP_VERSION" > /app/src/build-version.txt
 RUN chmod +x /app/worker.py \
-    && chown -R www-data:www-data /app
+    && chown -R root:root /app \
+    && chmod -R go-w /app
 
 # ----------------------------------------------------------------------------
 # Binaires statiques (smartctl, badblocks, dmidecode) — servis par nginx sous
@@ -139,7 +140,8 @@ RUN chmod +x /app/worker.py \
 # ----------------------------------------------------------------------------
 COPY docker/pxe-tools/static-bin/ /srv/http/static-bin/
 RUN find /srv/http/static-bin/ -type f ! -name '*.md' -exec chmod +x {} \; \
-    && chown -R www-data:www-data /srv/http/static-bin/
+    && chown -R root:root /srv/http/static-bin/ \
+    && chmod -R go-w /srv/http/static-bin/
 
 # ----------------------------------------------------------------------------
 # Bootstrap scripts (rendu templates, build GRUB, etc.) — repris du worker actuel
@@ -211,9 +213,14 @@ RUN mkdir -p \
         /var/lib/pxe-tools/postboot \
         /etc/pxe-tools/mok \
         /srv/http \
+        /srv/http/netboot \
         /srv/tftp \
         /run/php \
-    && chown -R www-data:www-data /var/lib/pxe-tools /srv/http \
+    && chown -R www-data:www-data /var/lib/pxe-tools \
+    && chown root:root /srv/http /srv/http/netboot \
+    && chmod 0755 /srv/http /srv/http/netboot \
+    && printf 'pxe-netboot-root-v1\n' > /srv/http/.pxe-netboot-root-v1 \
+    && chmod 0644 /srv/http/.pxe-netboot-root-v1 \
     && chmod 0750 /var/lib/pxe-tools/postboot
 # Note : /srv/tftp reste root:root. Le container tourne déjà en root pour pouvoir
 # bind dnsmasq sur :67/:69 via network_mode: host, donc pas besoin de drop privs.
@@ -229,6 +236,7 @@ ENV PXE_DB_PATH=/var/lib/pxe-tools/pxe-tools.sqlite \
     TLS_DIR=/var/lib/pxe-tools/tls \
     TFTP_ROOT=/srv/tftp \
     HTTP_ROOT=/srv/http \
+    PXE_SERVICE_MANAGER=s6 \
     ANSIBLE_WORKDIR=/home/ansible/ansible \
     WORKER_POLL_S=5 \
     PYTHONUNBUFFERED=1 \

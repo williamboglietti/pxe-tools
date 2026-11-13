@@ -67,6 +67,66 @@ def validate_files(fd: int | None, job_id: int) -> None:
                 raise ValueError('unsafe image file')
 
 
+def require_trusted_http_root(http_root: str, marker_dir: str = '/var/lib/pxe-tools-native') -> None:
+    """Require the path to match a root-owned, no-follow native marker."""
+    directory = open_image_dir(marker_dir, ())
+    if directory is None:
+        raise ValueError('protected native marker missing')
+    try:
+        fd = os.open('runtime.env', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or info.st_mode & 0o022 or info.st_size > 4096):
+                raise ValueError('untrusted native marker')
+            content = os.read(fd, 4097)
+            if len(content) != info.st_size:
+                raise ValueError('native marker changed while reading')
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+    lines = [line[len(b'HTTP_ROOT='):] for line in content.splitlines() if line.startswith(b'HTTP_ROOT=')]
+    if len(lines) != 1 or lines[0] != os.fsencode(http_root):
+        raise ValueError('HTTP root differs from protected native marker')
+
+
+def _exists(fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def restore_staged(fd: int | None, job_id: int) -> None:
+    """Revert a pre-commit interruption before revalidating dependencies."""
+    if fd is None:
+        return
+    validate_files(fd, job_id)
+    staged = [(name, f'{name}.pxe-delete-{job_id}') for name in FILES]
+    if any(_exists(fd, name) and _exists(fd, backup) for name, backup in staged):
+        raise ValueError('ambiguous image staging')
+    for name, backup in staged:
+        if _exists(fd, backup):
+            os.rename(backup, name, src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
+
+
+def stage_files(fd: int | None, job_id: int) -> None:
+    """Move only the fixed image files inside the validated directory."""
+    if fd is None:
+        return
+    validate_files(fd, job_id)
+    staged = [(name, f'{name}.pxe-delete-{job_id}') for name in FILES]
+    if any(_exists(fd, backup) for _name, backup in staged):
+        raise ValueError('image staging already exists')
+    for name, backup in staged:
+        if _exists(fd, name):
+            os.rename(name, backup, src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
+
+
 def cleanup_committed(fd: int | None, job_id: int) -> None:
     """After database commit, remove only this job's deterministic staging."""
     if fd is None:

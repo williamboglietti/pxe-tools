@@ -389,6 +389,35 @@ final class OsImage
         return $job;
     }
 
+    /** Hold the image lock while the worker stages protected files. */
+    public static function finishQueuedDelete(int $id, int $jobId, callable $stage): void
+    {
+        $scope = self::findById($id);
+        if ($scope === null) throw new \RuntimeException('Image introuvable.');
+        $pdo = Db::get();
+        $pdo->beginTransaction();
+        try {
+            self::lockImageGroup($pdo, $scope);
+            $image = self::findById($id);
+            if ($image === null) throw new \RuntimeException('Image introuvable.');
+            $stmt = $pdo->prepare("SELECT log FROM init_jobs WHERE id=? AND job_type=? AND status='running'");
+            $stmt->execute([$jobId, 'image:delete:' . $id]);
+            $raw = $stmt->fetchColumn();
+            $meta = is_string($raw) ? json_decode($raw, true, 16, JSON_THROW_ON_ERROR) : null;
+            $expected = ['id' => $id, 'distro' => $image['distro'], 'version' => $image['version'],
+                'version_full' => $image['version_full'], 'arch' => $image['arch']];
+            if ($meta !== $expected) throw new \RuntimeException('Tâche modifiée ; image conservée.');
+            $dependencies = self::dependencies($id);
+            if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
+            $stage();
+            $pdo->prepare('DELETE FROM os_images WHERE id = ?')->execute([$id]);
+            $pdo->commit();
+        } catch (\Throwable $error) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw $error;
+        }
+    }
+
     /** Lock replacement candidates together, before the transaction's first snapshot read. */
     private static function lockImageGroup(PDO $pdo, array $image): void
     {

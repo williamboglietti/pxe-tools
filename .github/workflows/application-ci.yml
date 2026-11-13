@@ -23,7 +23,7 @@ jobs:
         run: docker build --tag pxe-tools-application-test:local tests/ci
       - name: Exercise application behavior in isolation
         run: |
-          docker run --rm --network none --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+          docker run --rm --network none --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add KILL --cap-add SETUID --cap-add SETGID --security-opt no-new-privileges \
             --tmpfs /tmp:rw,nosuid,nodev,exec,size=256m \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --workdir /tmp pxe-tools-application-test:local bash -c '

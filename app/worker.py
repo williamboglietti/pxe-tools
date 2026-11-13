@@ -25,6 +25,7 @@ import logging
 import os
 import pwd
 import re
+import selectors
 import shlex
 import socket
 import sqlite3
@@ -38,7 +39,8 @@ import urllib.request
 from contextlib import contextmanager
 from typing import Callable, Optional
 from database_selection import select_database
-from image_delete import cleanup_committed, components as image_delete_components, open_image_dir, validate_files
+from image_delete import (cleanup_committed, components as image_delete_components,
+                          open_image_dir, require_trusted_http_root, restore_staged, stage_files, validate_files)
 
 from ansible_vault import (
     VaultLocked,
@@ -296,8 +298,20 @@ FLUSH_INTERVAL_S = 2.0
 FLUSH_MAX_LINES = 50
 
 
+def _read_image_delete_signal(process: subprocess.Popen, expected: bytes) -> None:
+    if process.stdout is None:
+        raise ValueError('missing deletion response')
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if not selector.select(timeout=15) or os.read(process.stdout.fileno(), 64) != expected:
+            raise ValueError('deletion reservation failed')
+    finally:
+        selector.close()
+
+
 def run_image_delete(job: dict) -> None:
-    """Delete only one approved image beneath a protected HTTP root."""
+    """Stage fixed files as root while an unprivileged PHP child holds the lock."""
     job_id = job.get('id')
     match = re.fullmatch(r'image:delete:([1-9][0-9]{0,18})', str(job.get('job_type', '')))
     if type(job_id) is not int or job_id <= 0 or match is None:
@@ -312,40 +326,67 @@ def run_image_delete(job: dict) -> None:
     if claimed != 1:
         return
     fd = None
+    process = None
     try:
         if os.geteuid() != 0:
             raise ValueError('root worker required for protected paths')
+        require_trusted_http_root(HTTP_ROOT)
         parts = image_delete_components(job['log'], image_id)
         fd = open_image_dir(HTTP_ROOT, parts)
         validate_files(fd, job_id)
         with db_connect() as db:
             row = db.execute('SELECT id,distro,version,version_full,arch FROM os_images WHERE id=?', (image_id,)).fetchone()
-        meta = json.loads(job['log'])
         if row is not None:
-            if dict(row) != meta:
+            if dict(row) != json.loads(job['log']):
                 raise ValueError('image changed after request')
-            cli = os.path.join(os.environ.get('PXE_APP_DIR', '/app'), 'cli', 'delete-image.php')
+            restore_staged(fd, job_id)
+            # Do not run PHP with root privileges or let it reread the mutable
+            # db.conf. The child gets only the parent's already-selected DB.
+            account = pwd.getpwnam('www-data')
+            if account.pw_uid == 0 or account.pw_gid == 0:
+                raise ValueError('invalid web account')
+            cli = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'cli', 'delete-image.php')
             env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
-                   'PXE_DB_PATH': DB_PATH, 'PXE_DB_DRIVER': 'sqlite',
                    'PXE_HTTP_ROOT': HTTP_ROOT, 'HTTP_ROOT': HTTP_ROOT}
-            result = subprocess.run(['/usr/bin/php', cli, str(image_id), str(job_id)], env=env,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=False)
-            with db_connect() as db:
-                row = db.execute('SELECT id FROM os_images WHERE id=?', (image_id,)).fetchone()
-            if result.returncode and row is not None:
-                raise ValueError('deletion refused or incomplete')
-        # If SQL committed before a crash, this only removes that job's staged
-        # files. A missing row cannot cause deletion of ordinary image names.
-        if row is None:
-            cleanup_committed(fd, job_id)
-        else:
-            raise ValueError('image was not deleted')
+            process = subprocess.Popen(['/usr/bin/php', cli, str(image_id), str(job_id), DB_PATH],
+                                       env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, user=account.pw_uid,
+                                       group=account.pw_gid, extra_groups=())
+            _read_image_delete_signal(process, b'READY\n')
+            stage_files(fd, job_id)
+            if process.stdin is None:
+                raise ValueError('missing deletion control pipe')
+            process.stdin.write(b'COMMIT\n'); process.stdin.flush(); process.stdin.close()
+            _read_image_delete_signal(process, b'COMMITTED\n')
+            if process.wait(timeout=10) != 0:
+                raise ValueError('deletion child failed')
+        # Once the SQL row is gone, remove only this job's staged files.
+        cleanup_committed(fd, job_id)
         update_init_job(job_id, status='success', message='Image et fichiers locaux supprimés.',
                         ended_at=now(), updated_at=now(), progress_percent=100)
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, subprocess.SubprocessError):
+        if process is not None:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+        # Roll back staged names only when SQLite kept the image. If it
+        # committed, retain the staged files for a safe idempotent retry.
+        try:
+            with db_connect() as db:
+                still_exists = db.execute('SELECT id FROM os_images WHERE id=?', (image_id,)).fetchone() is not None
+            if still_exists:
+                restore_staged(fd, job_id)
+        except (OSError, ValueError, sqlite3.Error):
+            pass
         update_init_job(job_id, status='failed', message='Suppression refusée ou interrompue ; fichiers conservés pour vérification.',
                         ended_at=now(), updated_at=now())
     finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
         if fd is not None:
             os.close(fd)
 

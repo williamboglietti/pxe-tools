@@ -8,6 +8,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+# Generated only in native package staging, never in Docker images.
+app/src/native-build-version.txt
 
 # Git / IDE
 .git

@@ -36,6 +36,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+            echo 'Start a new workflow run instead of rerunning an older publication.' >&2
+            exit 1
+          fi
           if [[ ! -f packaging/ci/release-manifest.json ]]; then
             if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
               echo 'No approved release configured; no renewal necessary.'

@@ -169,6 +169,8 @@ JOBS_RAW=$(echo "$JOB_BODY" | sed -n 's/.*"jobs"[[:space:]]*:[[:space:]]*\[\(.*\
 
 [ -z "$POST_ACTION" ] && POST_ACTION="poweroff"
 [ -z "$PARALLEL" ] && PARALLEL="false"
+rm -f "$JOB_FILE"
+unset JOB_BODY
 
 if [ -z "$TEST_ID" ] || [ "$TEST_ID" -le 0 ] 2>/dev/null || [ -z "$JOBS_RAW" ] || [ -z "$BOOT_TOKEN" ]; then
     echo "[FATAL] Job mal formé ou jeton de démarrage absent"

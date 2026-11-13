@@ -94,10 +94,25 @@ final class BootSession
             throw new \InvalidArgumentException('Invalid PXE agent session');
         }
         $token = bin2hex(random_bytes(32));
-        Db::get()->prepare('INSERT INTO boot_sessions '
-            . '(machine_id, action_id, mac, default_menu, selected_menu, token, client_ip) '
-            . 'VALUES (?, ?, ?, ?, ?, ?, ?)')
-            ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER, $token, $observedIp]);
+        $pdo = Db::get();
+        $owns = !$pdo->inTransaction();
+        if ($owns) $pdo->beginTransaction();
+        try {
+            // Serialize repeated script/job fetches and revoke every previous
+            // callback capability for this action before issuing the new one.
+            $pdo->prepare('UPDATE actions SET id = id WHERE id = ?')->execute([$actionId]);
+            $pdo->prepare('DELETE FROM boot_sessions WHERE machine_id = ? AND action_id = ? '
+                . 'AND mac = ? AND default_menu = ? AND selected_menu = ?')
+                ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER]);
+            $pdo->prepare('INSERT INTO boot_sessions '
+                . '(machine_id, action_id, mac, default_menu, selected_menu, token, client_ip) '
+                . 'VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER, $token, $observedIp]);
+            if ($owns) $pdo->commit();
+        } catch (\Throwable $error) {
+            if ($owns && $pdo->inTransaction()) $pdo->rollBack();
+            throw $error;
+        }
         return $token;
     }
 
@@ -114,11 +129,14 @@ final class BootSession
         $stmt = Db::get()->prepare('SELECT token, client_ip FROM boot_sessions '
             . 'WHERE token = ? AND machine_id = ? AND action_id = ? AND mac = ? '
             . 'AND default_menu = ? AND selected_menu = ? '
-            . "AND served_at >= datetime('now', '-35 days') LIMIT 1");
+            . "AND COALESCE(selected_at, served_at) >= datetime('now', '-24 hours') LIMIT 1");
         $stmt->execute([$token, $machineId, $actionId, $mac, $menu, self::AGENT_MARKER]);
         $row = $stmt->fetch();
-        return is_array($row) && hash_equals((string)$row['token'], $token)
-            && ($row['client_ip'] === null || hash_equals((string)$row['client_ip'], $clientIp));
+        if (!is_array($row) || !hash_equals((string)$row['token'], $token)
+            || ($row['client_ip'] !== null && !hash_equals((string)$row['client_ip'], $clientIp))) return false;
+        $refresh = Db::get()->prepare('UPDATE boot_sessions SET selected_at = CURRENT_TIMESTAMP WHERE token = ?');
+        $refresh->execute([$token]);
+        return $refresh->rowCount() === 1;
     }
 
     /** @return array<int,array<string,mixed>> */

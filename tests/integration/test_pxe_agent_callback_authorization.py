@@ -120,6 +120,27 @@ with tempfile.TemporaryDirectory(prefix='pxe-agent-callback-') as tmp:
     assert test_status == 200
     test_token = json.loads(test_json)['boot_token']
     assert re.fullmatch('[a-f0-9]{64}', test_token) and test_token != 'b' * 64
+    renewed_status, renewed_script = request(database, temporary, 'PxeController', 'wipeScript',
+                                             IP_WIPE, {'mac': MAC_WIPE})
+    assert renewed_status == 200
+    old_wipe_token = wipe_token
+    wipe_token = re.search(r'^BOOT_TOKEN="([a-f0-9]{64})"$', renewed_script, re.MULTILINE).group(1)
+    assert wipe_token != old_wipe_token
+    assert request(database, temporary, 'PxeController', 'wipeProgress', IP_WIPE,
+                   {'wipe_id': '1', 'mac': MAC_WIPE, 'line': 'stale'}, old_wipe_token)[0] == 404
+    # A silent agent session expires; a fresh job fetch replaces the old token.
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE boot_sessions SET served_at='2000-01-01 00:00:00' WHERE token=?",
+                   (test_token,))
+        db.commit()
+    assert request(database, temporary, 'PxeController', 'diskTestProgress', IP_TEST,
+                   {'test_id': '1', 'mac': MAC_TEST, 'line': 'expired'}, test_token)[0] == 404
+    fresh_status, fresh_json = request(database, temporary, 'PxeController', 'diskTestJob',
+                                       IP_TEST, {'mac': MAC_TEST})
+    assert fresh_status == 200
+    old_test_token = test_token
+    test_token = json.loads(fresh_json)['boot_token']
+    assert test_token != old_test_token
     with sqlite3.connect(database) as db:
         assert db.execute('SELECT client_ip FROM boot_sessions WHERE token=?',
                           (wipe_token,)).fetchone()[0] == IP_WIPE
@@ -151,6 +172,12 @@ with tempfile.TemporaryDirectory(prefix='pxe-agent-callback-') as tmp:
                    {'wipe_id': '1', 'mac': MAC_WIPE, 'line': 'agent-log'}, wipe_token)[0] == 200
     assert request(database, temporary, 'PxeController', 'diskTestProgress', IP_TEST,
                    {'test_id': '1', 'mac': MAC_TEST, 'line': 'agent-log'}, test_token)[0] == 200
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT selected_at FROM boot_sessions WHERE token=?',
+                          (test_token,)).fetchone()[0] is not None
+        db.execute("UPDATE boot_sessions SET served_at='2000-01-01 00:00:00' WHERE token=?",
+                   (test_token,))
+        db.commit()
     assert request(database, temporary, 'PxeController', 'diskTestDiskProgress', IP_TEST,
                    {'test_id': '1', 'mac': MAC_TEST, 'disk': '/dev/sda', 'phase': 'test', 'pct': '80'},
                    test_token)[0] == 200

@@ -8,12 +8,20 @@ verify that binding separately with administrator-level read access.
 """
 from __future__ import annotations
 import json
+import importlib.util
+from pathlib import Path
 import hashlib
 import urllib.error
 import os
 import re
 import secrets
 import urllib.request
+
+spec_http = importlib.util.spec_from_file_location('pxe_public_http', Path(__file__).with_name('public-http.py'))
+if spec_http is None or spec_http.loader is None:
+    raise RuntimeError('Public HTTPS helper unavailable')
+public_http = importlib.util.module_from_spec(spec_http)
+spec_http.loader.exec_module(public_http)
 
 WORKER = 'packages-pxetools-com'
 HOST = 'packages.pxetools.com'
@@ -59,21 +67,10 @@ def observe(account: str, token: str) -> dict:
 
 
 def observe_public_domain() -> tuple[int, str]:
-    request = urllib.request.Request('https://packages.pxetools.com/apt/dists/stable/InRelease',
-                                     headers={'User-Agent': 'curl/8.14.1', 'Cache-Control': 'no-cache'})
-    try:
-        try:
-            response = urllib.request.urlopen(request, timeout=20)
-        except urllib.error.HTTPError as exc:
-            response = exc
-        with response:
-            data = response.read(1024 * 1024 + 1)
-            code = response.status
-        if len(data) > 1024 * 1024 or code not in (200, 404):
-            raise ValueError('unexpected public response')
-        return code, hashlib.sha256(data).hexdigest()
-    except Exception:
-        raise ValueError('Cannot verify the public domain response') from None
+    status, data = public_http.fetch()
+    if status not in (200, 404):
+        raise ValueError(f'Public domain returned HTTP {status}')
+    return status, hashlib.sha256(data).hexdigest()
 
 
 

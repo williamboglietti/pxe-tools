@@ -14,6 +14,12 @@ import tarfile
 import urllib.error
 import urllib.request
 
+spec_http = importlib.util.spec_from_file_location('pxe_public_http', Path(__file__).with_name('public-http.py'))
+if spec_http is None or spec_http.loader is None:
+    raise RuntimeError('Public HTTPS helper unavailable')
+public_http = importlib.util.module_from_spec(spec_http)
+spec_http.loader.exec_module(public_http)
+
 TAG = Path('packaging/ci/snapshot-release-tag.txt').read_text().strip()
 if not re.fullmatch(r'apt-snapshots(?:-[a-z0-9]+)*', TAG):
     raise ValueError('invalid persistent snapshot release tag')
@@ -26,17 +32,13 @@ def gh(*args: str) -> bytes:
 
 
 def live_release() -> bytes | None:
-    request = urllib.request.Request(RELEASE_URL, headers={'User-Agent': 'curl/8.14.1', 'Cache-Control': 'no-cache'})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            content = response.read(1024 * 1024 + 1)
-            if len(content) > 1024 * 1024:
-                raise ValueError('live InRelease too large')
-            return content
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise
+    status, content = public_http.fetch()
+    if status == 404:
+        return None
+    if status != 200:
+        raise ValueError(f'Public domain returned HTTP {status}')
+    return content
+
 
 
 def validate_recovered(root: Path) -> None:

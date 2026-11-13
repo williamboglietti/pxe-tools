@@ -24,6 +24,11 @@ jobs:
         run: npm ci --prefix packaging/cloudflare
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Diagnose public APT endpoint without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/ci/diagnose-public-http.py
       - name: Verify inactive Worker upload guards
         run: python3 -m unittest discover -s tests -p 'test_cloudflare_upload_preflight.py' -v
       - name: Verify persistent Worker snapshot recovery

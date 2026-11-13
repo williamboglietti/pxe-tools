@@ -1,0 +1,52 @@
+name: Build reviewed APT package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  application-behavior:
+    uses: ./.github/workflows/application-ci.yml
+
+  package:
+    needs: application-behavior
+    if: github.ref == 'refs/heads/main' && github.ref_protected
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build exact package for the tracked version
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          version=$(cat packaging/ci/release-version.txt)
+          [[ "$version" =~ ^[0-9][A-Za-z0-9.+~_-]{0,100}$ ]]
+          dpkg --validate-version "$version"
+          mkdir -p "$RUNNER_TEMP/package"
+          asset_version=${version//\~/-}
+          [[ "$asset_version" =~ ^[A-Za-z0-9._-]+$ ]]
+          package="$RUNNER_TEMP/package/pxe-tools_${asset_version}_amd64.deb"
+          python3 packaging/native/build-apt-package-candidate.py "$package" --version "$version" \
+            --maintainer 'PXE Tools <security@pxetools.com>'
+          [[ "$(dpkg-deb --field "$package" Package)" == pxe-tools ]]
+          [[ "$(dpkg-deb --field "$package" Version)" == "$version" ]]
+          [[ "$(dpkg-deb --field "$package" Architecture)" == amd64 ]]
+          dpkg-deb --fsys-tarfile "$package" > "$RUNNER_TEMP/package-content.tar"
+          tar -tvf "$RUNNER_TEMP/package-content.tar" > "$RUNNER_TEMP/package-content.txt"
+          awk '$NF == "./usr/lib/pxe-tools/app/" && $1 == "drwxr-xr-x" {found=1} END {exit !found}' "$RUNNER_TEMP/package-content.txt"
+          awk '$NF == "./usr/lib/pxe-tools/app/public/" && $1 == "drwxr-xr-x" {found=1} END {exit !found}' "$RUNNER_TEMP/package-content.txt"
+          awk '$NF == "./usr/lib/pxe-tools/app/public/index.php" && $1 == "-rw-r--r--" {found=1} END {exit !found}' "$RUNNER_TEMP/package-content.txt"
+          sha256sum "$package" | awk '{print $1}' > "$RUNNER_TEMP/package/package.sha256"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/package/source-commit.txt"
+      - name: Retain package for human review and release promotion
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pxe-debian-package
+          path: ${{ runner.temp }}/package/
+          if-no-files-found: error
+          retention-days: 90

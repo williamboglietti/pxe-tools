@@ -1,0 +1,16 @@
+-- Migration 2026-05-17 — capture log debian-installer côté serveur (LOGCAP01).
+-- Ajoute installations.install_log pour stocker le log d-i poussé en batch
+-- par le late_command preseed via POST /api/internal/install-log.
+--
+-- Limite applicative : 5 MB (enforced dans Installation::appendInstallLog,
+-- truncate gracieux avec marker explicite). MEDIUMTEXT côté MySQL = jusqu'à
+-- 16 MB, marge confortable au-delà de la limite applicative.
+--
+-- Pas d'index : la colonne n'est jamais utilisée en WHERE/JOIN, uniquement
+-- lue 1 ligne à la fois lors du rendu UI _checklist.php.
+--
+-- Idempotent : migrate.php joue cette migration via Db::columnExists() avant
+-- l'ALTER. SQLite + MySQL.
+
+-- (logique idempotente déléguée à migrate.php qui parse ce fichier comme repère,
+--  l'ALTER lui-même est appliqué côté migrate.php pour gérer la branche driver).

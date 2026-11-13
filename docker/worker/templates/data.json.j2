@@ -1,0 +1,12 @@
+{
+  "ansible_pubkey": {{ pxe_ansible_pubkey | to_json }},
+  "root_password_hash": {{ pxe_root_password_hash | to_json }},
+  "mirror": {{ pxe_debian_mirror_url | to_json }},
+  "pxe_ip": {{ pxe_ip | to_json }},
+  "admin_port": {{ pxe_admin_port | to_json }},
+  "tftp_root": {{ pxe_tftp_root | to_json }},
+  "default_domain": "lan",
+  "default_distro": {{ pxe_debian_default_version | to_json }},
+  "allowed_distros": {{ pxe_debian_versions | to_json }},
+  "kernel_opts": {{ pxe_kernel_opts | to_json }}
+}

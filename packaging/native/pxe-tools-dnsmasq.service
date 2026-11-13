@@ -1,0 +1,11 @@
+[Unit]
+Description=PXE Tools dedicated DHCP proxy and TFTP
+Requires=pxe-tools-init.service
+BindsTo=pxe-tools-pxe-http.service
+After=pxe-tools-init.service pxe-tools-pxe-http.service
+[Service]
+Type=simple
+EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+ExecStartPre=/bin/sh /opt/pxe-tools/init/render-dnsmasq-conf.sh
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/pxe-tools/dnsmasq.conf
+Restart=on-failure

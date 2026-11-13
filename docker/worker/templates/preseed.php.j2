@@ -1,0 +1,1872 @@
+<?php
+// {{ ansible_managed }}
+// Générateur preseed Debian dynamique — lit DB SQLite + install_config_json par machine.
+
+declare(strict_types=1);
+header('Content-Type: text/plain; charset=utf-8');
+
+require_once rtrim(getenv('PXE_APP_DIR') ?: '/app', '/') . '/src/Db.php';
+try {
+    $db_path = \Admin\Db::sqliteRuntimePath();
+} catch (\Throwable $error) {
+    http_response_code(503);
+    exit("# ERREUR : base SQLite indisponible\n");
+}
+$tpl_file  = '{{ pxe_data_dir }}/preseed-base.cfg';
+$data_file = '{{ pxe_data_dir }}/data.json';
+
+if (!is_readable($db_path) || !is_readable($tpl_file)) {
+    http_response_code(500);
+    echo "# ERREUR : DB ou preseed-base.cfg introuvable\n";
+    exit;
+}
+
+$data = is_readable($data_file) ? (json_decode(file_get_contents($data_file), true) ?: []) : [];
+$tpl = file_get_contents($tpl_file);
+
+// --- Lookup machine ------------------------------------------------------
+function normalize_mac(string $raw): string {
+    $raw = strtolower(trim($raw));
+    $raw = preg_replace('/^01[-:]/', '', $raw);
+    $hex = preg_replace('/[^a-f0-9]/', '', $raw);
+    return strlen($hex) === 12 ? implode(':', str_split($hex, 2)) : '';
+}
+$mac = normalize_mac($_GET['mac'] ?? '');
+
+$pdo = new PDO('sqlite:' . $db_path);
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+// --- SEC F-02 : filtre de provenance subnet PXE --------------------------
+// preseed.php est servi en clair sur :80 sans auth nginx et émet des secrets
+// (hash root, hash admin, action_token Bearer du late_command). La MAC n'est
+// pas secrète → ce filtre réseau est la SEULE barrière, identique à /wipe.sh
+// (PxeController::ipInPxeSubnet). Un hôte hors pxe_subnet reçoit 403 AVANT
+// toute émission. Fonction dupliquée volontairement (PHP standalone, pas
+// d'autoload) — même pattern que le « mini-clone » assumé dans PxeController.
+function pxe_valid_cidr(string $cidr): bool {
+    $parts = explode('/', $cidr, 2);
+    if (count($parts) !== 2) return false;
+    if (!preg_match('/^(?:0|[1-9]|[12][0-9]|3[0-2])$/D', $parts[1])) return false;
+    return filter_var($parts[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+function pxe_ip_in_cidr(string $ip, string $cidr): bool {
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || !pxe_valid_cidr($cidr)) return false;
+    $parts = explode('/', $cidr, 2);
+    $prefix = (int)$parts[1];
+    $mask    = $prefix === 0 ? 0 : (-1 << (32 - $prefix)) & 0xFFFFFFFF;
+    $ipLong  = ip2long($ip);
+    $netLong = ip2long($parts[0]);
+    if ($ipLong === false || $netLong === false) return false;
+    return ($ipLong & $mask) === ($netLong & $mask);
+}
+// Le sous-réseau doit être fourni explicitement par l'administrateur.
+$pxe_subnet = '';
+try {
+    $st = $pdo->query("SELECT value FROM settings WHERE key = 'pxe_subnet'");
+    $r  = $st ? $st->fetch() : false;
+    if ($r && !empty($r['value'])) $pxe_subnet = (string)$r['value'];
+} catch (\Throwable $e) {
+    // La configuration manquante ou illisible est refusée ci-dessous.
+}
+if (!pxe_valid_cidr($pxe_subnet)) {
+    http_response_code(503);
+    echo "# ERREUR : sous-réseau PXE non configuré ou invalide\n";
+    exit;
+}
+if (!pxe_ip_in_cidr((string)($_SERVER['REMOTE_ADDR'] ?? ''), $pxe_subnet)) {
+    http_response_code(403);
+    echo "# ERREUR : accès refusé (hôte hors subnet PXE)\n";
+    exit;
+}
+
+if ($mac === '') {
+    http_response_code(400);
+    echo "# ERREUR : MAC manquante (?mac=...)\n";
+    exit;
+}
+
+$stmt = $pdo->prepare('SELECT * FROM machines WHERE mac = ?');
+$stmt->execute([$mac]);
+$machine = $stmt->fetch();
+
+if (!$machine) {
+    http_response_code(404);
+    echo "# ERREUR : machine introuvable pour MAC $mac\n";
+    exit;
+}
+if (empty($machine['install_config_json'])) {
+    http_response_code(404);
+    echo "# ERREUR : machine $mac sans config d'install (passer par /machines/{id}/install d'abord)\n";
+    exit;
+}
+$config = json_decode($machine['install_config_json'], true);
+if (!is_array($config)) {
+    http_response_code(500);
+    echo "# ERREUR : install_config_json corrompu pour MAC $mac\n";
+    exit;
+}
+$row = array_merge($machine, $config);
+
+// --- Refactor checkpoints 2026-05-16 ------------------------------------
+// Résout l'action en cours pour cette machine pour :
+//   1. Émettre le checkpoint 'preseed_loaded_install' au moment où le preseed
+//      est servi à l'installateur Debian (cf. ActionCheckpoints CATALOG).
+//   2. Injecter token + action_id dans le late_command (wgets checkpoints
+//      partitioning_started (early_command) / late_command_started +
+//      install postboot.sh + pxe-postboot.service via
+//      /pxe/postboot/{action_id}/...).
+//
+// Skip silencieux si pas d'action active (cas legacy : machine en 'configured'
+// sans Action parent — created avant Worker_CTRL ou flow manuel). Les wgets
+// sont omis du late_command ; le preseed reste fonctionnel.
+$action_id    = null;
+$action_token = null;
+$action_type  = null;
+try {
+    $stmt = $pdo->prepare(
+        "SELECT id, token, type FROM actions "
+      . "WHERE machine_id = ? AND status IN ('pending','running') "
+      . "ORDER BY id DESC LIMIT 1"
+    );
+    $stmt->execute([(int)$machine['id']]);
+    $act = $stmt->fetch();
+    if ($act) {
+        $action_id    = (int)$act['id'];
+        $action_token = (string)$act['token'];
+        $action_type  = (string)$act['type'];
+        // Checkpoint preseed_loaded_install — valide pour reinstall + install_only.
+        $valid_for_load = ['reinstall', 'install_only'];
+        if (in_array($action_type, $valid_for_load, true)) {
+            try {
+                $ins = $pdo->prepare(
+                    'INSERT INTO machine_events (machine_id, level, message, checkpoint, action_id) '
+                  . 'VALUES (?, ?, ?, ?, ?)'
+                );
+                $ins->execute([
+                    (int)$machine['id'],
+                    'info',
+                    'checkpoint:preseed_loaded_install',
+                    'preseed_loaded_install',
+                    $action_id,
+                ]);
+            } catch (\Throwable $e) {
+                error_log('preseed.php: insert preseed_loaded_install failed: ' . $e->getMessage());
+            }
+        }
+    }
+} catch (\Throwable $e) {
+    error_log('preseed.php: action lookup failed: ' . $e->getMessage());
+}
+
+// --- Construction des blocks dynamiques ----------------------------------
+
+// Hostname : si machines.hostname est NULL/vide, on N'ÉMET PAS les directives
+// netcfg/get_hostname et netcfg/hostname → d-i prend la valeur DHCP Option 12
+// (cas "le DHCP attribue le nom" du wizard preset). Sinon valeur normalisée.
+$hostnameRaw = $row['hostname'] ?? null;
+$hostname    = ($hostnameRaw !== null && trim((string)$hostnameRaw) !== '')
+    ? (preg_replace('/[^a-z0-9-]/', '', strtolower((string)$hostnameRaw)) ?: null)
+    : null;
+$domain = preg_replace('/[^a-z0-9.-]/', '', strtolower((string)($row['domain'] ?? '')));
+// --- Résolution du CODENAME apt-suite (modèle distro-name) ----------------
+// $distro alimente {{ '{{DISTRO_CODENAME}}' }} (mirror/suite apt) → DOIT être un
+// codename ('trixie'), JAMAIS un nom d'OS ('debian'). Chaîne de fallback :
+//   1. codename du snapshot (modèle distro-name nominal)
+//   2. dérivé de version_full (snapshot moderne sans codename)
+//   3. rétrocompat : distro EST un codename (snapshots legacy pré-refonte)
+//   4. data.default_distro (codename global) ; ultime 'trixie'.
+// (table inline : pas d'autoloader dans /srv/http, cf. default_advanced_config)
+$_majorToCodename = [11 => 'bullseye', 12 => 'bookworm', 13 => 'trixie', 14 => 'forky'];
+$_knownCodenames  = array_values($_majorToCodename);
+$_rawDistro   = isset($row['distro']) ? strtolower(trim((string)$row['distro'])) : '';
+$_rawCodename = isset($row['codename']) ? strtolower(trim((string)$row['codename'])) : '';
+$_versionFull = (string)($config['version_full'] ?? $row['version_full'] ?? '');
+$_vfMajor     = $_versionFull !== '' ? (int)explode('.', $_versionFull)[0] : 0;
+if ($_rawCodename !== '') {
+    $distro = $_rawCodename;
+} elseif ($_vfMajor > 0 && isset($_majorToCodename[$_vfMajor])) {
+    $distro = $_majorToCodename[$_vfMajor];
+} elseif (in_array($_rawDistro, $_knownCodenames, true)) {
+    $distro = $_rawDistro;
+} else {
+    $distro = $data['default_distro'] ?? 'trixie';
+}
+
+// Ne transmettre un nom ou un domaine que s'il a été renseigné.
+$hostname_lines = [];
+if ($hostname !== null) {
+    $hostname_lines[] = "d-i netcfg/get_hostname string " . safe_preseed_scalar($hostname);
+}
+if ($domain !== '') {
+    $hostname_lines[] = "d-i netcfg/get_domain string " . safe_preseed_scalar($domain);
+}
+if ($hostname !== null) {
+    $hostname_lines[] = "d-i netcfg/hostname string " . safe_preseed_scalar($hostname);
+}
+$hostname_block = implode("\n", $hostname_lines);
+
+// Snapshot install : install_config_json contient déjà 'advanced' (objet, structuré).
+// Fallback : si snapshot legacy sans advanced, on retombe sur la colonne
+// presets.advanced_config_json (string JSON), elle-même fallback aux defaults.
+// On passe par parse_advanced_config (round-trip JSON) dans les 2 cas pour garantir
+// le merge profond NIVEAU 1 — array_replace_recursive fusionnerait les listes
+// (ex. tasksel: ['custom'] + defaults['ssh-server','standard'] = ['custom','standard']
+// au lieu de ['custom']).
+$adv = is_array($config['advanced'] ?? null)
+    ? parse_advanced_config(json_encode($config['advanced']))
+    : parse_advanced_config($row['advanced_config_json'] ?? null);
+$root_login_mode = (($config['root_login_mode'] ?? $row['root_login_mode'] ?? 'enabled') === 'disabled')
+    ? 'disabled' : 'enabled';
+$root_hash_for_preseed = (string)($row['root_password_hash'] ?? '');
+$effective_root_mode = ($root_hash_for_preseed === '') ? 'disabled' : $root_login_mode;
+$admin_user_fullname = trim((string)($config['admin_user_fullname'] ?? $row['admin_user_fullname'] ?? ''));
+$accountsPlaceholder = '{{ '{{ACCOUNTS_BLOCK}}' }}';
+$hasAccountsBlock = (bool)preg_match('~^[\t ]*' . preg_quote($accountsPlaceholder, '~') . '[\t ]*(?:#.*)?$~m', $tpl);
+
+// Les anciens templates personnalisés peuvent coder les comptes en dur.
+// Ne pas les réécrire silencieusement : refuser tout contenu qui pourrait
+// contredire le verrouillage décidé pour cette machine, avant émission.
+if ($effective_root_mode === 'disabled') {
+    preg_match_all('~^[\t ]*[^\s#]+[\t ]+passwd/root-login\b([^\r\n]*)$~mi', $tpl, $rootLoginDirectives);
+    preg_match_all('~^[\t ]*[^\s#]+[\t ]+(passwd/root-password(?:-crypted|-again)?)\b([^\r\n]*)$~mi', $tpl, $rootPasswordDirectives, PREG_SET_ORDER);
+    $safe = $hasAccountsBlock || count($rootLoginDirectives[0]) > 0;
+    foreach ($rootLoginDirectives[1] as $directive) {
+        if (!preg_match('~^[\t ]+boolean[\t ]+false[\t ]*(?:#.*)?$~i', $directive)) $safe = false;
+    }
+    foreach ($rootPasswordDirectives as $directive) {
+        if (strtolower($directive[1]) !== 'passwd/root-password-crypted'
+            || !preg_match('~^[\t ]+password[\t ]+![\t ]*(?:#.*)?$~i', $directive[2])) $safe = false;
+    }
+    if (!$safe) {
+        http_response_code(422);
+        echo "# ERREUR : template preseed incompatible avec root verrouillé ; utiliser le bloc comptes dynamique ou des directives root désactivées.\n";
+        exit;
+    }
+} else {
+    // Un template ancien doit utiliser le hash de cette machine ; une valeur
+    // statique masquerait le choix de l'opérateur et pourrait être partagée.
+    preg_match_all('~^[\t ]*[^\s#]+[\t ]+passwd/root-login\b([^\r\n]*)$~mi', $tpl, $rootLoginDirectives);
+    preg_match_all('~^[\t ]*[^\s#]+[\t ]+(passwd/root-password(?:-crypted|-again)?)\b([^\r\n]*)$~mi', $tpl, $rootPasswordDirectives, PREG_SET_ORDER);
+    $safe = $hasAccountsBlock || count($rootPasswordDirectives) > 0;
+    foreach ($rootLoginDirectives[1] as $directive) {
+        if (!preg_match('~^[\t ]+boolean[\t ]+true[\t ]*(?:#.*)?$~i', $directive)) $safe = false;
+    }
+    foreach ($rootPasswordDirectives as $directive) {
+        $parts = preg_split('/[\t ]+/', trim($directive[2]), 2);
+        if (strtolower($directive[1]) !== 'passwd/root-password-crypted'
+            || count($parts) !== 2 || strtolower($parts[0]) !== 'password'
+            || $parts[1] !== '{{ '{{ROOT_PASSWORD_HASH}}' }}') $safe = false;
+    }
+    if (!$safe) {
+        http_response_code(422);
+        echo "# ERREUR : directives root du template preseed incompatibles avec la configuration de la machine.\n";
+        exit;
+    }
+}
+
+// --- Helpers preset (inlinés : pas d'autoloader dans /srv/http) ----------
+function cidr_to_netmask(int $cidr): string {
+    $cidr = max(1, min(32, $cidr));
+    $long = $cidr === 0 ? 0 : (-1 << (32 - $cidr)) & 0xFFFFFFFF;
+    return long2ip($long);
+}
+function parse_dns(mixed $raw): array {
+    if (is_array($raw)) {
+        return array_values(array_filter(array_map('trim', $raw), fn($x) => $x !== ''));
+    }
+    if ($raw === null || trim((string)$raw) === '') return [];
+    $decoded = json_decode((string)$raw, true);
+    if (is_array($decoded)) {
+        return array_values(array_filter(array_map('trim', $decoded), fn($x) => $x !== ''));
+    }
+    $parts = preg_split('/[\s,]+/', (string)$raw);
+    return array_values(array_filter(array_map('trim', $parts), fn($x) => $x !== ''));
+}
+
+/**
+ * Defaults preseed étendus — single source of truth des valeurs hardcodées
+ * historiquement dans preseed-base.cfg.j2. Tout preset sans advanced_config_json
+ * doit produire le MÊME preseed qu'avant l'ajout de la colonne (compat R1).
+ *
+ * SYNC avec Preset::defaultAdvancedConfig() — app/src/Models/Preset.php
+ * (recopie textuelle obligatoire : pas d'autoloader dans /srv/http).
+ */
+function default_advanced_config(): array {
+    return [
+        'localization' => [
+            'locale'             => 'fr_FR.UTF-8',
+            'language'           => null,
+            'country'            => null,
+            'supported_locales'  => [],
+            'keymap'             => 'fr(latin9)',
+            'keymap_toggle'      => null,
+            'console_ask_detect' => null,
+        ],
+        'mirror' => [
+            'country'   => 'manual',
+            'hostname'  => 'deb.debian.org',
+            'directory' => '/debian',
+            'proxy'     => '',
+        ],
+        'timezone' => [
+            'utc'        => true,
+            'zone'       => 'Europe/Paris',
+            'ntp'        => true,
+            'ntp_server' => null,
+        ],
+        'packages' => [
+            'tasksel'            => ['ssh-server', 'standard'],
+            'pkgsel_include'     => ['sudo', 'openssh-server', 'python3', 'ca-certificates', 'curl'],
+            'install_recommends' => false,
+            'upgrade'            => 'full-upgrade',
+            'update_policy'      => null,
+            'popcon'             => false,
+        ],
+        'apt' => [
+            'non_free_firmware'       => true,
+            'contrib'                 => true,
+            'non_free'                => false,
+            'services_select'         => null,
+            'security_host'           => null,
+            'hw_detect_load_firmware' => true,
+        ],
+        'bootloader' => [
+            'only_debian'   => true,
+            'with_other_os' => false,
+            'bootdev'       => 'default',
+        ],
+        'finish' => [
+            'reboot'      => 'note',
+            'eject_cdrom' => null,
+        ],
+        'post_install' => [
+            'remote_pubkey_urls' => [],
+        ],
+    ];
+}
+
+function parse_advanced_config(?string $raw): array {
+    $defaults = default_advanced_config();
+    if ($raw === null || trim($raw) === '') return $defaults;
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) return $defaults;
+    $out = $defaults;
+    foreach ($defaults as $section => $sub) {
+        if (!isset($decoded[$section]) || !is_array($decoded[$section])) continue;
+        foreach ($sub as $key => $_default) {
+            if (array_key_exists($key, $decoded[$section])) {
+                $out[$section][$key] = $decoded[$section][$key];
+            }
+        }
+    }
+    return $out;
+}
+
+function bool_str(bool $b): string { return $b ? 'true' : 'false'; }
+
+/** Sanitise valeurs scalaires injectées dans le preseed (espace puis newline interdits). */
+function safe_preseed_scalar(?string $s): string {
+    if ($s === null) return '';
+    $s = preg_replace('/[\r\n]/', '', $s) ?? '';
+    return $s;
+}
+
+/**
+ * Décode le plan arborescent partition_custom_json. Tolère format legacy en renvoyant null.
+ */
+function parse_partitioning_plan(?string $raw): ?array {
+    if ($raw === null || trim($raw) === '') return null;
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) return null;
+    if (array_is_list($decoded)) return null; // format legacy, plan vide
+    return [
+        'target_disks'    => is_array($decoded['target_disks'] ?? null) ? $decoded['target_disks'] : [],
+        'target_disk_identities' => is_array($decoded['target_disk_identities'] ?? null) ? $decoded['target_disk_identities'] : [],
+        'disks'           => is_array($decoded['disks'] ?? null) ? $decoded['disks'] : [],
+        'raid_arrays'     => is_array($decoded['raid_arrays'] ?? null) ? $decoded['raid_arrays'] : [],
+        'vgs'             => is_array($decoded['vgs'] ?? null) ? $decoded['vgs'] : [],
+        'logical_volumes' => is_array($decoded['logical_volumes'] ?? null) ? $decoded['logical_volumes'] : [],
+    ];
+}
+
+/**
+ * Identité d'un disque telle que la découverte l'a relevée : "<octets>:<VENDORMODEL>" (alphanum
+ * majuscules). C'est exactement ce que le garde-fou relit dans /sys/block de l'installateur
+ * (size × 512, device/vendor + device/model) : les noms sdX ne sont pas stables d'un démarrage à
+ * l'autre (lecteur de cartes, disque USB), taille + modèle le sont.
+ */
+function disk_identity_from_inventory(array $inventory, string $path): ?string {
+    foreach ($inventory['disks'] ?? [] as $d) {
+        if (!is_array($d) || ($d['name'] ?? '') !== $path) continue;
+        $bytes = (int)($d['size_bytes'] ?? 0);
+        // La découverte écrit « n/a » quand device/model est absent ; le sysfs de l'installateur
+        // renvoie alors une chaîne vide.
+        $modelRaw = (string)($d['model'] ?? '');
+        $model = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string)($d['vendor'] ?? '') . ($modelRaw === 'n/a' ? '' : $modelRaw)) ?? '');
+        if ($bytes <= 0 || $model === '') return null;
+        return $bytes . ':' . $model;
+    }
+    return null;
+}
+
+/** Sanitize une option de montage pour partman : autorise [a-zA-Z0-9_=,.-]. */
+function safe_mount_option(string $o): string {
+    return preg_replace('/[^a-zA-Z0-9_=,.-]/', '', $o) ?? '';
+}
+
+/** Sanitize un nom (VG, LV) pour partman : alphanum + underscore + dash. */
+function safe_lvm_name(string $n): string {
+    return preg_replace('/[^a-zA-Z0-9_-]/', '', $n) ?? '';
+}
+
+/**
+ * Génère un segment d'expert_recipe pour une PARTITION PHYSIQUE.
+ * Format : `min priority max fstype <flags> .`
+ *
+ * Cas fs :
+ *   ext2/3/4, xfs : standard, formatée, mountpoint si fourni
+ *   swap          : linux-swap, pas de mountpoint
+ *   efi           : fat32, $bootable, mountpoint
+ *   lvm-pv        : marquée comme PV via method{ lvm } + vg_name{ } ; PAS de $lvmok ici
+ *   raid-member   : marquée comme partition RAID ($lvmignore + method{ raid }), consommée par partman-auto-raid
+ */
+function partman_partition_segment(array $p, ?string $diskPath, ?string $vgForPv): string {
+    $fs    = $p['fs'];
+    $mount = $p['mount'] ?? null;
+    $fill  = !empty($p['fill']);
+    $size  = (int)($p['size_mb'] ?? 0);
+
+    // Partition BIOS GRUB : 1 MiB, sans système de fichiers, embarque GRUB legacy
+    // sur GPT. Émet le segment minimal `1 1 1 free $bios_boot{ } method{ biosgrub } .`.
+    // Le drapeau $disk{} est ajouté pour les plans multi-disques (un biosgrub par
+    // disque) — sur mono-disque c'est inoffensif (partman ignore quand 1 seul disque).
+    if ($fs === 'biosgrub') {
+        $sizeStr = $size > 0 ? (string)$size : '1';
+        $parts = ["$sizeStr $sizeStr $sizeStr free", '$bios_boot{ }'];
+        if ($diskPath !== null) {
+            $parts[] = '$disk{ ' . $diskPath . ' }';
+        }
+        $parts[] = 'method{ biosgrub }';
+        return implode(' ', $parts) . ' .';
+    }
+
+    $type = match ($fs) {
+        'swap'        => 'linux-swap',
+        'efi'         => 'fat32',
+        'lvm-pv'      => 'ext4', // type de base, sera reformaté en PV par method{ lvm }
+        'raid-member' => 'ext4', // idem, sera consommé par partman-auto-raid
+        default       => $fs,
+    };
+
+    $minSize = $fill ? '512' : (string)$size;
+    $prio    = $fill ? '1000' : (string)$size;
+    $maxSize = $fill ? '-1' : (string)$size;
+
+    $parts = ["$minSize $prio $maxSize $type"];
+    $parts[] = '$primary{ }';
+    if ($diskPath !== null) {
+        $parts[] = '$disk{ ' . $diskPath . ' }';
+    }
+
+    if ($fs === 'lvm-pv') {
+        // preseed: $lvmok{ } est INTERDIT sur le segment PV — il ne va QUE sur les LVs
+        // (segments avec in_vg{ }). Si on le pose ici, partman ne reconnaît plus la
+        // partition comme PV, le VG reste vide et d-i bloque sur "Pas de volume
+        // physique défini dans le groupe de volumes".
+        // Réf : https://www.debian.org/releases/stable/example-preseed.txt § partman-auto.
+        //
+        // preseed: $defaultignore{ } empêche partman d'appliquer la stratégie default
+        // (créer un FS standard) sur le segment PV. Sans ce flag, partman peut ignorer
+        // l'intégralité de custom_recipe et fallback silencieusement sur la recipe
+        // atomic (symptôme : LVs nommés `root`/`swap_1` au lieu de `lv_root`/`lv_swap`,
+        // table MBR avec partition extended au lieu de GPT).
+        $parts[] = '$defaultignore{ }';
+        $parts[] = 'method{ lvm }';
+        if ($vgForPv !== null && $vgForPv !== '') {
+            $parts[] = 'vg_name{ ' . safe_lvm_name($vgForPv) . ' }';
+        }
+    } elseif ($fs === 'raid-member') {
+        $parts[] = 'method{ raid }';
+    } elseif ($fs === 'swap') {
+        $parts[] = 'method{ swap } format{ }';
+    } elseif ($fs === 'efi') {
+        $parts[] = '$bootable{ }';
+        $parts[] = 'method{ efi } format{ }';
+        if ($mount !== null) $parts[] = 'mountpoint{ ' . $mount . ' }';
+    } else {
+        // ext2/3/4, xfs : standard
+        if ($mount === '/boot') $parts[] = '$bootable{ }';
+        $parts[] = 'method{ format } format{ }';
+        $parts[] = 'use_filesystem{ } filesystem{ ' . $fs . ' }';
+        if ($mount !== null) $parts[] = 'mountpoint{ ' . $mount . ' }';
+    }
+
+    foreach (($p['mount_options'] ?? []) as $opt) {
+        $clean = safe_mount_option((string)$opt);
+        if ($clean !== '') {
+            $parts[] = 'options/' . $clean . '{ ' . $clean . ' }';
+        }
+    }
+
+    return implode(' ', $parts) . ' .';
+}
+
+/**
+ * Génère un segment d'expert_recipe pour un LV (Logical Volume).
+ * Le LV n'est pas une partition physique — flagué $defaultignore{ } pour éviter
+ * que partman ne tente de le placer sur disque, et $lvmok{ } pour partman-auto-lvm.
+ */
+function partman_lv_segment(array $lv): string {
+    $fs    = $lv['fs'];
+    $mount = $lv['mount'] ?? null;
+    $fill  = !empty($lv['fill']);
+    $size  = (int)($lv['size_mb'] ?? 0);
+    $vg    = safe_lvm_name((string)($lv['vg'] ?? ''));
+    $name  = safe_lvm_name((string)($lv['name'] ?? ''));
+
+    $type = match ($fs) {
+        'swap'  => 'linux-swap',
+        default => $fs,
+    };
+
+    $minSize = $fill ? '512' : (string)$size;
+    $prio    = $fill ? '1000' : (string)$size;
+    $maxSize = $fill ? '-1' : (string)$size;
+
+    $parts = ["$minSize $prio $maxSize $type"];
+    $parts[] = '$defaultignore{ }';
+    $parts[] = '$lvmok{ }';
+    $parts[] = 'in_vg{ ' . $vg . ' }';
+    $parts[] = 'lv_name{ ' . $name . ' }';
+
+    if ($fs === 'swap') {
+        $parts[] = 'method{ swap } format{ }';
+    } else {
+        $parts[] = 'method{ format } format{ }';
+        $parts[] = 'use_filesystem{ } filesystem{ ' . $fs . ' }';
+        if ($mount !== null) $parts[] = 'mountpoint{ ' . $mount . ' }';
+    }
+
+    foreach (($lv['mount_options'] ?? []) as $opt) {
+        $clean = safe_mount_option((string)$opt);
+        if ($clean !== '') {
+            $parts[] = 'options/' . $clean . '{ ' . $clean . ' }';
+        }
+    }
+
+    return implode(' ', $parts) . ' .';
+}
+
+/**
+ * Construit l'index inversé : pour chaque PV id (sda1, ...), le nom du VG qui l'utilise.
+ * @return array<string,string>
+ */
+function build_pv_to_vg(array $vgs): array {
+    $out = [];
+    foreach ($vgs as $vg) {
+        $vgName = (string)($vg['name'] ?? '');
+        foreach ((array)($vg['pvs'] ?? []) as $pvId) {
+            $out[(string)$pvId] = $vgName;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Construit la directive `partman-auto-raid/recipe` à partir des arrays déclarés.
+ *
+ * Format Debian :
+ *   <level> <num-devices> <num-spares> <fs> <mountpoint> <devices> <spare-devices>
+ *
+ * - <devices>       : liste `#`-séparée des partitions membres (paths /dev/sdaN)
+ * - <spare-devices> : idem, ou `-` si pas de spare
+ * - <fs>=lvm + <mountpoint>=- pour un MD utilisé comme PV LVM (consommé par partman-auto-lvm via vg_name{ })
+ *
+ * Mapping id (sda1) → /dev/sda1 : partman attribue les paths dans l'ordre des
+ * segments du expert_recipe, qui suit lui-même l'ordre des partitions déclarées
+ * par disque. Donc pos = position dans la liste partitions[] du disque.
+ */
+function build_raid_recipe(array $raidArrays, array $disks): string {
+    if (empty($raidArrays)) return '';
+
+    $idToPath = [];
+    foreach ($disks as $disk) {
+        $diskPath = (string)($disk['path'] ?? '');
+        if ($diskPath === '') continue;
+        $pos = 1;
+        foreach ((array)($disk['partitions'] ?? []) as $p) {
+            $id = (string)($p['id'] ?? '');
+            // Kernel names ending in a digit (NVMe, MMC) separate the partition number with p.
+            if ($id !== '') $idToPath[$id] = $diskPath . (preg_match('/[0-9]$/', $diskPath) ? 'p' : '') . $pos;
+            $pos++;
+        }
+    }
+
+    $lines = [];
+    foreach ($raidArrays as $arr) {
+        $level     = (int)($arr['level'] ?? 1);
+        $members   = (array)($arr['members'] ?? []);
+        $spares    = (array)($arr['spares']  ?? []);
+        $numActive = count($members);
+        $numSpares = count($spares);
+
+        $memberPaths = array_map(fn($id) => $idToPath[(string)$id] ?? '/dev/UNKNOWN', $members);
+        $sparePaths  = array_map(fn($id) => $idToPath[(string)$id] ?? '/dev/UNKNOWN', $spares);
+        $devices = implode('#', $memberPaths);
+        $sparesField = $numSpares > 0 ? implode('#', $sparePaths) : '-';
+
+        // is_pv → MD consommé par LVM, pas formaté ici (fs=lvm, mount=-)
+        // sinon → fallback ext4 sur / (Phase B : pas de champ mount UI sur les MD non-PV)
+        $fs    = !empty($arr['is_pv']) ? 'lvm'  : 'ext4';
+        $mount = !empty($arr['is_pv']) ? '-'   : '/';
+
+        $lines[] = "$level $numActive $numSpares $fs $mount $devices $sparesField";
+    }
+
+    // Format multi-lignes attendu par partman : segments séparés par " . " avec backslash continuation
+    return "d-i partman-auto-raid/recipe string \\\n      "
+         . implode(" \\\n      . \\\n      ", $lines)
+         . " \\\n      .\n";
+}
+
+// --- Block réseau (Phase 3 chantier preset-hardware-aware) --------------
+//
+// Deux régimes :
+//   (a) Snapshot multi-NIC présent (config.network.interfaces) → on génère :
+//        - directives d-i natives pour la NIC PRIMAIRE (choose_interface +
+//          get_ipaddress/netmask/gateway/nameservers si static)
+//        - lignes late_command qui écrivent /etc/network/interfaces.d/<iface>
+//          pour CHAQUE NIC secondaire active (dhcp ou static). d-i ne configure
+//          qu'une interface nativement, le reste passe par ifupdown post-install.
+//
+//   (b) Pas de snapshot multi-NIC → fallback historique single-NIC sur les
+//       colonnes flat (network_mode/static_*). Garantit qu'un preset legacy
+//       continue à générer exactement le même preseed qu'avant ce chantier.
+//
+// $secondary_iface_cmds : tableau de commandes late_command à concaténer en aval
+// (utilisé plus bas dans la construction de $late_command).
+$network_block         = '';
+$secondary_iface_cmds  = [];
+$network_extra_pkgs    = []; // vlan / ifenslave selon VLAN/bond utilisés
+$net_plan              = (isset($config['network']) && is_array($config['network'])) ? $config['network'] : null;
+$net_interfaces        = (is_array($net_plan) && isset($net_plan['interfaces']) && is_array($net_plan['interfaces']))
+    ? $net_plan['interfaces'] : [];
+$net_primary_idx       = is_array($net_plan) && isset($net_plan['primary']) ? (int)$net_plan['primary'] : 0;
+
+if (!empty($net_interfaces)) {
+    // ----- (a) Régime multi-NIC -----
+    if ($net_primary_idx < 0 || $net_primary_idx >= count($net_interfaces)) {
+        $net_primary_idx = 0;
+    }
+    $primary = $net_interfaces[$net_primary_idx];
+    $primary_lines = [];
+
+    // 1) Sélection de l'interface primaire au niveau d-i.
+    //    Si match_by=mac : on passe la MAC à netcfg/choose_interface (d-i accepte
+    //    soit "auto", soit un nom comme "eth0", soit une MAC). C'est l'option la
+    //    plus stable car le naming systemd peut différer entre installateur et OS.
+    //    Sinon : 'auto' (legacy).
+    $primary_match_by = $primary['match_by'] ?? 'primary';
+    $primary_mac      = strtolower((string)($primary['match']['mac'] ?? ''));
+    if ($primary_match_by === 'mac' && $primary_mac !== '') {
+        $primary_lines[] = "d-i netcfg/choose_interface select " . safe_preseed_scalar($primary_mac);
+    } else {
+        $primary_lines[] = "d-i netcfg/choose_interface select auto";
+    }
+
+    // 2) Mode primaire : static / dhcp / disabled (disabled ne devrait pas arriver
+    //    en pratique car validateNetworkPlan refuse une primaire disabled).
+    // The PXE member and the member carrying the bond's address may differ.
+    // During d-i, use the bond master's address on the selected physical NIC.
+    $install_primary = $primary;
+    $primary_bond_name = $primary['bond']['name'] ?? null;
+    if ($primary_bond_name !== null) foreach ($net_interfaces as $iface) {
+        if (($iface['bond']['name'] ?? null) === $primary_bond_name && ($iface['bond']['role'] ?? null) === 'master') {
+            $install_primary = $iface;
+            break;
+        }
+    }
+    $primary_mode = $install_primary['mode'] ?? 'dhcp';
+    if ($primary_mode === 'static' && is_array($install_primary['static'] ?? null)) {
+        $st       = $install_primary['static'];
+        $cidr     = (int)($st['cidr'] ?? 24) ?: 24;
+        $netmask  = cidr_to_netmask($cidr);
+        $dns_list = is_array($st['dns'] ?? null) ? $st['dns'] : parse_dns($st['dns'] ?? null);
+        $dns_str  = implode(' ', array_map('safe_preseed_scalar', array_map('strval', $dns_list)));
+        $primary_lines[] = "d-i netcfg/disable_autoconfig boolean true";
+        $primary_lines[] = "d-i netcfg/get_ipaddress string "   . safe_preseed_scalar((string)($st['ip'] ?? ''));
+        $primary_lines[] = "d-i netcfg/get_netmask string "     . safe_preseed_scalar($netmask);
+        $primary_lines[] = "d-i netcfg/get_gateway string "     . safe_preseed_scalar((string)($st['gateway'] ?? ''));
+        $primary_lines[] = "d-i netcfg/get_nameservers string " . $dns_str;
+        $primary_lines[] = "d-i netcfg/confirm_static boolean true";
+    } else {
+        $primary_lines[] = "# Interface primaire : DHCP";
+    }
+
+    $network_block = implode("\n", $primary_lines);
+
+    // 3) NICs secondaires — écriture par late_command de /etc/network/interfaces.d/.
+    //    Le nom systemd peut être inconnu au moment du preseed → on résout par MAC
+    //    au runtime via `ip -br link`. Le contenu interfaces.d est encodé base64
+    //    pour préserver les newlines à travers le quoting late_command (qui exige
+    //    des backslashes de continuation).
+    //
+    //    Sécurité : si match.mac est absent dans la NIC secondaire, on skip avec
+    //    un commentaire DEBUG (cas snapshot mal formé).
+    // Bonding : un groupe par bond.name. Le « master » porte la config IP du bond ;
+    // toutes les NICs du groupe (master compris, primaire comprise) en sont membres.
+    // Le bond est émis une seule fois après la boucle (cf. plus bas).
+    $bond_modes_ok   = ['active-backup', 'balance-rr', 'balance-xor', 'broadcast', '802.3ad', 'balance-tlb', 'balance-alb'];
+    $bonds           = [];
+    $bond_member_idx = [];
+    foreach ($net_interfaces as $idx => $iface) {
+        $b      = is_array($iface['bond'] ?? null) ? $iface['bond'] : [];
+        $b_name = (string)($b['name'] ?? '');
+        if (!in_array($b['role'] ?? null, ['master', 'slave'], true)
+            || !preg_match('/^[A-Za-z][A-Za-z0-9_-]{0,14}$/D', $b_name)) continue;
+        $bonds[$b_name]['members'][] = $idx;
+        $bond_member_idx[$idx] = true;
+        if ($b['role'] === 'master') {
+            $bonds[$b_name]['master'] = $idx;
+            $bonds[$b_name]['mode']   = in_array($b['mode'] ?? '', $bond_modes_ok, true) ? $b['mode'] : 'active-backup';
+        }
+    }
+
+    foreach ($net_interfaces as $idx => $iface) {
+        if ($idx === $net_primary_idx) continue;
+        if (isset($bond_member_idx[$idx])) continue;
+        $mode = $iface['mode'] ?? 'dhcp';
+        if ($mode === 'disabled') continue; // skip silencieux
+
+        $mac = strtolower((string)($iface['match']['mac'] ?? ''));
+        if ($mac === '') {
+            // Skip défensif plutôt qu'une mauvaise iface configurée. Pas de `#` ici :
+            // d-i joint les lignes du late_command, un commentaire neutraliserait
+            // toutes les commandes suivantes. Un echo laisse la trace dans le log d-i.
+            $secondary_iface_cmds[] =
+                "    in-target /bin/echo 'NIC secondaire #" . ($idx + 1) . " ignoree (match.mac absent)' ; \\\n";
+            continue;
+        }
+
+        $iface_lines = [
+            "# Géré par preseed multi-NIC (PXE Tools)",
+        ];
+
+        $vlan_id   = isset($iface['vlan']['id']) ? (int)$iface['vlan']['id'] : 0;
+
+        if ($vlan_id > 0) $network_extra_pkgs[] = 'vlan';
+
+        // Nom logique de l'interface telle qu'on l'écrit dans interfaces.d.
+        // Préfère le `name` inventaire si on l'avait, mais d-i n'a pas accès à
+        // l'inventaire PXE — on résoudra par MAC au runtime. On utilise donc
+        // un nom marker placé dans un script shell qui réécrit la conf après
+        // résolution `ifname=$(ip -br link | awk ...)`.
+        //
+        // Comme on est en heredoc qui sera lui-même quoted dans late_command,
+        // on garde le placeholder __IFNAME__ et on le remplace shell-side.
+        $logical = '__IFNAME__';
+
+        if ($vlan_id > 0) {
+            // Sur Debian, vlan-raw-device <parent> + auto-naming <parent>.<id>
+            $vlan_iface = $logical . '.' . $vlan_id;
+            $iface_lines[] = "auto $vlan_iface";
+            if ($mode === 'static' && is_array($iface['static'] ?? null)) {
+                $st = $iface['static'];
+                $cidr = (int)($st['cidr'] ?? 24) ?: 24;
+                $netmask = cidr_to_netmask($cidr);
+                $iface_lines[] = "iface $vlan_iface inet static";
+                $iface_lines[] = "    address " . (string)($st['ip'] ?? '');
+                $iface_lines[] = "    netmask " . $netmask;
+                if (!empty($st['gateway'])) $iface_lines[] = "    gateway " . (string)$st['gateway'];
+                $dns_secondary = is_array($st['dns'] ?? null) ? implode(' ', $st['dns']) : '';
+                if ($dns_secondary !== '') $iface_lines[] = "    dns-nameservers " . $dns_secondary;
+                $iface_lines[] = "    vlan-raw-device $logical";
+            } else {
+                $iface_lines[] = "iface $vlan_iface inet dhcp";
+                $iface_lines[] = "    vlan-raw-device $logical";
+            }
+        } else {
+            // Cas simple : DHCP ou static sur l'interface physique.
+            $iface_lines[] = "auto $logical";
+            if ($mode === 'static' && is_array($iface['static'] ?? null)) {
+                $st = $iface['static'];
+                $cidr = (int)($st['cidr'] ?? 24) ?: 24;
+                $iface_lines[] = "iface $logical inet static";
+                $iface_lines[] = "    address " . (string)($st['ip'] ?? '');
+                $iface_lines[] = "    netmask " . cidr_to_netmask($cidr);
+                if (!empty($st['gateway'])) $iface_lines[] = "    gateway " . (string)$st['gateway'];
+                $dns_secondary = is_array($st['dns'] ?? null) ? implode(' ', $st['dns']) : '';
+                if ($dns_secondary !== '') $iface_lines[] = "    dns-nameservers " . $dns_secondary;
+            } else {
+                $iface_lines[] = "iface $logical inet dhcp";
+            }
+        }
+
+        // Encodage base64 du contenu interfaces.d : préserve les newlines à
+        // travers le late_command (qui exige des continuation backslashes).
+        // Au runtime : résout MAC → ifname, substitue __IFNAME__, écrit le fichier.
+        $iface_content = implode("\n", $iface_lines) . "\n";
+        $iface_b64     = base64_encode($iface_content);
+        $mac_safe      = safe_preseed_scalar($mac);
+        // Nom de fichier court et stable : indexé par index original — évite
+        // les collisions et reste prédictible pour debug.
+        $iface_file    = sprintf('pxe-nic-%02d', $idx);
+
+        $secondary_iface_cmds[] =
+            "    in-target /bin/bash -c '"
+            . "ifname=\$(ip -br link 2>/dev/null | awk -v m=$mac_safe \"BEGIN{IGNORECASE=1} tolower(\\\$3)==tolower(m){print \\\$1; exit}\"); "
+            . "if [ -n \"\$ifname\" ]; then "
+            . "echo $iface_b64 | base64 -d | sed \"s/__IFNAME__/\$ifname/g\" > /etc/network/interfaces.d/$iface_file; "
+            . "else echo \"# NIC $mac_safe non trouvée au runtime\" > /etc/network/interfaces.d/$iface_file; fi"
+            . "' ; \\\n";
+    }
+
+    // 4) Bonds — format ifupdown natif Debian/Proxmox : `bond-slaves` sur le bond,
+    //    slaves en `inet manual` sans `auto` (le bond les monte). Pas de `hwaddress` :
+    //    le noyau donne au bond la MAC du 1er slave enrôlé, donc on liste la primaire
+    //    en premier → MAC stable, celle que la DB connaît, sans risque d'ordre de
+    //    montée ifupdown. La stanza d-i de chaque NIC membre (posée en IP directe sur
+    //    la NIC physique) est retirée de /etc/network/interfaces, sinon `iface X`
+    //    serait défini deux fois. Si aucune NIC n'est résolue, la config d-i reste.
+    $bond_script_tpl = <<<'SH'
+m2n() { ip -br link 2>/dev/null | awk -v m="$1" 'tolower($3)==tolower(m){print $1; exit}'; }
+slaves=""
+for mac in __MACS__; do
+  n=$(m2n "$mac")
+  if [ -n "$n" ]; then slaves="$slaves $n"; fi
+done
+if [ -z "$slaves" ]; then
+  echo "# bond __BOND__ : aucune NIC membre trouvee, config d-i conservee" > /etc/network/interfaces.d/pxe-bond-__BOND__
+  exit 0
+fi
+for n in $slaves; do
+  awk -v n="$n" '
+    /^(auto|allow-[a-z-]+|iface)[[:space:]]/ { if ($2 == n) { drop = ($1 == "iface"); next }; drop = 0 }
+    /^(source|source-directory|mapping|no-[a-z-]+)[[:space:]]/ { drop = 0 }
+    drop && /^[[:space:]]/ { next }
+    { print }
+  ' /etc/network/interfaces > /etc/network/interfaces.pxe && mv /etc/network/interfaces.pxe /etc/network/interfaces
+done
+{
+  for n in $slaves; do printf 'iface %s inet manual\n\n' "$n"; done
+  cat <<'PXEBOND'
+__STANZA__
+PXEBOND
+  if [ "__ACTIVE_BACKUP__" = 1 ]; then
+    set -- $slaves
+    printf '    bond-primary %s\n' "$1"
+  fi
+  echo "    bond-slaves$slaves"
+} > /etc/network/interfaces.d/pxe-bond-__BOND__
+SH;
+
+    foreach ($bonds as $bond_name => $bond) {
+        if (!isset($bond['master'])) continue; // validateNetworkPlan exige un master
+
+        $master = $net_interfaces[$bond['master']];
+        $order  = $bond['members'];
+        usort($order, fn($a, $b) => [$a !== $net_primary_idx, $a !== $bond['master']]
+                                <=> [$b !== $net_primary_idx, $b !== $bond['master']]);
+        $macs = [];
+        foreach ($order as $member_idx) {
+            $m = strtolower((string)($net_interfaces[$member_idx]['match']['mac'] ?? ''));
+            if (preg_match('/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/', $m)) $macs[] = $m;
+        }
+        // Un commentaire dans late_command neutraliserait tout le reste de la ligne
+        // jointe par d-i : on saute sans rien émettre (validateNetworkPlan le refuse déjà).
+        if (count($macs) < 2) continue;
+
+        $stanza = ["# Genere par PXE Tools : bond $bond_name", "auto $bond_name"];
+        $st = is_array($master['static'] ?? null) ? $master['static'] : [];
+        if (($master['mode'] ?? 'dhcp') === 'static' && !empty($st)) {
+            $ipv4 = fn($v) => filter_var((string)$v, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ?: '';
+            $stanza[] = "iface $bond_name inet static";
+            $stanza[] = "    address " . $ipv4($st['ip'] ?? '');
+            $stanza[] = "    netmask " . cidr_to_netmask((int)($st['cidr'] ?? 24) ?: 24);
+            if ($ipv4($st['gateway'] ?? '') !== '') $stanza[] = "    gateway " . $ipv4($st['gateway']);
+            $dns = array_filter(array_map($ipv4, is_array($st['dns'] ?? null) ? $st['dns'] : []));
+            if ($dns) $stanza[] = "    dns-nameservers " . implode(' ', $dns);
+        } else {
+            $stanza[] = "iface $bond_name inet dhcp";
+        }
+        $stanza[] = "    bond-mode " . $bond['mode'];
+        $stanza[] = "    bond-miimon 100";
+        if ($bond['mode'] === 'active-backup') {
+            // Le carrier de la NIC peut remonter avant que le port du switch
+            // transmette : différer le retour et l'ARP gratuit du bond.
+            $stanza[] = "    bond-primary-reselect always";
+            $stanza[] = "    bond-updelay 5000";
+        }
+
+        $script = strtr($bond_script_tpl, [
+            '__MACS__'   => implode(' ', $macs),
+            '__BOND__'   => $bond_name,
+            '__STANZA__' => implode("\n", $stanza),
+            '__ACTIVE_BACKUP__' => $bond['mode'] === 'active-backup' ? '1' : '0',
+        ]);
+        $script_b64 = base64_encode($script);
+        $secondary_iface_cmds[] =
+            "    in-target /bin/bash -c 'echo $script_b64 | base64 -d > /tmp/pxe-bond.sh && /bin/bash /tmp/pxe-bond.sh ; rm -f /tmp/pxe-bond.sh' ; \\\n";
+        $network_extra_pkgs[] = 'ifenslave';
+    }
+
+    // Dédup paquets supplémentaires (vlan / ifenslave)
+    $network_extra_pkgs = array_values(array_unique($network_extra_pkgs));
+} else {
+    // ----- (b) Fallback legacy single-NIC -----
+    // La directive choose_interface=auto est désormais portée par ce bloc
+    // (retirée de preseed-base.cfg.j2 pour ne pas dupliquer en mode multi-NIC).
+    if (($row['network_mode'] ?? 'dhcp') === 'static' && !empty($row['static_ip'])) {
+        $cidr = (int)($row['static_cidr'] ?? 24) ?: 24;
+        $netmask = cidr_to_netmask($cidr);
+        $dns_list = parse_dns($row['static_dns'] ?? null);
+        $dns_str = implode(' ', $dns_list);
+        $network_block = <<<CFG
+d-i netcfg/choose_interface select auto
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/get_ipaddress string {$row['static_ip']}
+d-i netcfg/get_netmask string $netmask
+d-i netcfg/get_gateway string {$row['static_gateway']}
+d-i netcfg/get_nameservers string $dns_str
+d-i netcfg/confirm_static boolean true
+CFG;
+    } else {
+        $network_block = "d-i netcfg/choose_interface select auto\n# Réseau : DHCP (default)";
+    }
+}
+
+// --- Block partitionnement -----------------------------------------------
+/** Encode a typed disk identity; unknown and malformed values fail closed. */
+function encode_disk_guard_identity(mixed $identity): string {
+    if (!is_array($identity)) return '-';
+    $value = strtoupper(trim((string)($identity['value'] ?? '')));
+    if (($identity['kind'] ?? '') === 'serial') return $value === '' ? '-' : base64_encode($value);
+    if (($identity['kind'] ?? '') === 'wwid' && ($identity['source'] ?? '') === 'sysfs-wwid'
+        && preg_match('/^NAA\.[0-9A-F]{32}$/D', $value) && $value !== 'NAA.' . str_repeat('0', 32)) {
+        return 'wwid=' . base64_encode($value);
+    }
+    return '-';
+}
+
+$partition_block = '';
+$mode = $row['partition_mode'] ?? 'default';
+$partitions_for_tune2fs = []; // [mountpoint => reserved_pct] pour ext2/3/4 avec reserved défini
+$disk_guard_specs = [];       // "chemin:base64(serial)" des disques cibles liés au snapshot machine
+$disk_guard_mode  = 'remap';  // 'strict' si RAID : les chemins des membres sont figés dans le recipe
+$disk_guard_required = false;
+$planned_boot_mode = '';     // Guided recipes determine their own firmware mode.
+
+if ($mode === 'custom') {
+    $disk_guard_required = true;
+    $plan = parse_partitioning_plan($row['partition_custom_json'] ?? null);
+    if ($plan === null || empty($plan['target_disks'])) {
+        // Plan vide ou legacy → fallback default
+        $partition_block = <<<CFG
+# WARN : partition_mode='custom' mais plan vide/legacy → fallback atomic
+d-i partman-auto/method string lvm
+d-i partman-auto/choose_recipe select atomic
+d-i partman-auto-lvm/guided_size string max
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+CFG;
+    } else {
+        $targetDisks = $plan['target_disks'];
+        $disks       = $plan['disks'];
+        $raidArrays  = $plan['raid_arrays'] ?? [];
+        $vgs         = $plan['vgs'];
+        $lvs         = $plan['logical_volumes'];
+
+        $hasLvm  = !empty($vgs);
+        $hasRaid = !empty($raidArrays);
+        $planned_boot_mode = 'bios';
+        foreach ($disks as $disk) foreach ($disk['partitions'] ?? [] as $part) {
+            if (($part['fs'] ?? '') === 'efi') $planned_boot_mode = 'uefi';
+        }
+        $pvToVg = build_pv_to_vg($vgs);
+
+        foreach ($targetDisks as $targetDisk) {
+            $savedIdentity = $plan['target_disk_identities'][(string)$targetDisk] ?? null;
+            $serial = is_array($savedIdentity) && ($savedIdentity['kind'] ?? '') === 'serial'
+                ? strtoupper(trim((string)($savedIdentity['value'] ?? ''))) : '';
+            $encodedIdentity = encode_disk_guard_identity($savedIdentity);
+            if (($config['disk_target_constraints'] ?? []) !== []) {
+                $constraints = $config['disk_target_constraints'];
+                $intent = is_array($constraints) && is_string($constraints[(string)$targetDisk] ?? null)
+                    ? strtoupper(trim($constraints[(string)$targetDisk])) : '';
+                if (count($targetDisks) !== 1 || !is_array($constraints) || count($constraints) !== 1 || $intent === '' || $intent !== $serial) $encodedIdentity = '-';
+            }
+            if (preg_match('#^/dev/[A-Za-z0-9]+$#', (string)$targetDisk)) {
+                $disk_guard_specs[] = $targetDisk . ':' . $encodedIdentity;
+            }
+        }
+        // Multi-disk recipes contain physical paths; fail if d-i renumbers
+        // them instead of leaving recipe constraints pointing to another disk.
+        if ($hasRaid || count($targetDisks) > 1) $disk_guard_mode = 'strict';
+
+        // Collecte des mountpoints ext* avec reserved_pct défini (pour tune2fs late)
+        foreach ($disks as $d) {
+            foreach ($d['partitions'] ?? [] as $p) {
+                if (in_array($p['fs'] ?? '', ['ext2','ext3','ext4'], true)
+                    && ($p['reserved_pct'] ?? null) !== null
+                    && !empty($p['mount'])) {
+                    $partitions_for_tune2fs[$p['mount']] = (int)$p['reserved_pct'];
+                }
+            }
+        }
+        foreach ($lvs as $lv) {
+            if (in_array($lv['fs'] ?? '', ['ext2','ext3','ext4'], true)
+                && ($lv['reserved_pct'] ?? null) !== null
+                && !empty($lv['mount'])) {
+                $partitions_for_tune2fs[$lv['mount']] = (int)$lv['reserved_pct'];
+            }
+        }
+
+        // Génération des segments expert_recipe
+        $segments = [];
+        foreach ($disks as $d) {
+            $diskPath = $d['path'] ?? null;
+            foreach ($d['partitions'] ?? [] as $p) {
+                $vgForPv = null;
+                if (($p['fs'] ?? '') === 'lvm-pv') {
+                    $pvId = (string)($p['id'] ?? '');
+                    $vgForPv = $pvToVg[$pvId] ?? null;
+                }
+                $segments[] = partman_partition_segment($p, count($targetDisks) > 1 ? $diskPath : null, $vgForPv);
+            }
+        }
+        foreach ($lvs as $lv) {
+            $segments[] = partman_lv_segment($lv);
+        }
+
+        $recipe_body = implode(" \\\n      ", $segments);
+        $disk_param = 'd-i partman-auto/disk string ' . implode(' ', $targetDisks);
+        // method : raid > lvm > regular. partman-auto/method=raid couvre les combos RAID+LVM.
+        $method = $hasRaid ? 'raid' : ($hasLvm ? 'lvm' : 'regular');
+
+        // partman-auto-lvm/new_vg_name : fallback VG si une partition lvm-pv n'a pas
+        // de vg_name{ } dans le recipe. On met le premier VG par défaut.
+        $firstVg = $vgs[0]['name'] ?? 'vg0';
+        $firstVgClean = safe_lvm_name($firstVg) ?: 'vg0';
+
+        // preseed: détection du label de table. GPT si une partition `biosgrub`
+        // (BIOS legacy + GPT) ou `efi` (UEFI) est déclarée dans le plan, sinon
+        // msdos (MBR legacy). Sans default_label explicite, partman conserve
+        // toute table existante (résidu d'install précédente) ou choisit un
+        // défaut incompatible avec le recipe → fallback atomic silencieux.
+        $useGpt = false;
+        foreach ($disks as $d) {
+            foreach ($d['partitions'] ?? [] as $p) {
+                if (in_array($p['fs'] ?? '', ['biosgrub', 'efi'], true)) {
+                    $useGpt = true;
+                    break 2;
+                }
+            }
+        }
+        $diskLabel = $useGpt ? 'gpt' : 'msdos';
+
+        $lvm_block = $hasLvm ? <<<CFG
+d-i partman-auto-lvm/new_vg_name string $firstVgClean
+d-i partman-auto-lvm/guided_size string max
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman-auto/purge_lvm_from_device boolean true
+CFG : '';
+
+        $raid_recipe_block = $hasRaid ? rtrim(build_raid_recipe($raidArrays, $disks), "\n") : '';
+        $md_confirm_block  = $hasRaid
+            ? "d-i partman-md/confirm boolean true\nd-i partman-md/confirm_nooverwrite boolean true"
+            : '';
+
+        // preseed: choose_recipe est OBLIGATOIRE même quand expert_recipe est posé.
+        // Sans cette directive, partman ne sait pas QUELLE recipe utiliser et retombe
+        // sur la recipe "atomic" par défaut (sda1 /boot + sda2 extended + sda5 lvm-pv
+        // → vg_root/root + vg_root/swap_1), ignorant complètement l'expert_recipe ad-hoc.
+        // Le nom 'custom_recipe' doit matcher le label déclaré dans expert_recipe ci-dessous.
+        //
+        // preseed: confirm_write_new_label boolean true évite le prompt interactif quand
+        // partman doit écrire une nouvelle table de partitions (cas wipe partial qui laisse
+        // une signature résiduelle, ou changement MBR↔GPT).
+        //
+        // preseed: default_label + default_filesystem + unmount_active + purge_lvm_from_device
+        // sont OBLIGATOIRES pour que partman applique fiablement custom_recipe. Sans elles,
+        // partman fallback silencieusement sur la recipe atomic (cf. bug latent 2026-05-17).
+        $partition_block = $disk_param . "\n" . <<<CFG
+d-i partman/unmount_active boolean true
+d-i partman-auto/method string $method
+d-i partman-partitioning/default_label string $diskLabel
+d-i partman-basicfilesystems/default_label string $diskLabel
+d-i partman/default_filesystem string ext4
+$lvm_block
+$raid_recipe_block
+$md_confirm_block
+d-i partman-md/device_remove_md boolean true
+d-i partman-auto/expert_recipe string custom_recipe :: \\
+      $recipe_body
+d-i partman-auto/choose_recipe select custom_recipe
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i partman-basicfilesystems/no_swap boolean false
+CFG;
+    }
+} else {
+    $disk_guard_required = true;
+    $defaultPath = (string)($row['system_disk_path'] ?? '/dev/pxe-disque-inconnu');
+    $defaultIdentity = is_array($row['system_disk_identity'] ?? null) ? $row['system_disk_identity'] : null;
+    $disk_guard_specs[] = $defaultPath . ':' . encode_disk_guard_identity($defaultIdentity);
+    // Mode 'default' : recipe atomic_lvm. Le disque cible n'est plus défini par preset
+    // (choix machine snapshoté et vérifié par numéro) — le garde-fou définit le chemin validé.
+    $partition_block = <<<CFG
+d-i partman-auto/method string lvm
+d-i partman-auto/choose_recipe select atomic
+d-i partman-auto-lvm/guided_size string max
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+CFG;
+}
+
+// --- Block user admin ----------------------------------------------------
+$admin_user_block = '';
+$admin_login = preg_replace('/[^a-z0-9_-]/', '', strtolower($row['admin_user_login'] ?? '')) ?: 'admin';
+$admin_groups = preg_replace('/[^a-z0-9_,-]/', '', $row['admin_user_groups'] ?? 'sudo') ?: 'sudo';
+$admin_pwhash = $row['admin_user_pwhash'] ?? '';
+$admin_pubkeys = trim($row['admin_user_pubkeys'] ?? '');
+// Le fichier data.json peut avoir été rendu avant une désactivation ou une
+// rotation. La configuration courante fait foi pour chaque preseed servi.
+$ansible_pubkey = '';
+try {
+    $settings = [];
+    $stmt = $pdo->query("SELECT key, value FROM settings WHERE key IN ('ansible_enabled', 'ansible_ssh_pubkey')");
+    foreach ($stmt->fetchAll() as $setting) {
+        $settings[(string)$setting['key']] = (string)$setting['value'];
+    }
+    if (($settings['ansible_enabled'] ?? 'off') === 'on') {
+        $ansible_pubkey = trim($settings['ansible_ssh_pubkey'] ?? '');
+        if ($ansible_pubkey !== '' && !preg_match('/^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+)\s+[A-Za-z0-9+\/]+={0,2}(?:\s+[^\r\n]*)?$/D', $ansible_pubkey)) {
+            http_response_code(422);
+            echo "# ERREUR : clé publique du module Ansible invalide.\n";
+            exit;
+        }
+    }
+} catch (\Throwable $e) {
+    http_response_code(503);
+    echo "# ERREUR : configuration du module indisponible.\n";
+    exit;
+}
+
+// Éviter qu'une directive statique ne contredise le bloc comptes ou ne
+// désactive le seul compte administrateur quand root est verrouillé.
+preg_match_all('~^[\t ]*[^\s#]+[\t ]+passwd/make-user\b([^\r\n]*)$~mi', $tpl, $makeUserDirectives);
+$accountsSafe = true;
+foreach ($makeUserDirectives[1] as $directive) {
+    $expectedMakeUser = $effective_root_mode === 'disabled' ? 'true' : 'false';
+    if (($effective_root_mode === 'disabled' || $hasAccountsBlock)
+        && !preg_match('~^[\t ]+boolean[\t ]+' . $expectedMakeUser . '[\t ]*(?:#.*)?$~i', $directive)) {
+        $accountsSafe = false;
+    }
+}
+if ($hasAccountsBlock && $effective_root_mode === 'disabled') {
+    $expectedAdmin = [
+        'passwd/username' => ['string', $admin_login],
+        'passwd/user-fullname' => ['string', safe_preseed_scalar($admin_user_fullname !== '' ? $admin_user_fullname : $admin_login)],
+        'passwd/user-default-groups' => ['string', safe_preseed_scalar($admin_groups)],
+        'passwd/user-password-crypted' => ['password', $admin_pwhash !== '' ? safe_preseed_scalar($admin_pwhash) : '!'],
+    ];
+    preg_match_all('~^[\t ]*[^\s#]+[\t ]+(passwd/(?:username|user-fullname|user-default-groups|user-password(?:-crypted|-again)?))\b([^\r\n]*)$~mi', $tpl, $adminDirectives, PREG_SET_ORDER);
+    foreach ($adminDirectives as $directive) {
+        $field = strtolower($directive[1]);
+        $parts = preg_split('/[\t ]+/', trim($directive[2]), 2);
+        if (!isset($expectedAdmin[$field]) || count($parts) !== 2
+            || strtolower($parts[0]) !== $expectedAdmin[$field][0]
+            || $parts[1] !== $expectedAdmin[$field][1]) $accountsSafe = false;
+    }
+}
+if (!$accountsSafe) {
+    http_response_code(422);
+    echo "# ERREUR : directives comptes du template preseed incompatibles avec la configuration de la machine.\n";
+    exit;
+}
+
+$user_create = "in-target /usr/sbin/useradd -m -s /bin/bash";
+foreach (explode(',', $admin_groups) as $g) {
+    $g = trim($g);
+    if ($g !== '') $user_create .= " -G " . escapeshellarg($g);
+}
+$user_create .= " " . escapeshellarg($admin_login);
+
+$pw_set = '';
+if ($admin_pwhash !== '') {
+    $escaped = str_replace(['\\', '"', '$'], ['\\\\', '\\"', '\\$'], $admin_pwhash);
+    $pw_set = ' ; in-target /bin/bash -c \'echo "' . $admin_login . ':' . $escaped . '" | chpasswd -e\'';
+}
+
+$pubkey_lines = [];
+foreach (preg_split('/\r?\n/', $admin_pubkeys) as $key) {
+    $key = trim($key);
+    if ($key !== '') $pubkey_lines[] = $key;
+}
+$pubkeys_str = implode("\\n", array_map(fn($k) => addslashes($k), $pubkey_lines));
+
+// Bug 1 fix : on ne crée le user ansible QUE si une pubkey est configurée. Sinon
+// on aurait un user verrouillé sans accès SSH (authorized_keys vide). Le user
+// ansible sert exclusivement aux playbooks PXE Tools → sans clé pubkey, il
+// est inutile et son existence masquerait l'erreur de config.
+$late_command = '';
+
+// A network-loaded preseed can arrive after netcfg has already selected the
+// DHCP hostname. Apply an explicitly chosen hostname to the installed system
+// as well; leave DHCP-selected names alone when no hostname was configured.
+if ($hostname !== null) {
+    $hostname_b64 = base64_encode($hostname);
+    $fqdn_b64 = base64_encode($domain !== '' ? $hostname . '.' . $domain : $hostname);
+    $host_script = <<<'SH'
+#!/bin/sh
+set -eu
+node=$(printf '%s' '__NODE__' | base64 -d)
+fqdn=$(printf '%s' '__FQDN__' | base64 -d)
+printf '%s\n' "$node" > /target/etc/hostname
+hosts=/target/etc/hosts
+tmp="$hosts.pxe-tools.$$"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+[ -f "$hosts" ] || : > "$hosts"
+awk -v node="$node" -v fqdn="$fqdn" '
+    $1 == "127.0.1.1" && !done {
+        printf "127.0.1.1\t%s", fqdn
+        if (node != fqdn) printf " %s", node
+        for (i = 2; i <= NF; i++) {
+            if ($i != node && $i != fqdn) printf " %s", $i
+        }
+        printf "\n"
+        done = 1
+        next
+    }
+    { print }
+    END {
+        if (!done) {
+            printf "127.0.1.1\t%s", fqdn
+            if (node != fqdn) printf " %s", node
+            printf "\n"
+        }
+    }
+' "$hosts" > "$tmp"
+mv "$tmp" "$hosts"
+SH;
+    $host_script = str_replace(['__NODE__', '__FQDN__'], [$hostname_b64, $fqdn_b64], $host_script);
+    $late_command .= "    printf '%s' '" . base64_encode($host_script) . "' | base64 -d | /bin/sh || exit 1 ; \\\n";
+}
+
+// LOGCAP01 (2026-05-17) — résolution install_id AVANT le rendu late_command.
+// Le late_command embarque un tail+POST en arrière-plan vers /api/internal/install-log
+// qui exige install_id en query string. On le récupère via /api/install-start
+// (idempotent : Installation::startForMachine dédup si déjà in_progress). Best-effort :
+// si l'endpoint répond pas, on continue sans tail (skip silencieux).
+//
+// L'install-start historique en bas de fichier (L994) est conservé pour back-compat
+// (équivalent NO-OP idempotent). Le déplacer plus haut ici nous donne la valeur
+// d'install_id pour injecter dans le late_command.
+$install_id = null;
+$ctx = stream_context_create(['http' => ['timeout' => 3, 'method' => 'GET']]);
+$resp = @file_get_contents('http://127.0.0.1/api/install-start?mac=' . urlencode($mac), false, $ctx);
+if ($resp !== false) {
+    $jr = json_decode($resp, true);
+    if (is_array($jr) && isset($jr['installation_id'])) {
+        $install_id = (int)$jr['installation_id'];
+    }
+}
+
+// Pings de suivi temps réel (best-effort, --timeout=5 pour ne pas bloquer
+// l'install si l'endpoint répond pas). Au moment où late_command s'exécute,
+// partman + base-install + bootloader sont DÉJÀ tous terminés → on peut
+// marquer leur status='success' en bulk.
+$pxe_ip_local = $data['pxe_ip'] ?? '{{ pxe_ip }}';
+$pingBase = "/usr/bin/wget -q --timeout=5 -O /dev/null 'http://" . $pxe_ip_local . "/api/task-phase?task=install&mac=" . $mac;
+foreach (['partman-done', 'base-install-done', 'apt-setup', 'tasksel', 'bootloader'] as $p) {
+    $late_command .= $pingBase . "&phase=$p&status=success' || true ; \\\n";
+}
+$late_command .= $pingBase . "&phase=late-command&status=running' || true ; \\\n";
+
+// REINSTCKPT01 (Fix P + Fix S) — Checkpoints émis depuis le late_command.
+// Ordre dans le catalogue après refonte :
+//   late_command_started → posé ici, à l'entrée du late_command
+//   install_reboot       → RETIRÉ (cf. Fix P plus bas)
+//   base_system_installed→ RETIRÉ (Fix S) : ce checkpoint était sémantiquement
+//     trompeur (le base-installer Debian finit AVANT le late_command ; le
+//     checkpoint arrivait donc bien après la réalité). Aucune dette DB.
+//
+// Wgets best-effort (|| true) — le token est passé en Bearer header.
+// --post-data='' : force HTTP POST — l'endpoint /api/internal/checkpoint est
+// déclaré $router->post(...) strict. Sans ce flag, wget émet un GET → 404.
+// $cpBase réutilisé pour late_command_started + early_command (partitioning_started).
+$cpBase = ($action_token !== null && $action_id !== null)
+    ? "/usr/bin/wget -q --timeout=5 --post-data='' -O /dev/null --header='Authorization: Bearer " . $action_token
+      . "' 'http://" . $pxe_ip_local . "/api/internal/checkpoint?mac=" . $mac . "&code="
+    : null;
+if ($cpBase !== null) {
+    $late_command .= $cpBase . "late_command_started' || true ; \\\n";
+}
+
+// LOGCAP01 — capture du journal d-i (/var/log/syslog) : script pxe-dilog.sh, démarré par
+// preseed/early_command (les échecs d'avant le late_command doivent laisser un journal) puis vidé
+// et arrêté ici. L'ancienne version utilisait `timeout` et `mkfifo`, absents du busybox de
+// l'installeur Debian : rien n'était jamais envoyé. Le script n'emploie que wc, tail, dd, sleep,
+// wget. Le décalage n'avance qu'après un envoi réussi : aucune ligne perdue ni doublée.
+$dilog_enabled = ($action_token !== null && $action_id !== null && $install_id !== null);
+$dilog_url = "http://" . $pxe_ip_local . "/api/internal/install-log?install_id=" . (int)$install_id;
+$dilog_tpl = <<<'SH'
+#!/bin/sh
+# usage : pxe-dilog.sh <run|flush> <url> <jeton>
+SRC="${PXE_DILOG_SRC:-/var/log/syslog}"; STATE="${PXE_DILOG_STATE:-/tmp/pxe-dilog}"
+WGET="${PXE_DILOG_WGET:-/usr/bin/wget}"; PAUSE="${PXE_DILOG_PAUSE:-2}"
+MODE="$1"; URL="$2"; TOKEN="$3"
+send() {
+    [ -r "$SRC" ] || return 0
+    OFF=$(( $(cat "$STATE.off" 2>/dev/null || echo 0) ))
+    SIZE=$(( $(wc -c < "$SRC") ))
+    [ "$SIZE" -gt "$OFF" ] || return 0
+    tail -c +$((OFF + 1)) "$SRC" 2>/dev/null | dd bs=4096 count=48 2>/dev/null > "$STATE.chunk"
+    N=$(( $(wc -c < "$STATE.chunk") ))
+    [ "$N" -gt 0 ] || return 0
+    SEQ=$(( $(cat "$STATE.seq" 2>/dev/null || echo 0) + 1 ))
+    if "$WGET" -q --timeout=5 --tries=1 --header="Authorization: Bearer $TOKEN" --header='Content-Type: text/plain' \
+        --post-file="$STATE.chunk" -O /dev/null "$URL&seq=$SEQ" 2>/dev/null; then
+        echo $((OFF + N)) > "$STATE.off"; echo "$SEQ" > "$STATE.seq"
+    fi
+}
+if [ "$MODE" = run ]; then
+    echo $$ > "$STATE.pid"
+    while :; do send; sleep "$PAUSE"; done
+fi
+for i in 1 2 3 4 5 6 7 8; do
+    send
+    [ $(( $(cat "$STATE.off" 2>/dev/null || echo 0) )) -ge $(( $(wc -c < "$SRC") )) ] && break
+done
+exit 0
+SH;
+
+if ($ansible_pubkey !== '') {
+    $late_command .= "in-target /usr/sbin/groupadd -f ansible ; \\\n"
+                  .  "    in-target /usr/bin/id -u ansible >/dev/null 2>&1 || in-target /usr/sbin/useradd -m -s /bin/bash -g ansible -G sudo ansible ; \\\n"
+                  .  "    in-target /bin/bash -c 'install -d -m 0700 -o ansible -g ansible /home/ansible/.ssh' ; \\\n"
+                  .  "    in-target /bin/bash -c 'echo " . base64_encode($ansible_pubkey . "\n") . " | base64 -d > /home/ansible/.ssh/authorized_keys' ; \\\n"
+                  .  "    in-target /bin/chown ansible:ansible /home/ansible/.ssh/authorized_keys ; \\\n"
+                  .  "    in-target /bin/chmod 0600 /home/ansible/.ssh/authorized_keys ; \\\n"
+                  .  "    in-target /bin/bash -c 'echo \"ansible ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/ansible' ; \\\n"
+                  .  "    in-target /bin/chmod 0440 /etc/sudoers.d/ansible ; \\\n"
+                  .  "    in-target /usr/sbin/visudo -cf /etc/sudoers.d/ansible ; \\\n";
+}
+
+// Bug 2 fix : on ne crée le user admin QUE s'il a au moins un moyen d'accès
+// (password OU clé pubkey). Sinon useradd créerait un compte verrouillé donc
+// inaccessible — autant ne pas le créer.
+// Cas root_login_mode='disabled' : le user est déjà créé par d-i (make-user=true),
+// on saute le useradd mais on conserve le déploiement pubkeys + permissions.
+$create_admin = ($admin_pwhash !== '' || !empty($pubkey_lines));
+if ($create_admin) {
+    if ($effective_root_mode !== 'disabled') {
+        $late_command .= "    $user_create$pw_set ; \\\n";
+    }
+    if (!empty($pubkey_lines)) {
+        $late_command .= "    in-target /bin/bash -c 'install -d -m 0700 -o $admin_login -g $admin_login /home/$admin_login/.ssh' ; \\\n"
+                      .  "    in-target /bin/bash -c 'printf \"" . $pubkeys_str . "\\n\" > /home/$admin_login/.ssh/authorized_keys' ; \\\n"
+                      .  "    in-target /bin/chown -R $admin_login:$admin_login /home/$admin_login/.ssh ; \\\n"
+                      .  "    in-target /bin/chmod 0600 /home/$admin_login/.ssh/authorized_keys ; \\\n";
+    }
+}
+
+// Pubkeys remote (post_install.remote_pubkey_urls) : pré-filtre les URLs valides
+// (whitelist HTTPS + chars limités) AVANT d'émettre des commandes. Si toutes
+// les URLs échouent le filtre, on n'émet aucun bloc — évite un .ssh créé vide
+// puis un chmod 0600 sur un authorized_keys inexistant (le bloc admin pubkeys
+// au-dessus crée déjà le fichier quand $pubkey_lines est non vide).
+$remote_urls_raw = is_array($adv['post_install']['remote_pubkey_urls'] ?? null)
+    ? $adv['post_install']['remote_pubkey_urls'] : [];
+$valid_remote_urls = [];
+foreach ($remote_urls_raw as $entry) {
+    $url = is_array($entry) ? (string)($entry['url'] ?? '') : (string)$entry;
+    $url = trim($url);
+    if ($url === '') continue;
+    // Whitelist : https + alphanum + . / _ - ~ : @ ? = & + %
+    if (!preg_match('#^https://[A-Za-z0-9._~/:?=&@\-+%]+$#', $url)) continue;
+    $valid_remote_urls[] = $url;
+}
+if ($create_admin && !empty($valid_remote_urls)) {
+    // Si le bloc admin pubkeys n'a pas créé .ssh (pas de $pubkey_lines), on le
+    // crée + touch authorized_keys ici. Sinon idempotent (install -d écrase pas).
+    if (empty($pubkey_lines)) {
+        $late_command .= "    in-target /bin/bash -c 'install -d -m 0700 -o $admin_login -g $admin_login /home/$admin_login/.ssh' ; \\\n"
+                      .  "    in-target /bin/bash -c 'touch /home/$admin_login/.ssh/authorized_keys' ; \\\n";
+    }
+    foreach ($valid_remote_urls as $url) {
+        $url_esc = escapeshellarg($url);
+        $late_command .= "    in-target /bin/bash -c 'curl -fsSL $url_esc >> /home/$admin_login/.ssh/authorized_keys' ; \\\n";
+    }
+    $late_command .= "    in-target /bin/chown -R $admin_login:$admin_login /home/$admin_login/.ssh ; \\\n"
+                  .  "    in-target /bin/chmod 0600 /home/$admin_login/.ssh/authorized_keys ; \\\n";
+}
+
+// Respecter le moyen d'accès choisi : un compte à clé seule garde les mots de
+// passe SSH désactivés ; un mot de passe admin explicitement fourni les active.
+$password_auth = $admin_pwhash !== '' ? 'yes' : 'no';
+$late_command .= "    in-target /bin/sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication " . $password_auth . "/' /etc/ssh/sshd_config ; \\\n"
+              .  "    in-target /bin/sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config ; \\\n";
+
+// Service systemd oneshot post-boot : signale à PXE Tools que la machine est
+// bootée et que sshd est up (`After=sshd.service`) — utilisé par le worker
+// Ansible comme signal de readiness avant `ansible-playbook`. Le contenu du
+// fichier .service est encodé base64 pour éviter les newlines littéraux qui
+// casseraient la directive preseed (qui exige des continuation backslashes).
+$pxe_machine_ready_unit = "[Unit]\n"
+                       .  "Description=PXE Tools — signal machine ready post-reboot\n"
+                       .  "After=network-online.target sshd.service\n"
+                       .  "Wants=network-online.target sshd.service\n"
+                       .  "\n"
+                       .  "[Service]\n"
+                       .  "Type=oneshot\n"
+                       .  "ExecStart=/usr/bin/curl -fsS --max-time 10 'http://" . $pxe_ip_local . "/api/machine-ready?mac=" . $mac . "'\n"
+                       .  "RemainAfterExit=yes\n"
+                       .  "\n"
+                       .  "[Install]\n"
+                       .  "WantedBy=multi-user.target\n";
+$pxe_machine_ready_b64 = base64_encode($pxe_machine_ready_unit);
+$late_command .= "    in-target /bin/bash -c 'echo \"" . $pxe_machine_ready_b64 . "\" | base64 -d > /etc/systemd/system/pxe-machine-ready.service' ; \\\n"
+              .  "    in-target /bin/systemctl enable pxe-machine-ready.service ; \\\n";
+
+// Les pourcentages de blocs réservés viennent exclusivement du plan de
+// partitionnement (reserved_pct par partition/LV).
+if (!empty($partitions_for_tune2fs)) {
+    $tune_args = '';
+    foreach ($partitions_for_tune2fs as $mp => $pct) {
+        $mp_safe  = preg_replace('/[^a-zA-Z0-9_\/.-]/', '', $mp) ?? '';
+        $pct_safe = (int)$pct;
+        if ($mp_safe !== '') {
+            $tune_args .= " $mp_safe:$pct_safe";
+        }
+    }
+    if ($tune_args !== '') {
+        $late_command .= "    in-target /bin/bash -c 'for pair in" . $tune_args . "; do mp=\"\${pair%%:*}\"; pct=\"\${pair##*:}\"; d=\$(findmnt -n -o SOURCE \"\$mp\" 2>/dev/null) || continue; tune2fs -m \"\$pct\" \"\$d\" || true; done' ; \\\n";
+    }
+}
+
+// Refactor checkpoints 2026-05-16 — installation de postboot.sh + service
+// systemd dans le système cible. Téléchargés depuis /pxe/postboot/{action_id}/
+// (servi par PxeController::serveActionFile avec filtre pxe_subnet). Le
+// service oneshot émet le checkpoint os_first_boot au premier boot OS.
+//
+// On utilise `in-target wget` car wget est dans pkgsel/include (cf. defaults
+// packages.pkgsel_include = sudo openssh-server python3 ca-certificates curl).
+// curl est aussi dispo en fallback si wget pose problème.
+//
+// `|| true` partout — un échec d'install postboot ne doit pas casser l'install
+// Debian (le boot OS aboutira sans ansible auto-trigger, recoverable manuel).
+if ($action_token !== null && $action_id !== null) {
+    $postbootUrl = "http://" . $pxe_ip_local . "/pxe/postboot/" . $action_id;
+    $late_command .= "    in-target /usr/bin/wget -q '" . $postbootUrl . "/postboot.sh' -O /usr/local/bin/postboot.sh || true ; \\\n";
+    $late_command .= "    in-target /bin/chmod +x /usr/local/bin/postboot.sh || true ; \\\n";
+    $late_command .= "    in-target /usr/bin/wget -q '" . $postbootUrl . "/pxe-postboot.service' -O /etc/systemd/system/pxe-postboot.service || true ; \\\n";
+    $late_command .= "    in-target /bin/systemctl enable pxe-postboot.service || true ; \\\n";
+}
+
+// Phase 3 chantier preset-hardware-aware — émission des configs ifupdown
+// pour les NICs secondaires (multi-NIC). Chaque commande encode son contenu
+// /etc/network/interfaces.d/<idx> en base64 et résout MAC → ifname au runtime.
+// Skip silencieux si pas de plan multi-NIC ($secondary_iface_cmds reste vide).
+if (!empty($secondary_iface_cmds)) {
+    $late_command .= "    in-target /bin/mkdir -p /etc/network/interfaces.d ; \\\n";
+    foreach ($secondary_iface_cmds as $cmd) {
+        $late_command .= $cmd;
+    }
+}
+
+// Pings finaux (avant l'install-end qui clôt l'installation côté DB) :
+// late-command terminée + finished. L'install-end vient ensuite : il passe
+// installations.install_status à 'success' → TaskPhase::activeForMachine()
+// renvoie null → la timeline UI s'auto-replie via HX-Redirect.
+$late_command .= $pingBase . "&phase=late-command&status=success' || true ; \\\n";
+$late_command .= $pingBase . "&phase=finished&status=success' || true ; \\\n";
+
+// LOGCAP03 (2026-05-18) — Stop install-log streaming AVANT le dernier checkpoint
+// + install-end. Sans ce kill, d-i attend que TOUS les enfants du late_command
+// ferment leurs fds → boucle infinie sur l'écran "Execution du script preseed".
+// Backup pidof tail/wget si le PID stocké est devenu invalide (re-fork interne).
+// `|| true` partout pour ne jamais casser le late_command si kill échoue.
+if ($dilog_enabled) {
+    $late_command .= "    /bin/sh /tmp/pxe-dilog.sh flush '" . $dilog_url . "' '" . $action_token . "' || true ; \\\n";
+    $late_command .= "    kill \$(cat /tmp/pxe-dilog.pid 2>/dev/null) 2>/dev/null || true ; \\\n";
+}
+
+// REINSTCKPT01 (Fix P) — Checkpoint install_reboot RETIRÉ du late_command.
+// Le nouveau signal terminal de réinstallation est le DHCP/TFTP post-install
+// capté par le sidecar dnsmasq-tail (checkpoint install_reboot_done émis
+// APRÈS le reboot d-i, quand la machine re-boote en PXE). Ce signal est plus
+// fiable : il confirme que la machine a réellement redémarré et contacté le
+// DHCP, là où install_reboot n'attestait que la fin du late_command (le reboot
+// physique pouvait encore échouer après).
+// worker.py attend désormais install_reboot_done (poll DB) avant wait_for_ssh.
+
+$late_command .= "    in-target /usr/bin/curl -fsS -X POST 'http://" . ($data['pxe_ip'] ?? '{{ pxe_ip }}') . "/api/install-end?mac=$mac&status=success' || true";
+
+$admin_user_block = "d-i preseed/late_command string \\\n    $late_command";
+
+// --- Block localisation --------------------------------------------------
+$loc = $adv['localization'];
+$loc_lines = [];
+$loc_lines[] = "d-i debian-installer/locale string " . safe_preseed_scalar($loc['locale'] ?: 'fr_FR.UTF-8');
+if (!empty($loc['language']))           $loc_lines[] = "d-i debian-installer/language string " . safe_preseed_scalar($loc['language']);
+if (!empty($loc['country']))            $loc_lines[] = "d-i debian-installer/country string " . safe_preseed_scalar($loc['country']);
+if (!empty($loc['supported_locales']) && is_array($loc['supported_locales'])) {
+    $sl = array_filter(array_map(fn($x) => safe_preseed_scalar((string)$x), $loc['supported_locales']));
+    if (!empty($sl)) $loc_lines[] = "d-i localechooser/supported-locales multiselect " . implode(', ', $sl);
+}
+$loc_lines[] = "d-i keyboard-configuration/xkb-keymap select " . safe_preseed_scalar($loc['keymap'] ?: 'fr(latin9)');
+if (!empty($loc['keymap_toggle']))      $loc_lines[] = "d-i keyboard-configuration/toggle select " . safe_preseed_scalar($loc['keymap_toggle']);
+if ($loc['console_ask_detect'] !== null) $loc_lines[] = "d-i console-setup/ask_detect boolean " . bool_str((bool)$loc['console_ask_detect']);
+$localization_block = implode("\n", $loc_lines);
+
+// --- Block miroir --------------------------------------------------------
+$mir = $adv['mirror'];
+$mir_lines = [
+    "d-i mirror/country string " . safe_preseed_scalar($mir['country'] ?: 'manual'),
+    "d-i mirror/http/hostname string " . safe_preseed_scalar($mir['hostname'] ?: 'deb.debian.org'),
+    "d-i mirror/http/directory string " . safe_preseed_scalar($mir['directory'] ?: '/debian'),
+    "d-i mirror/http/proxy string " . safe_preseed_scalar($mir['proxy'] ?? ''),
+];
+$mirror_block = implode("\n", $mir_lines);
+
+// --- Block horloge -------------------------------------------------------
+$tz = $adv['timezone'];
+$clock_lines = [
+    "d-i clock-setup/utc boolean " . bool_str((bool)$tz['utc']),
+    "d-i time/zone string " . safe_preseed_scalar($tz['zone'] ?: 'Europe/Paris'),
+    "d-i clock-setup/ntp boolean " . bool_str((bool)$tz['ntp']),
+];
+if (!empty($tz['ntp']) && !empty($tz['ntp_server'])) {
+    $clock_lines[] = "d-i clock-setup/ntp-server string " . safe_preseed_scalar((string)$tz['ntp_server']);
+}
+$clock_block = implode("\n", $clock_lines);
+
+// --- Block comptes utilisateur (root + make-user selon root_login_mode) -
+// Sémantique : mdp root vide per-machine = compte root verrouillé (pattern
+// Debian standard, équivalent à laisser vide en interactif). Plus de fallback
+// sur le mdp root global (Settings) — la source de vérité est le hash
+// per-machine uniquement. Si vide, on bascule en mode 'disabled' peu importe
+// le radio coché, pour ne pas créer un root sans mdp.
+$accounts_lines = [];
+if ($effective_root_mode === 'disabled') {
+    // Pattern preseed-board : root verrouillé, user admin créé par d-i lui-même.
+    $accounts_lines[] = "d-i passwd/root-login boolean false";
+    $accounts_lines[] = "d-i passwd/make-user boolean true";
+    // user-setup demande le nom complet en interactif si la question n'est pas
+    // préseedée (vu en pratique sur monitor : preset sans admin_user_fullname
+    // → install bloquée). Fallback sur l'identifiant admin quand le preset ne
+    // fournit pas de nom complet.
+    $accounts_lines[] = "d-i passwd/user-fullname string " . safe_preseed_scalar($admin_user_fullname !== '' ? $admin_user_fullname : $admin_login);
+    $accounts_lines[] = "d-i passwd/username string " . safe_preseed_scalar($admin_login);
+    if ($admin_pwhash !== '') {
+        // user-password-crypted prend un hash compatible /etc/shadow ($6$...)
+        $accounts_lines[] = "d-i passwd/user-password-crypted password " . safe_preseed_scalar($admin_pwhash);
+    } else {
+        // Un compte à clé seule doit éviter l'invite interactive d-i tout en
+        // interdisant l'authentification par mot de passe.
+        $accounts_lines[] = "d-i passwd/user-password-crypted password !";
+    }
+    $primaryGroup = '';
+    foreach (explode(',', $admin_groups) as $g) {
+        $g = trim($g);
+        if ($g !== '') { $primaryGroup = $g; break; }
+    }
+    if ($primaryGroup !== '') {
+        $accounts_lines[] = "d-i passwd/user-default-groups string " . safe_preseed_scalar($admin_groups);
+    }
+} else {
+    // Mode 'enabled' (défaut/compat) : root activé, user admin créé en late_command.
+    $accounts_lines[] = "d-i passwd/root-login boolean true";
+    $accounts_lines[] = "d-i passwd/root-password-crypted password " . safe_preseed_scalar($root_hash_for_preseed);
+    $accounts_lines[] = "d-i passwd/make-user boolean false";
+}
+$accounts_block = implode("\n", $accounts_lines);
+
+// --- Block packages (tasksel + pkgsel) ----------------------------------
+$pkg = $adv['packages'];
+$pkg_lines = [
+    "d-i base-installer/install-recommends boolean " . bool_str((bool)$pkg['install_recommends']),
+];
+if (is_array($pkg['tasksel']) && !empty($pkg['tasksel'])) {
+    $tk = array_filter(array_map(fn($x) => safe_preseed_scalar((string)$x), $pkg['tasksel']));
+    if (!empty($tk)) $pkg_lines[] = "tasksel tasksel/first multiselect " . implode(', ', $tk);
+}
+// Phase 3 chantier preset-hardware-aware : ajoute vlan/ifenslave à pkgsel_include
+// si une NIC secondaire les requiert (cf. construction $network_extra_pkgs).
+$pkg_include_combined = is_array($pkg['pkgsel_include'] ?? null) ? $pkg['pkgsel_include'] : [];
+if (!empty($network_extra_pkgs)) {
+    $pkg_include_combined = array_values(array_unique(array_merge($pkg_include_combined, $network_extra_pkgs)));
+}
+if (!empty($pkg_include_combined)) {
+    $inc = array_filter(array_map(fn($x) => safe_preseed_scalar((string)$x), $pkg_include_combined));
+    if (!empty($inc)) $pkg_lines[] = "d-i pkgsel/include string " . implode(' ', $inc);
+} elseif ($distro === 'trixie') {
+    // The early hook may need to append signed EFI packages even when the
+    // administrator did not request any additional packages.
+    $pkg_lines[] = "d-i pkgsel/include string ";
+}
+if (!empty($pkg['upgrade']))       $pkg_lines[] = "d-i pkgsel/upgrade select " . safe_preseed_scalar((string)$pkg['upgrade']);
+if (!empty($pkg['update_policy'])) $pkg_lines[] = "d-i pkgsel/update-policy select " . safe_preseed_scalar((string)$pkg['update_policy']);
+$pkg_lines[] = "popularity-contest popularity-contest/participate boolean " . bool_str((bool)$pkg['popcon']);
+$packages_block = implode("\n", $pkg_lines);
+
+// --- Block APT (firmware/composantes/services) --------------------------
+$apt = $adv['apt'];
+$apt_lines = [
+    "d-i apt-setup/non-free-firmware boolean " . bool_str((bool)$apt['non_free_firmware']),
+    "d-i apt-setup/contrib boolean " . bool_str((bool)$apt['contrib']),
+    "d-i apt-setup/non-free boolean " . bool_str((bool)$apt['non_free']),
+    "d-i hw-detect/load_firmware boolean " . bool_str((bool)$apt['hw_detect_load_firmware']),
+];
+if (is_array($apt['services_select'])) {
+    $sv = array_filter(array_map(fn($x) => safe_preseed_scalar((string)$x), $apt['services_select']));
+    $apt_lines[] = "d-i apt-setup/services-select multiselect " . implode(', ', $sv);
+}
+if (!empty($apt['security_host'])) $apt_lines[] = "d-i apt-setup/security_host string " . safe_preseed_scalar((string)$apt['security_host']);
+$apt_block = implode("\n", $apt_lines);
+
+// --- Block bootloader GRUB ----------------------------------------------
+$bl = $adv['bootloader'];
+$bl_lines = [
+    "d-i grub-installer/only_debian boolean " . bool_str((bool)$bl['only_debian']),
+    "d-i grub-installer/with_other_os boolean " . bool_str((bool)$bl['with_other_os']),
+    "d-i grub-installer/bootdev string " . safe_preseed_scalar($bl['bootdev'] ?: 'default'),
+    // Sans ça, sur UEFI, grub-installer ne pose l'entrée que dans le NVRAM ;
+    // certains firmwares OEM (constaté sur board, Toshiba Satellite) ne la
+    // conservent pas ou ne la priorisent pas -> boot bloqué sur le menu du
+    // firmware, disque à sélectionner manuellement à chaque démarrage.
+    // Ignoré sans effet sur une install BIOS (grub-pc).
+    "d-i grub-installer/force-efi-extra-removable boolean true",
+];
+$bootloader_block = implode("\n", $bl_lines);
+
+// --- Block finish --------------------------------------------------------
+$fin = $adv['finish'];
+$fin_lines = [
+    "d-i finish-install/reboot_in_progress " . safe_preseed_scalar($fin['reboot'] ?: 'note'),
+];
+if ($fin['eject_cdrom'] !== null) {
+    $fin_lines[] = "d-i cdrom-detect/eject boolean " . bool_str((bool)$fin['eject_cdrom']);
+}
+$finish_block = implode("\n", $fin_lines);
+
+// --- Block early_command : checkpoints démarrage installer (refactor 2026-05-16) -
+// Émis AVANT partman → 'partitioning_started'. Skip si pas d'action active.
+$early_command_block = '';
+
+// Garde-fou d'identité des disques (POSIX sh, busybox d-i). Il relit le numéro dans sysfs,
+// exige une correspondance exacte et unique, puis remappe les chemins et GRUB si nécessaire.
+// Lancé à partman/early_command après chargement des pilotes. Lecture sysfs en premier pour
+// SCSI/SATA (série VPD/ATA si publiée), NVMe (/sys/class/nvme/nvmeX/serial) et virtio
+// (device/serial si fourni). Si sysfs n'expose rien, le script télécharge le smartctl statique
+// servi par PXE Tools et tente une lecture informative (SATA/SCSI/SAT/NVMe). RAID matériel qui
+// masque les membres et toute identité illisible échouent fermés.
+$disk_guard_tpl = <<<'SH'
+#!/bin/sh
+# usage : pxe-disk-guard.sh <remap|strict> <url-ping> <bootdev> <smartctl-url> <chemin:base64(serial)|->...
+SYS="${PXE_GUARD_SYSFS:-/sys/block}"
+SYSROOT="${PXE_GUARD_SYSROOT:-/sys}"
+EXPECTED_BOOT_MODE='__BOOTMODE__'
+MODE="$1"; PING="$2"; BOOTDEV="$3"; SMARTCTL_URL="$4"; shift 4
+SMARTCTL=""; SMARTCTL_TRIED=0
+ensure_smartctl() {
+    [ "$SMARTCTL_TRIED" = 1 ] && return 0
+    SMARTCTL_TRIED=1
+    [ -n "$SMARTCTL_URL" ] || return 0
+    if "${PXE_GUARD_WGET:-/usr/bin/wget}" -q --timeout=8 -O /tmp/pxe-guard-smartctl "$SMARTCTL_URL" 2>/dev/null \
+        && chmod +x /tmp/pxe-guard-smartctl 2>/dev/null && /tmp/pxe-guard-smartctl --version >/dev/null 2>&1; then
+        SMARTCTL=/tmp/pxe-guard-smartctl
+    else rm -f /tmp/pxe-guard-smartctl; fi
+}
+norm() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
+valid_serial() {
+    case "$1" in ''|0|UNKNOWN|N/A|NA|NONE|NULL|DEFAULT|"NOT AVAILABLE") return 1 ;; esac
+    return 0
+}
+serial_for() {
+    d="$1"; b="${d##*/}"
+    s=""
+    # Les contrôleurs n'exposent pas tous la série au même niveau de sysfs.
+    for serial_path in "$d/device/serial" "$d/serial" "$d/device/device/serial"; do
+        candidate=$(norm "$(cat "$serial_path" 2>/dev/null)")
+        if valid_serial "$candidate"; then s="$candidate"; break; fi
+    done
+    if [ -z "$s" ]; then
+        c=$(printf '%s' "$b" | sed -n 's/^\(nvme[0-9][0-9]*\)n[0-9][0-9]*$/\1/p')
+        [ -n "$c" ] && s=$(norm "$(cat "$SYSROOT/class/nvme/$c/serial" 2>/dev/null)")
+        valid_serial "$s" || s=""
+    fi
+    if [ -z "$s" ]; then
+        ensure_smartctl
+        [ -n "$SMARTCTL" ] && s=$("$SMARTCTL" -i "/dev/$b" 2>/dev/null | sed -n 's/^[Ss]erial [Nn]umber:[[:space:]]*//p' | head -1)
+    fi
+    norm "$s"
+}
+wwid_for() {
+    d="$1"
+    # Only the Hyper-V synthetic SCSI device class validated by the collector.
+    [ "$(norm "$(cat "$d/device/vendor" 2>/dev/null)")" = 'MSFT' ] || return 0
+    [ "$(norm "$(cat "$d/device/model" 2>/dev/null)")" = 'VIRTUAL DISK' ] || return 0
+    norm "$(cat "$d/device/wwid" 2>/dev/null)"
+}
+valid_wwid() {
+    [ "$1" != 'NAA.00000000000000000000000000000000' ] && printf '%s\n' "$1" | grep -Eq '^NAA\.[0-9A-F]{32}$'
+}
+report() {
+    [ -n "$PING" ] || return 0
+    "${PXE_GUARD_WGET:-/usr/bin/wget}" -q --timeout=5 -O /dev/null "$PING&phase=disk-guard&status=$1&message=$(printf '%s' "$2" | tr ' /' '+_')" 2>/dev/null || true
+}
+if [ -n "$EXPECTED_BOOT_MODE" ]; then
+    actual_boot_mode=bios
+    [ -d "$SYSROOT/firmware/efi" ] && actual_boot_mode=uefi
+    if [ "$actual_boot_mode" != "$EXPECTED_BOOT_MODE" ]; then
+        debconf-set partman-auto/disk /dev/pxe-disque-introuvable
+        logger -t pxe-disk-guard "firmware-refuse-attendu-$EXPECTED_BOOT_MODE-observe-$actual_boot_mode"
+        report failed "firmware-refuse-attendu-$EXPECTED_BOOT_MODE-observe-$actual_boot_mode"
+        exit 1
+    fi
+fi
+final_list=""; new_boot="$BOOTDEV"; bad=""; changes=""; target_count=0; diagnostic=""
+for spec in "$@"; do
+    path="${spec%%:*}"; encoded="${spec#*:}"; target_count=$((target_count + 1))
+    case "$path" in /dev/[A-Za-z0-9]*) ;; *) bad="$bad $path"; diagnostic="chemin-cible-invalide"; continue ;; esac
+    if [ "$encoded" = "-" ] || [ -z "$encoded" ]; then bad="$bad $path"; diagnostic="numero-serie-absent-du-snapshot"; continue; fi
+    kind=serial
+    case "$encoded" in wwid=*) kind=wwid; encoded="${encoded#wwid=}" ;; esac
+    decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null || printf '%s' "$encoded" | base64 -D 2>/dev/null)
+    want=$(norm "$decoded")
+    if [ "$kind" = wwid ]; then
+        if ! valid_wwid "$want"; then bad="$bad $path"; diagnostic="wwid-cible-invalide"; continue; fi
+    elif ! valid_serial "$want"; then bad="$bad $path"; diagnostic="numero-serie-cible-invalide"; continue; fi
+    found=""; count=0
+    for d in "$SYS"/*; do
+        b="${d##*/}"
+        case "$b" in loop*|ram*|dm-*|md*|sr*|fd*|zram*|nbd*|mmcblk*boot*|mmcblk*gp*|mmcblk*rpmb) continue ;; esac
+        [ -e "$d/size" ] || continue
+        if [ "$kind" = wwid ]; then
+            got=$(wwid_for "$d")
+            valid_wwid "$got" || continue
+        else
+            got=$(serial_for "$d")
+            valid_serial "$got" || continue
+        fi
+        [ "$got" = "$want" ] || continue
+        found="$b"; count=$((count + 1))
+    done
+    if [ "$count" -ne 1 ]; then
+        bad="$bad $path"
+        if [ "$count" -eq 0 ]; then diagnostic="numero-absent-illisible-ou-different"; else diagnostic="numero-serie-ambigu"; fi
+    elif [ "$MODE" = strict ] && [ "/dev/$found" != "$path" ]; then
+        bad="$bad $path"; diagnostic="remappage-interdit-en-raid-strict"
+    else
+        final_list="$final_list /dev/$found"
+        [ "/dev/$found" != "$path" ] && changes="$changes $path=/dev/$found"
+        [ "$BOOTDEV" = "$path" ] && new_boot="/dev/$found"
+    fi
+done
+if [ -n "$bad" ]; then
+    debconf-set partman-auto/disk /dev/pxe-disque-introuvable
+    logger -t pxe-disk-guard "identite-refusee-$diagnostic:$bad"
+    report failed "identite-refusee-$diagnostic:$bad"
+    exit 1
+elif [ "$target_count" -eq 0 ]; then
+    debconf-set partman-auto/disk /dev/pxe-disque-introuvable
+    logger -t pxe-disk-guard "aucun-disque-cible-avec-identite"
+    report failed "aucun-disque-cible-avec-identite"
+    exit 1
+else
+    debconf-set partman-auto/disk "${final_list# }"
+    [ "$new_boot" != "$BOOTDEV" ] && debconf-set grub-installer/bootdev "$new_boot"
+    if [ "$BOOTDEV" = default ] && [ "$target_count" -eq 1 ]; then debconf-set grub-installer/bootdev "${final_list# }"; fi
+    logger -t pxe-disk-guard "identite confirmee :$final_list remappes:$changes"
+    report success "identite confirmee:$final_list remappes:$changes"
+fi
+exit 0
+SH;
+$disk_guard_tpl = str_replace('__BOOTMODE__', $planned_boot_mode, $disk_guard_tpl);
+
+$early_parts = [];
+if ($distro === 'trixie') {
+    // Debian's grub-efi-amd64-signed is a recommendation. When recommends
+    // are disabled, install both signed components explicitly on UEFI amd64;
+    // BIOS installs must retain their existing GRUB package selection.
+    $early_parts[] = 'if [ -d /sys/firmware/efi ] && [ "$(uname -m)" = x86_64 ]; then '
+                   . 'pxe_pkgs="$(debconf-get pkgsel/include)" || exit 1; '
+                   . 'debconf-set pkgsel/include "$pxe_pkgs grub-efi-amd64-signed shim-signed" || exit 1; fi';
+}
+if ($dilog_enabled) {
+    $early_parts[] = 'echo ' . base64_encode($dilog_tpl) . " | base64 -d > /tmp/pxe-dilog.sh ; "
+                   . "(/bin/sh /tmp/pxe-dilog.sh run '" . $dilog_url . "' '" . $action_token . "' </dev/null >/dev/null 2>&1 &)";
+}
+// $cpBase défini plus haut (bloc late_command_started) — réutilisation directe.
+if ($cpBase !== null) {
+    $early_parts[] = $cpBase . "partitioning_started' || true";
+}
+if ($early_parts !== []) {
+    $early_command_block = "d-i preseed/early_command string \\\n    " . implode(" ; \\\n    ", $early_parts);
+}
+if ($disk_guard_required) {
+    $guardPing = 'http://' . ($data['pxe_ip'] ?? '{{ pxe_ip }}') . '/api/task-phase?task=install&mac=' . normalize_mac((string)($machine['mac'] ?? ''));
+    $guardSmartctl = 'http://' . ($data['pxe_ip'] ?? '{{ pxe_ip }}') . '/static-bin/smartctl';
+    $guardArgs = implode(' ', array_map(static fn($s) => "'" . $s . "'", $disk_guard_specs));
+    $early_command_block .= ($early_command_block === '' ? '' : "\n")
+        . "d-i partman/early_command string \\\n    echo " . base64_encode($disk_guard_tpl) . " | base64 -d > /tmp/pxe-disk-guard.sh ; "
+        . "/bin/sh /tmp/pxe-disk-guard.sh " . $disk_guard_mode . " '" . $guardPing . "' '"
+        . safe_preseed_scalar($bl['bootdev'] ?: 'default') . "' '" . $guardSmartctl . "' " . $guardArgs;
+}
+
+// --- Substitutions placeholder template ----------------------------------
+// HOSTNAME_BLOCK contient 0 ou 3 directives netcfg (selon que machines.hostname
+// est NULL ou non). Les placeholders HOSTNAME et DOMAIN bruts restent listés
+// pour rétrocompat (templates customs) — inertes si non utilisés.
+$replacements = [
+    '{{ '{{HOSTNAME_BLOCK}}' }}'     => $hostname_block,
+    '{{ '{{HOSTNAME}}' }}'           => $hostname ?? '',
+    '{{ '{{DOMAIN}}' }}'             => $domain,
+    '{{ '{{DISTRO_CODENAME}}' }}'    => $distro,
+    // Les templates hérités ne doivent jamais récupérer le hash global.
+    '{{ '{{ROOT_PASSWORD_HASH}}' }}' => $effective_root_mode === 'enabled' ? $root_hash_for_preseed : '',
+    '{{ '{{ANSIBLE_PUBKEY}}' }}'     => $ansible_pubkey,
+    '{{ '{{MIRROR_URL}}' }}'         => $data['mirror'] ?? 'http://deb.debian.org/debian',
+    '{{ '{{PXE_IP}}' }}'             => $data['pxe_ip'] ?? '{{ pxe_ip }}',
+    // Back-compat : preseed-base.cfg legacy (pré-rename 2026-05-12) peut encore
+    // contenir {{ '{{ORCHESTRATOR_IP}}' }}. À retirer une fois tous les volumes refresh.
+    '{{ '{{ORCHESTRATOR_IP}}' }}'    => $data['pxe_ip'] ?? '{{ pxe_ip }}',
+    '{{ '{{NETWORK_BLOCK}}' }}'      => $network_block,
+    '{{ '{{PARTITION_BLOCK}}' }}'    => $partition_block,
+    '{{ '{{ADMIN_USER_BLOCK}}' }}'   => $admin_user_block,
+    '{{ '{{LOCALIZATION_BLOCK}}' }}' => $localization_block,
+    '{{ '{{MIRROR_BLOCK}}' }}'       => $mirror_block,
+    '{{ '{{CLOCK_BLOCK}}' }}'        => $clock_block,
+    '{{ '{{ACCOUNTS_BLOCK}}' }}'     => $accounts_block,
+    '{{ '{{PACKAGES_BLOCK}}' }}'     => $packages_block,
+    '{{ '{{APT_BLOCK}}' }}'          => $apt_block,
+    '{{ '{{BOOTLOADER_BLOCK}}' }}'   => $bootloader_block,
+    '{{ '{{FINISH_BLOCK}}' }}'       => $finish_block,
+    '{{ '{{EARLY_COMMAND_BLOCK}}' }}' => $early_command_block,
+];
+
+@file_get_contents('http://127.0.0.1/api/install-start?mac=' . urlencode($mac));
+
+// Ping suivi temps réel : on a servi le preseed → phase 'preseed-loaded' = success.
+// Le ping endpoint résout mac → install_id (latest in_progress). Best-effort,
+// ne bloque pas la livraison du preseed si l'endpoint répond pas.
+@file_get_contents('http://127.0.0.1/api/task-phase?task=install&mac=' . urlencode($mac) . '&phase=preseed-loaded&status=success');
+
+echo strtr($tpl, $replacements);

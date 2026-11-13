@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+# -k = keep foreground (no fork) → s6 supervise correctement
+# --conf-dir = /etc/dnsmasq.d/, lit pxe.conf rendu par render-dnsmasq-conf
+exec /usr/sbin/dnsmasq -k --conf-dir=/etc/dnsmasq.d

@@ -1,0 +1,15 @@
+# Optional override of the existing appliance. It adds no permanent service.
+# Create and explicitly prepare the external runtime volume before starting.
+services:
+  pxe-tools:
+    environment:
+      PXE_ANSIBLE_RUNTIME: /var/lib/pxe-ansible
+    volumes:
+      - ansible_runtime:/var/lib/pxe-ansible:ro
+      - ansible_workspace:/home/ansible/ansible
+
+volumes:
+  ansible_runtime:
+    external: true
+    name: ${PXE_ANSIBLE_VOLUME:?Choisir le volume Ansible préparé}
+  ansible_workspace: {}

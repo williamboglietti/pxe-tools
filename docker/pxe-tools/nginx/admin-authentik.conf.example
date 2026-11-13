@@ -1,0 +1,28 @@
+# Authentik forward-auth : exemple de principe pour le REVERSE PROXY EXTERNE.
+# Ce fichier n'est pas une configuration nginx complète et ne doit pas être
+# installé comme vhost de l'appliance. Suivre la configuration officielle :
+# https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_nginx/
+#
+# Dans le bloc location du proxy, après `auth_request` réussi et avec une
+# politique d'accès Authentik adaptée, transmettre uniquement l'identité
+# renvoyée par l'outpost ; ne jamais relayer l'en-tête fourni par le client :
+#
+#   auth_request_set $authentik_username $upstream_http_x_authentik_username;
+#   proxy_set_header X-Forwarded-User $authentik_username;
+#
+# Exiger HTTPS côté navigateur (rediriger ou refuser HTTP) et écraser les
+# en-têtes de protocole/hôte fournis par le client. Si CE proxy termine lui-même
+# TLS, les valeurs suivantes reflètent sa connexion entrante :
+#
+#   proxy_set_header X-Forwarded-Proto $scheme;
+#   proxy_set_header X-Forwarded-Host $host;
+#
+# Si TLS est terminé par un proxy amont, n'accepter son protocole et son hôte
+# qu'après avoir limité et vérifié cet amont ; $scheme seul décrit alors la
+# liaison entre les proxys. L'application marque le cookie de session Secure
+# lorsque HTTPS est détecté ; sur HTTP sans indication HTTPS il ne l'est pas.
+#
+# Renseigner l'IP réelle de ce proxy (et non X-Forwarded-For) dans
+# AUTHENTIK_TRUSTED_PROXY_CIDRS. Protéger l'accès direct aux ports admin :
+# un autre client qui partage l'adresse réseau du proxy reste indistinguable.
+# Une liste vide ou invalide refuse toutes les identités Authentik.

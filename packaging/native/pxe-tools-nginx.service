@@ -1,0 +1,14 @@
+[Unit]
+Description=PXE Tools dedicated nginx
+Requires=pxe-tools-php.service
+After=pxe-tools-php.service
+[Service]
+Type=simple
+RuntimeDirectory=pxe-tools-nginx
+EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+ExecStartPre=/usr/bin/mkdir -p /run/pxe-tools-nginx/conf.d
+ExecStartPre=/bin/sh /opt/pxe-tools/init/render-nginx-conf.sh
+ExecStartPre=/usr/sbin/nginx -t -c /usr/lib/pxe-tools/native/nginx.conf
+ExecStart=/usr/sbin/nginx -c /usr/lib/pxe-tools/native/nginx.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -s reload -c /usr/lib/pxe-tools/native/nginx.conf
+Restart=on-failure

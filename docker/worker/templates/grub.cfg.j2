@@ -1,0 +1,54 @@
+# {{ ansible_managed }}
+# Menu GRUB UEFI — chargé par shim (signé MS) → grubx64.efi (custom, signé MOK)
+# kernel + initrd via HTTP (le binaire custom embarque http en builtin)
+# 2nd initrd : firmware.cpio.gz pour firmwares non-free (Realtek, Intel, Broadcom...)
+
+# Modules réseau (no-op si déjà builtin, ce qui est notre cas)
+insmod efinet
+insmod tftp
+insmod http
+insmod gzio
+
+set timeout=10
+set default=0
+set net_default_server={{ pxe_ip }}
+
+echo "==================================================================="
+echo " Orchestrateur de provisionnement"
+echo "==================================================================="
+echo " "
+
+menuentry 'Identification du matériel' {
+    echo "Démarrage de l'inventaire..."
+    linux (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/linux {{ pxe_kernel_opts }} auto=true priority=critical url=http://{{ pxe_ip }}/discovery-preseed.cfg interface=${net_default_mac} netcfg/dhcp_timeout=30 BOOTIF=01-${net_default_mac}
+    initrd (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/initrd.gz (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/firmware.cpio.gz
+}
+
+{# Layout v2 : 1 menu par couple (codename, version_full) → /netboot/<distro>/<version_full>/<arch>/ #}
+{% for v in pxe_debian_versions_full %}
+menuentry 'Installation automatique — Debian {{ v.codename }} {{ v.version_full }}' {
+    echo "Démarrage de l'installation automatique..."
+    linux (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/linux {{ pxe_kernel_opts }} auto=true priority=critical url=http://{{ pxe_ip }}/preseed.php?distro={{ v.codename }} interface=auto netcfg/dhcp_timeout=30 hostname=unassigned domain=lan
+    initrd (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/initrd.gz (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/firmware.cpio.gz
+}
+
+menuentry 'Installation guidée — Debian {{ v.codename }} {{ v.version_full }}' {
+    echo "Démarrage de l'installation guidée..."
+    linux (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/linux {{ pxe_kernel_opts }}
+    initrd (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/initrd.gz (http,{{ pxe_ip }})/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/firmware.cpio.gz
+}
+
+{% endfor %}
+menuentry 'Mode dépannage' {
+    echo 'Démarrage du mode dépannage...'
+    linux (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/linux {{ pxe_kernel_opts }} rescue/enable=true
+    initrd (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/initrd.gz (http,{{ pxe_ip }})/netboot/{{ pxe_default_netboot_path }}/firmware.cpio.gz
+}
+
+{% if pxe_ipxe_enabled %}
+menuentry 'Chainload iPXE (HTTP boot natif)' {
+    echo "Chargement d'iPXE depuis TFTP..."
+    chainloader (tftp,{{ pxe_ip }})/ipxe.efi
+    boot
+}
+{% endif %}

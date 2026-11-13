@@ -1,0 +1,24 @@
+# Ansible secrets & state
+.vault_pass
+.vault_pass.*
+*.retry
+.ansible/
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.DS_Store
+
+# Git / IDE
+.git
+.gitignore
+.vscode/
+.claude/
+
+# Doc / archives non requis dans les images
+README.md
+OLD/
+
+# Compose runtime artefacts
+compose/.env
+compose/docker-compose.override.yml

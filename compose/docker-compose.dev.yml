@@ -1,0 +1,44 @@
+# Override DEV : (re)build de l'image pxe-tools depuis le repo local au lieu de
+# pull depuis GitHub Container Registry.
+#
+# Usage :
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Service MariaDB optionnel pour tester le wizard /init/db en mode MySQL.
+# Activable via :
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile mariadb up -d
+
+services:
+  pxe-tools:
+    build:
+      context: ..
+      dockerfile: docker/pxe-tools/Dockerfile
+      args:
+        ANSIBLE_UID: ${ANSIBLE_UID:-1000}
+        ANSIBLE_GID: ${ANSIBLE_GID:-1000}
+    pull_policy: build
+
+  # MariaDB local opt-in (profile mariadb). Ne tourne PAS par défaut pour
+  # garder l'esprit appliance 1-container (SQLite suffit pour la plupart des
+  # déploiements). Utile pour le test E2E du wizard MySQL et le dev local.
+  mariadb:
+    profiles: [mariadb]
+    image: mariadb:lts
+    container_name: pxe-tools-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-changeme_root}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-pxe_tools}
+      MARIADB_USER: ${MARIADB_USER:-pxe_tools}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-changeme_user}
+    volumes:
+      - pxe_mariadb:/var/lib/mysql
+    # Bind explicite sur 127.0.0.1 pour éviter d'exposer la DB sur le LAN
+    # (le container pxe-tools est en network_mode: host donc peut s'y connecter
+    # via localhost). Override via env si besoin de dev distant.
+    ports:
+      - "127.0.0.1:${MARIADB_PORT:-3306}:3306"
+
+volumes:
+  pxe_mariadb:
+    name: pxe_mariadb

@@ -1,0 +1,545 @@
+<?php
+// {{ ansible_managed }}
+// Générateur dynamique de config GRUB par MAC.
+// Lit la DB SQLite. Cas :
+//   - MAC absente DB    → menuentry "Hardware Discovery" (boot rescue qui POST inventaire)
+//   - MAC en 'configured' → menuentry "AUTO INSTALL" qui appelle preseed.php
+//   - Autre status      → chainload menu générique grub.cfg
+
+declare(strict_types=1);
+header('Content-Type: text/plain; charset=utf-8');
+
+// Le générateur est standalone sous /srv/http ; ces trois classes permettent
+// d'écrire l'historique via la connexion DB active (SQLite ou MySQL).
+foreach (['Db.php', 'Models/MachineEvent.php', 'Models/BootSession.php'] as $classFile) {
+    $path = rtrim(getenv('PXE_APP_DIR') ?: '/app', '/') . '/src/' . $classFile;
+    if (is_file($path)) require_once $path;
+}
+
+try {
+    $db_path = \Admin\Db::sqliteRuntimePath();
+} catch (\Throwable $error) {
+    http_response_code(503);
+    exit("# PXE database configuration unavailable\n");
+}
+$data_file = '{{ pxe_data_dir }}/data.json';
+
+$data = is_readable($data_file) ? (json_decode(file_get_contents($data_file), true) ?: []) : [];
+$orch_ip      = $data['pxe_ip']      ?? '{{ pxe_ip }}';
+$admin_port   = $data['admin_port']           ?? '{{ pxe_admin_port }}';
+$kernel_opts  = $data['kernel_opts']          ?? '{{ pxe_kernel_opts }}';
+$default_distro = $data['default_distro']     ?? '{{ pxe_debian_default_version }}';
+// Spec D : architecture pour les paths /netboot/<version>/<arch>/.
+// Priorités successives (la première non-vide gagne) :
+//   1. $_GET['arch']             — forwardé par grub-early.cfg via ${grub_cpu}.
+//                                   Source de vérité au premier boot (machine
+//                                   inconnue, pas encore de boot_arch en DB).
+//                                   Mapping nomenclature GRUB → Debian netboot.
+//   2. $machine['boot_arch']     — appliqué plus bas après le lookup DB
+//                                   (Spec D.4, capté par discover.sh uname -m).
+//   3. $data['default_arch']     — fallback global depuis settings DB.
+//   4. pxe_default_arch — env var rendue par render_template.py.
+$grubArchMap = [
+    'x86_64'  => 'amd64',
+    'arm64'   => 'arm64',  // grubnetaa64.efi → ${grub_cpu}=arm64
+    'aarch64' => 'arm64',  // au cas où certains GRUB rapportent aarch64
+    'i386'    => 'i386',
+    'i686'    => 'i386',
+];
+$queryArch = isset($_GET['arch']) ? (string)$_GET['arch'] : '';
+$archFromBoot = $grubArchMap[$queryArch] ?? null;
+
+$default_arch = $archFromBoot
+    ?? ($data['default_arch'] ?? '{{ pxe_default_arch }}');
+
+// Setting global discovery_boot_proto, modifiable via UI /settings.
+// Défaut 'http' si la clé n'existe pas (table settings absente avant migration,
+// ou jamais réglée côté UI). Le PDO est ouvert plus bas (ligne ~49) ; on
+// utilise une requête isolée ici car les fonctions menuentry_*() sont déclarées
+// après la lecture de la machine et avant l'output.
+$discoveryBootProto = 'http';
+// PXE clients are authorized only after the administrator configures a subnet.
+$pxe_subnet = '';
+try {
+    $tmpPdo = new PDO('sqlite:' . $db_path);
+    $tmpPdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $stmt = $tmpPdo->query("SELECT value FROM settings WHERE key = 'discovery_boot_proto'");
+    $row = $stmt ? $stmt->fetch(PDO::FETCH_ASSOC) : false;
+    if ($row && in_array($row['value'], ['http', 'tftp'], true)) {
+        $discoveryBootProto = $row['value'];
+    }
+    $stmt = $tmpPdo->query("SELECT value FROM settings WHERE key = 'pxe_subnet'");
+    $row = $stmt ? $stmt->fetch(PDO::FETCH_ASSOC) : false;
+    if ($row && !empty($row['value'])) {
+        $pxe_subnet = (string)$row['value'];
+    }
+} catch (\Throwable $e) {
+    // Table settings absente (avant migration) ou DB indisponible → fallbacks
+}
+
+// --- SEC F-02 : filtre de provenance subnet PXE --------------------------
+// grub.php est servi en clair sur :80 sans auth nginx. Même règle que /wipe.sh
+// et /preseed.php (PxeController::ipInPxeSubnet) : on ne sert la config de boot
+// qu'aux clients du subnet PXE. grub-early charge grub.php depuis une machine
+// EN BOOT sur le subnet → non impactée ; seul un hôte hors subnet reçoit 403.
+// Fonction dupliquée volontairement (PHP standalone, pas d'autoload).
+function pxe_ip_in_cidr(string $ip, string $cidr): bool {
+    if ($ip === '' || $cidr === '') return false;
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return false;
+    $parts = explode('/', $cidr, 2);
+    if (count($parts) !== 2 || !preg_match('/^(?:0|[1-9]|[12][0-9]|3[0-2])$/D', $parts[1])) return false;
+    $prefix = (int)$parts[1];
+    if ($prefix < 0 || $prefix > 32) return false;
+    if (!filter_var($parts[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return false;
+    $mask    = $prefix === 0 ? 0 : (-1 << (32 - $prefix)) & 0xFFFFFFFF;
+    $ipLong  = ip2long($ip);
+    $netLong = ip2long($parts[0]);
+    if ($ipLong === false || $netLong === false) return false;
+    return ($ipLong & $mask) === ($netLong & $mask);
+}
+$subnetParts = explode('/', $pxe_subnet, 2);
+if (count($subnetParts) !== 2 || !filter_var($subnetParts[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+    || !preg_match('/^(?:0|[1-9]|[12][0-9]|3[0-2])$/D', $subnetParts[1])) {
+    http_response_code(503);
+    echo "# PXE network configuration missing or invalid\n";
+    exit;
+}
+if (!pxe_ip_in_cidr((string)($_SERVER['REMOTE_ADDR'] ?? ''), $pxe_subnet)) {
+    http_response_code(403);
+    exit("# accès refusé : hôte hors subnet PXE\n");
+}
+
+// --- Normalisation MAC ---------------------------------------------------
+function normalize_mac(string $raw): string {
+    $raw = strtolower(trim($raw));
+    $raw = preg_replace('/^01[-:]/', '', $raw);
+    $hex = preg_replace('/[^a-f0-9]/', '', $raw);
+    return strlen($hex) === 12 ? implode(':', str_split($hex, 2)) : '';
+}
+
+$mac = normalize_mac($_GET['mac'] ?? '');
+
+// Fallback ARP si pas de mac dans l'URL
+if ($mac === '') {
+    $client_ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    $arp = @file_get_contents('/proc/net/arp');
+    if ($client_ip && $arp && preg_match(
+        '/^' . preg_quote($client_ip, '/') . '\s+\S+\s+\S+\s+([0-9a-f:]+)/im',
+        $arp, $m
+    )) {
+        $mac = strtolower($m[1]);
+    }
+}
+
+// --- Lookup DB -----------------------------------------------------------
+// 1) match direct sur machines.mac (interface principale enregistrée au discovery)
+// 2) fallback : si MAC inconnue, on cherche dans inventory_json.interfaces[].mac
+//    (utile quand le BIOS UEFI boot via une interface secondaire)
+$machine = null;
+try {
+    $pdo = new PDO('sqlite:' . $db_path);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $pdo->exec('PRAGMA foreign_keys = ON');
+    if ($mac !== '') {
+        $stmt = $pdo->prepare(
+            'SELECT m.*, p.distro AS p_distro, p.codename AS p_codename '
+          . 'FROM machines m LEFT JOIN presets p ON m.preset_id = p.id '
+          . 'WHERE m.mac = ?'
+        );
+        $stmt->execute([$mac]);
+        $machine = $stmt->fetch() ?: null;
+        // Curseur laissé ouvert = verrou de lecture conservé : une écriture concurrente (worker, API) fait
+        // alors échouer l'insertion du checkpoint en « database is locked », sans attente possible.
+        $stmt->closeCursor();
+
+        // Fallback : scan inventory_json.interfaces[].mac de toutes les machines
+        if (!$machine) {
+            $rows = $pdo->query(
+                'SELECT m.*, p.distro AS p_distro '
+              . 'FROM machines m LEFT JOIN presets p ON m.preset_id = p.id '
+              . 'WHERE m.inventory_json IS NOT NULL'
+            )->fetchAll();
+            foreach ($rows as $row) {
+                $inv = json_decode($row['inventory_json'] ?? '', true);
+                if (!is_array($inv)) continue;
+                foreach (($inv['interfaces'] ?? []) as $iface) {
+                    $imac = strtolower(trim($iface['mac'] ?? ''));
+                    if ($imac !== '' && $imac === $mac) {
+                        $machine = $row;
+                        error_log("grub.php: matched MAC $mac via inventory iface (machine_id={$row['id']})");
+                        break 2;
+                    }
+                }
+            }
+        }
+    }
+} catch (\Throwable $e) {
+    error_log('grub.php DB error: ' . $e->getMessage());
+}
+
+// --- Helpers menuentry ---------------------------------------------------
+// $bootProto = 'http' (rapide, défaut) ou 'tftp' (fiable, pour VMs/firmwares lents)
+function begin_boot_session(int $machineId, string $mac, string $menu): ?array {
+    if ($machineId <= 0 || !class_exists(\Admin\Models\BootSession::class)) return null;
+    try {
+        return \Admin\Models\BootSession::recordServed(
+            $machineId, $mac, $menu, (string)($_SERVER['REMOTE_ADDR'] ?? '')
+        );
+    } catch (\Throwable $e) {
+        // Le suivi ne doit jamais empêcher GRUB de recevoir une configuration.
+        error_log('grub.php: boot session failed: ' . $e->getMessage());
+        return null;
+    }
+}
+
+function boot_signal(string $orch_ip, string $menu): string {
+    global $bootSession;
+    if (!$bootSession) return '';
+    $id = (int)$bootSession['id'];
+    $token = (string)$bootSession['token'];
+    // source exécute le commentaire renvoyé par l'API sans quitter l'entrée.
+    // Si le réseau de suivi échoue, le kernel continue tout de même à booter.
+    return "if source \"(http,$orch_ip)/api/boot-selected?boot_id=$id&token=$token&menu=$menu\"; then true; fi";
+}
+
+// Démarrage du système installé. `exit` seul rend la main au firmware, qui doit alors retrouver le disque
+// par son ordre de boot NVRAM : sur certains firmwares (constaté sur le Toshiba monitor) l'entrée est
+// ignorée ou périmée et la machine retombe sur le menu de boot du BIOS. On lance donc directement le
+// chargeur Debian trouvé sur les disques ; `exit` reste le repli (autre distribution, chargeur absent).
+// `root` doit désigner le disque : GRUB 2.06 déduit le chemin de périphérique de l'image de $root (ici le
+// réseau du démarrage PXE) et non du préfixe (hd0,gpt2) de l'argument. Avec un préfixe seul, le shim se
+// croit chargé depuis le réseau, ne retrouve pas ses fichiers voisins (« Failed to find fs ») et échoue.
+function menuentry_local(string $orch_ip): string {
+    $signal = boot_signal($orch_ip, 'local');
+    return <<<GRUB
+menuentry 'Démarrer sur le système installé' {
+    $signal
+    insmod part_gpt
+    insmod chain
+    if search --no-floppy --file --set=root /EFI/debian/shimx64.efi; then
+        if chainloader /EFI/debian/shimx64.efi; then
+            boot
+        fi
+        echo "Échec du chargement de (\$root)/EFI/debian/shimx64.efi par GRUB."
+    else
+        echo "Chargeur /EFI/debian/shimx64.efi introuvable. Périphériques vus par GRUB :"
+        ls
+    fi
+    echo "Retour au firmware dans 10 secondes."
+    sleep 10
+    exit
+}
+GRUB;
+}
+
+function menuentry_discovery(string $orch_ip, string $kernel_opts, string $default_distro, string $default_arch, string $bootProto = 'http'): string {
+    $proto = ($bootProto === 'tftp') ? 'tftp' : 'http';
+    $label = "Identification du matériel";
+    $preseedUrl = "http://$orch_ip/discovery-preseed.cfg";
+    $signal = boot_signal($orch_ip, 'discovery');
+    // BOOTIF=01-\${net_default_mac} : injecte la MAC vue par le firmware PXE
+    // dans la kernel cmdline (format PXELINUX). discover.sh la lit depuis
+    // /proc/cmdline pour utiliser la MEME MAC que celle stubbée par grub.php
+    // — sinon sur multi-NIC le kernel peut choisir une autre interface comme
+    // route default → POST /api/discovery avec un MAC ≠ stub → doublon.
+    //
+    // interface=\${net_default_mac} : on FIGE l'interface netcfg sur la MAC de
+    // boot. netcfg/choose_interface accepte une MAC (aa:bb:cc:dd:ee:ff) et la
+    // sélection explicite par MAC est PRIORITAIRE sur la détection de lien ET
+    // sur BOOTIF. Indispensable en multi-NIC : `interface=auto` élisait la 1re
+    // interface par nom (carte PCIe enp1s0 < onboard enp2s0) → DHCP bloqué si
+    // elle n'a pas de câble ; et netcfg n'honore PAS BOOTIF tout seul ici (sans
+    // interface=, il prompte). BOOTIF reste pour discover.sh (POST même MAC).
+    // Les netcfg/* d'un preseed chargé en url= sont ignorés (netcfg tourne
+    // avant) → la sélection DOIT passer par la cmdline kernel.
+    return <<<CFG
+menuentry '$label' {
+    echo 'Identification du serveur en cours...'
+    insmod efinet
+    insmod tftp
+    insmod http
+    $signal
+    linux  ($proto,$orch_ip)/netboot/$default_distro/$default_arch/linux $kernel_opts auto=true priority=critical url=$preseedUrl interface=\${net_default_mac} netcfg/dhcp_timeout=30 BOOTIF=01-\${net_default_mac}
+    # firmware.cpio.gz INCLUS en discovery UEFI : les machines UEFI (récentes,
+    # RAM suffisante) embarquent souvent des NIC Realtek/Intel exigeant un
+    # firmware non-libre (ex. r8169 → rtl_nic/rtl8168e-2.fw + rtl8168g-2.fw).
+    # Sans lui, ethdetect échoue ("Detect network hardware"), la machine ne POST
+    # jamais son inventaire → reste inconnue → reboucle sur ce discovery (cercle
+    # vicieux). Le discovery BIOS (pxelinux-default.j2) reste SANS firmware :
+    # machines legacy à RAM faible (Atom ~956 Mo) où les ~474 Mo d'initramfs
+    # additionnels satureraient.
+    initrd ($proto,$orch_ip)/netboot/$default_distro/$default_arch/initrd.gz ($proto,$orch_ip)/netboot/$default_distro/$default_arch/firmware.cpio.gz
+}
+CFG;
+}
+
+function menuentry_install(string $orch_ip, string $kernel_opts, string $distro, string $default_arch, string $hostname, string $mac, string $bootProto = 'http'): string {
+    $proto = ($bootProto === 'tftp') ? 'tftp' : 'http';
+    $label = "Installation automatique : $hostname (Debian $distro)";
+    $signal = boot_signal($orch_ip, 'install');
+    return <<<CFG
+menuentry '$label' {
+    echo 'Préparation de $hostname...'
+    insmod efinet
+    insmod tftp
+    insmod http
+    $signal
+    linux  ($proto,$orch_ip)/netboot/$distro/$default_arch/linux $kernel_opts auto=true priority=critical url=http://$orch_ip/preseed.php?mac=$mac interface=\${net_default_mac} netcfg/dhcp_timeout=30 hostname=$hostname domain=lan BOOTIF=01-\${net_default_mac}
+    initrd ($proto,$orch_ip)/netboot/$distro/$default_arch/initrd.gz ($proto,$orch_ip)/netboot/$distro/$default_arch/firmware.cpio.gz
+}
+CFG;
+}
+
+function menuentry_wipe(string $orch_ip, string $kernel_opts, string $default_distro, string $default_arch, string $bootProto = 'http'): string {
+    $proto = ($bootProto === 'tftp') ? 'tftp' : 'http';
+    $label = "Effacement sécurisé des disques";
+    $preseedUrl = "http://$orch_ip/wipe-preseed.cfg";
+    $signal = boot_signal($orch_ip, 'wipe');
+    return <<<CFG
+menuentry '$label' {
+    echo 'Effacement sécurisé en cours...'
+    insmod efinet
+    insmod tftp
+    insmod http
+    $signal
+    linux  ($proto,$orch_ip)/netboot/$default_distro/$default_arch/linux $kernel_opts auto=true priority=critical url=$preseedUrl interface=\${net_default_mac} netcfg/dhcp_timeout=30 BOOTIF=01-\${net_default_mac}
+    initrd ($proto,$orch_ip)/netboot/$default_distro/$default_arch/initrd.gz ($proto,$orch_ip)/netboot/$default_distro/$default_arch/firmware.cpio.gz
+}
+CFG;
+}
+
+function menuentry_rescue(string $orch_ip, string $kernel_opts, string $default_distro, string $default_arch, string $bootProto = 'http'): string {
+    $proto = ($bootProto === 'tftp') ? 'tftp' : 'http';
+    $label = "Mode de récupération (rescue)";
+    $signal = boot_signal($orch_ip, 'rescue');
+    return <<<CFG
+menuentry '$label' {
+    echo 'Démarrage du mode récupération...'
+    insmod efinet
+    insmod tftp
+    insmod http
+    $signal
+    linux  ($proto,$orch_ip)/netboot/$default_distro/$default_arch/linux $kernel_opts rescue/enable=true
+    initrd ($proto,$orch_ip)/netboot/$default_distro/$default_arch/initrd.gz ($proto,$orch_ip)/netboot/$default_distro/$default_arch/firmware.cpio.gz
+}
+CFG;
+}
+
+function menuentry_disktest(string $orch_ip, string $kernel_opts, string $default_distro, string $default_arch, string $bootProto = 'http'): string {
+    $proto = ($bootProto === 'tftp') ? 'tftp' : 'http';
+    $label = "Tests de disque (SMART + badblocks)";
+    $preseedUrl = "http://$orch_ip/disktest-preseed.cfg";
+    $signal = boot_signal($orch_ip, 'disktest');
+    return <<<CFG
+menuentry '$label' {
+    echo 'Démarrage des tests de disque...'
+    insmod efinet
+    insmod tftp
+    insmod http
+    $signal
+    linux  ($proto,$orch_ip)/netboot/$default_distro/$default_arch/linux $kernel_opts auto=true priority=critical url=$preseedUrl interface=\${net_default_mac} netcfg/dhcp_timeout=30 BOOTIF=01-\${net_default_mac}
+    initrd ($proto,$orch_ip)/netboot/$default_distro/$default_arch/initrd.gz ($proto,$orch_ip)/netboot/$default_distro/$default_arch/firmware.cpio.gz
+}
+CFG;
+}
+
+// --- Helper checkpoint (refactor 2026-05-16) ----------------------------
+// Insère un événement checkpoint pour l'action en cours sur cette machine.
+// Skip silencieux si aucune action active (cas legacy : machine sans action
+// parent, ou status discovered/inventorying sans flow démarré).
+//
+// POURQUOI inline ici plutôt qu'appel HTTP au InternalApiController : grub.php
+// est un script standalone (pas d'autoloader Admin\), et on a déjà $pdo +
+// $machine en scope local. Insert direct = pas de round-trip ni surface
+// d'attaque supplémentaire.
+//
+// Ordre des codes : on prend l'action la plus récente non-terminale.
+function emit_grub_checkpoint(PDO $pdo, int $machineId, string $code, string $mac): void {
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT id, type FROM actions "
+          . "WHERE machine_id = ? AND status IN ('pending','running') "
+          . "ORDER BY id DESC LIMIT 1"
+        );
+        $stmt->execute([$machineId]);
+        $action = $stmt->fetch();
+        $stmt->closeCursor();
+        if (!$action) return;
+        // Valider que le code est cohérent avec le type d'action — évite
+        // de poser un grub_config_served_install sur une action wipe_only.
+        // SYNC avec ActionCheckpoints::CATALOG — mettre à jour si nouveau type d'action ajouté.
+        // (catalogue dupliqué inline car pas d'autoloader Admin\ dans /srv/http)
+        $catalog = [
+            'reinstall' => ['grub_config_served_wipe', 'grub_config_served_install'],
+            'install_only' => ['grub_config_served_install'],
+            'wipe_only' => ['grub_config_served_wipe'],
+            'disktest' => ['grub_config_served_disktest'],
+        ];
+        $type = (string)$action['type'];
+        if (!isset($catalog[$type]) || !in_array($code, $catalog[$type], true)) return;
+        $ins = $pdo->prepare(
+            'INSERT INTO machine_events (machine_id, level, message, checkpoint, action_id) '
+          . 'VALUES (?, ?, ?, ?, ?)'
+        );
+        // MAC (demandée dans l'URL) et IP (adresse qui a réellement téléchargé cette configuration) :
+        // observées ici, pas déduites d'un autre événement.
+        $seen = json_encode(['mac' => $mac, 'ip' => (string)($_SERVER['REMOTE_ADDR'] ?? ''), 'src' => 'grub.php'],
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $ins->execute([$machineId, 'info', 'checkpoint:' . $code . ' ' . $seen, $code, (int)$action['id']]);
+    } catch (\Throwable $e) {
+        error_log('grub.php: emit_checkpoint failed: ' . $e->getMessage());
+    }
+}
+
+// --- Génération ----------------------------------------------------------
+$bootSession = null;
+echo "set timeout=3\n";
+echo "set default=0\n";
+echo "set net_default_server=$orch_ip\n\n";
+
+if ($machine === null) {
+    // MAC absente DB → discovery toujours en TFTP (universel, marche partout).
+    // Pas d'alternative HTTP : si la machine ne supporte pas HTTP, elle ne pourrait
+    // jamais faire son discovery et donc jamais être enregistrée — œuf et poule.
+    // Le boot_mode HTTP/TFTP est ensuite paramétrable par machine via l'UI pour
+    // les boots récurrents (install, wipe).
+    //
+    // Côté DB : on crée immédiatement un stub avec status='inventorying' pour que
+    // la machine apparaisse dans le dashboard "en cours d'inventaire" pendant la
+    // séquence GRUB → image discovery → discover.sh. Quand discover.sh POST son
+    // inventaire à /api/discovery, le PxeController bascule le status à 'discovered'.
+    $bootMachineId = 0;
+    if ($mac !== '' && isset($pdo)) {
+        try {
+            // Spec D : si l'arch a pu être déduite depuis ${grub_cpu} ($archFromBoot),
+            // on la persiste dès le stub. Sinon on laisse NULL et discover.sh
+            // (uname -m) la complétera au POST /api/discovery.
+            if ($archFromBoot !== null) {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO machines (mac, status, last_seen_at, boot_arch) VALUES (?, ?, ?, ?)'
+                );
+                $stmt->execute([$mac, 'inventorying', date('Y-m-d H:i:s'), $archFromBoot]);
+                $bootMachineId = (int)$pdo->lastInsertId();
+                error_log("grub.php: stub created for $mac (status=inventorying, boot_arch=$archFromBoot from grub_cpu)");
+            } else {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO machines (mac, status, last_seen_at) VALUES (?, ?, ?)'
+                );
+                $stmt->execute([$mac, 'inventorying', date('Y-m-d H:i:s')]);
+                $bootMachineId = (int)$pdo->lastInsertId();
+                error_log("grub.php: stub created for $mac (status=inventorying)");
+            }
+        } catch (\Throwable $e) {
+            error_log("grub.php: stub insert failed for $mac: " . $e->getMessage());
+        }
+    }
+    $bootSession = begin_boot_session($bootMachineId, $mac, 'discovery');
+    echo "# Machine inconnue (MAC: '$mac') — discovery en $discoveryBootProto (setting global), stub créé en 'inventorying'\n";
+    echo menuentry_discovery($orch_ip, $kernel_opts, $default_distro, $default_arch, $discoveryBootProto), "\n";
+} else {
+    $status = $machine['status'];
+    $hostname = preg_replace('/[^a-z0-9-]/', '', strtolower($machine['hostname'] ?? 'unassigned')) ?: 'unassigned';
+    // Segment de path netboot = CODENAME (résolu via le symlink /netboot/<codename>/<arch>).
+    // Modèle distro-name : p.distro = nom OS ('debian') ne résout PAS le path → on prend
+    // p.codename, fallback dérivé du snapshot/version_full, fallback $default_distro (codename).
+    $_majorToCodename = [11 => 'bullseye', 12 => 'bookworm', 13 => 'trixie', 14 => 'forky'];
+    $_cfg = json_decode($machine['install_config_json'] ?? '', true) ?: [];
+    $distro = strtolower(trim((string)($machine['p_codename'] ?? ($_cfg['codename'] ?? ''))));
+    if ($distro === '') {
+        $_vf = (string)($_cfg['version_full'] ?? '');
+        $_mj = $_vf !== '' ? (int)explode('.', $_vf)[0] : 0;
+        $distro = $_majorToCodename[$_mj] ?? '';
+    }
+    if ($distro === '') {
+        // rétrocompat : p.distro est peut-être encore un codename (snapshot legacy)
+        $_pd = strtolower((string)($machine['p_distro'] ?? ''));
+        $distro = in_array($_pd, $_majorToCodename, true) ? $_pd : $default_distro;
+    }
+    // Spec D : per-machine arch override (depuis discover.sh inventory.cpu_arch).
+    // Fallback sur pxe_default_arch (env DEBIAN_ARCH) si jamais discovered.
+    if (!empty($machine['boot_arch'])) {
+        $default_arch = $machine['boot_arch'];
+    }
+    $bootProto = $machine['boot_mode'] ?? 'http';
+    $rescueMode = (int)($machine['rescue_mode'] ?? 0) === 1;
+    $localBootAllowed = in_array((string)($machine['local_boot_source'] ?? 'none'), ['pxe', 'manual'], true);
+    $defaultMenu = $rescueMode ? 'rescue' : match ($status) {
+        'testing' => 'disktest',
+        'wiping' => 'wipe',
+        'configured' => 'install',
+        'installing', 'inventorying' => 'discovery',
+        default => $localBootAllowed ? 'local' : 'discovery',
+    };
+    $bootSession = begin_boot_session((int)$machine['id'], $mac, $defaultMenu);
+
+    if ($rescueMode) {
+        // rescue_mode=1 : priorité absolue sur le status. La machine est volontairement
+        // mise en mode récupération via l'UI ; on sert uniquement le menuentry rescue
+        // jusqu'à ce que l'utilisateur sorte du mode rescue (POST /machines/{id}/rescue/exit).
+        echo "# Machine $hostname en mode rescue → boot Debian d-i en récupération\n";
+        echo menuentry_rescue($orch_ip, $kernel_opts, $default_distro, $default_arch, $bootProto), "\n";
+    } elseif ($status === 'testing') {
+        // Job de tests de disque en cours → sert le menuentry disktest qui charge
+        // disktest-preseed.cfg → disktest.sh télécharge smartctl/badblocks et exécute.
+        echo "# Machine $hostname en cours de tests disque → boot disktest-preseed (proto=$bootProto)\n";
+        echo menuentry_disktest($orch_ip, $kernel_opts, $default_distro, $default_arch, $bootProto), "\n";
+        if (isset($pdo)) emit_grub_checkpoint($pdo, (int)$machine['id'], 'grub_config_served_disktest', $mac);
+    } elseif ($status === 'wiping') {
+        echo "# Machine $hostname en cours de wipe → boot wipe-preseed (proto=$bootProto)\n";
+        echo menuentry_wipe($orch_ip, $kernel_opts, $default_distro, $default_arch, $bootProto), "\n";
+        if (isset($pdo)) emit_grub_checkpoint($pdo, (int)$machine['id'], 'grub_config_served_wipe', $mac);
+    } elseif ($status === 'configured') {
+        echo "# Machine $hostname configurée → install auto (proto=$bootProto)\n";
+        echo menuentry_install($orch_ip, $kernel_opts, $distro, $default_arch, $hostname, $mac, $bootProto), "\n";
+        if (isset($pdo)) emit_grub_checkpoint($pdo, (int)$machine['id'], 'grub_config_served_install', $mac);
+    } elseif ($defaultMenu === 'local') {
+        // Installation PXE réussie ou choix explicite de l'administrateur.
+        echo "# Machine $hostname → boot local autorisé ({$machine['local_boot_source']})\n";
+        echo menuentry_local($orch_ip), "\n";
+        echo "\n# Forcer la réinstall (override) :\n";
+        if ($distro) {
+            echo menuentry_install($orch_ip, $kernel_opts, $distro, $default_arch, $hostname, $mac, $bootProto), "\n";
+        }
+    } elseif (in_array($status, ['inventorying', 'unknown'], true)) {
+        // 'inventorying' : stub créé par un précédent appel grub.php, en cours
+        //   d'inventaire → re-sert le menuentry discovery pour terminer le cycle.
+        // 'unknown' (rang 0) : machine réinitialisée via le force-statut admin →
+        //   re-discovery au prochain boot PXE. Sans ce cas, 'unknown' tombait dans
+        //   le `else` générique dont le default=0 chaînait sur grub.cfg → install
+        //   AUTO non sollicitée (qui échouait sur preseed.php sans mac). JAMAIS ça.
+        echo "# Machine ($status, mac=$mac) → (re-)boot ramdisk discovery (proto=$discoveryBootProto)\n";
+        echo menuentry_discovery($orch_ip, $kernel_opts, $default_distro, $default_arch, $discoveryBootProto), "\n";
+    } elseif (in_array($status, ['discovered', 'tested', 'failed', 'wiped'], true)) {
+        // Machine inventoriée SANS flow actif (découverte sans preset, ou
+        // revenue d'un test de disques en tested/failed). NE PAS émettre un
+        // menuentry `reboot` sec ici : avec `set default=0` + `set timeout=3`,
+        // GRUB l'exécute automatiquement → re-PXE → grub.php → même statut →
+        // reboot → boucle GRUB infinie qui ne redescend jamais dans le ramdisk.
+        // On re-boote le ramdisk discovery (idem 'inventorying') : discover.sh
+        // re-POST l'inventaire (→ /api/discovery repose awaiting_action_until à
+        // NOW+1h) puis poll /api/discovery-action (wait → banner d'attente ;
+        // reboot/poweroff sur action admin). La machine reste donc vivante en
+        // poll au lieu de boucler, et réagit à une assignation de preset en ≤5s.
+        // tested/failed/wiped surtout : avant 2026-06-10 ils tombaient dans le
+        // fallback boot local — une machine rallumée après un test de disques
+        // tentait de démarrer son OS (souvent inexistant) au lieu de revenir
+        // à l'écran d'attente. Le pendant BIOS (render-per-mac-pxelinux.sh)
+        // les route déjà vers discovery via son case default.
+        echo "# Machine $hostname ($status, sans flow actif) → re-boot ramdisk discovery (poll d'attente, re-timeout 1h)\n";
+        echo menuentry_discovery($orch_ip, $kernel_opts, $default_distro, $default_arch, $discoveryBootProto), "\n";
+    } else {
+        // Statut transitoire ou futur : discovery reste le repli sûr tant
+        // qu'une installation terminée n'est pas attestée dans la DB.
+        echo "# Machine en status='$status' — discovery par défaut\n";
+        echo menuentry_discovery($orch_ip, $kernel_opts, $default_distro, $default_arch, $discoveryBootProto), "\n";
+    }
+}
+
+// Le boot local n'est proposé que si local_boot_source l'autorise plus haut.
+// Toutes les autres machines ont une entrée Discovery ou opération dédiée
+// en premier ; le menu générique reste accessible manuellement.
+echo "menuentry 'Autres options de démarrage' {\n";
+echo "    " . boot_signal($orch_ip, 'other') . "\n";
+echo "    configfile (tftp,$orch_ip)/grub/grub.cfg\n";
+echo "}\n";

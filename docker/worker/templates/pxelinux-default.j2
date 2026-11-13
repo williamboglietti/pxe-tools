@@ -1,0 +1,64 @@
+# {{ ansible_managed }}
+# Menu PXE servi par TFTP (BIOS legacy via lpxelinux.0)
+# Note : le 2nd initrd (firmware.cpio.gz) charge les firmwares non-free au boot
+
+UI menu.c32
+PROMPT 0
+TIMEOUT 100   # 10s
+DEFAULT discovery
+
+MENU TITLE Orchestrateur de provisionnement
+MENU AUTOBOOT Demarrage automatique dans # secondes...
+
+# Pendant du menuentry 'Hardware Discovery' généré dynamiquement par grub.php
+# pour les machines UEFI inconnues. En BIOS legacy, pxelinux.cfg/default est
+# statique → on met discovery en DEFAULT pour que toute machine BIOS inconnue
+# (qui tombe sur ce fichier en fallback faute de pxelinux.cfg/01-<MAC>) lance
+# l'inventaire automatiquement au premier boot.
+# IPAPPEND 2 injecte BOOTIF=01-<MAC> dans /proc/cmdline (lu par discover.sh
+# pour POST /api/discovery avec la même MAC que celle vue par le firmware).
+LABEL discovery
+  MENU LABEL Hardware Discovery (auto)
+  KERNEL http://{{ pxe_ip }}/netboot/{{ pxe_default_netboot_path }}/linux
+  # firmware.cpio.gz volontairement omis : il pèse ~474 MB et sature les
+  # machines à RAM faible (ex: Atom N570 956 MB → tmpfs full → segfault
+  # initramfs). Discovery utilise juste l'ethernet (drivers in-tree kernel)
+  # pour POST /api/discovery puis poweroff. Le firmware non-free reste chargé
+  # pour les menuentry Installation auto/manuelle qui ont vraiment besoin
+  # des drivers wifi/Realtek/Broadcom.
+  # Menu STATIQUE (machine inconnue) : on ne connaît pas la MAC au rendu, donc
+  # on ne peut pas figer `interface=<MAC>` comme dans les configs per-MAC. Repli
+  # `interface=auto` (évite le prompt netcfg ; OK en mono-NIC, le cas courant).
+  # Limite connue : une machine multi-NIC INCONNUE en BIOS peut élire la mauvaise
+  # carte à sa 1re découverte ; elle est quand même enregistrée (discover.sh lit
+  # le BOOTIF) puis reçoit un config per-MAC déterministe au boot suivant.
+  APPEND vga=788 initrd=http://{{ pxe_ip }}/netboot/{{ pxe_default_netboot_path }}/initrd.gz {{ pxe_kernel_opts }} auto=true priority=critical url=http://{{ pxe_ip }}/discovery-preseed.cfg interface=auto netcfg/dhcp_timeout=30
+  IPAPPEND 2
+
+{# Layout v2 : 1 menu par couple (codename, version_full) → path /netboot/<distro>/<version_full>/<arch>/ #}
+{% for v in pxe_debian_versions_full %}
+LABEL debian-{{ v.codename }}-{{ v.version_full }}-auto
+  MENU LABEL Installation automatique - Debian {{ v.codename }} {{ v.version_full }}
+  KERNEL http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/linux
+  APPEND vga=788 initrd=http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/initrd.gz,http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/firmware.cpio.gz {{ pxe_kernel_opts }} auto=true priority=critical url=http://{{ pxe_ip }}/preseed.php?distro={{ v.codename }} interface=auto netcfg/dhcp_timeout=30 hostname=unassigned domain=lan
+
+LABEL debian-{{ v.codename }}-{{ v.version_full }}-manual
+  MENU LABEL Installation manuelle - Debian {{ v.codename }} {{ v.version_full }}
+  KERNEL http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/linux
+  APPEND vga=788 initrd=http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/initrd.gz,http://{{ pxe_ip }}/netboot/{{ v.distro }}/{{ v.version_full }}/{{ pxe_default_arch }}/firmware.cpio.gz {{ pxe_kernel_opts }}
+
+{% endfor %}
+LABEL rescue
+  MENU LABEL Mode rescue (depannage)
+  KERNEL http://{{ pxe_ip }}/netboot/{{ pxe_default_netboot_path }}/linux
+  APPEND vga=788 initrd=http://{{ pxe_ip }}/netboot/{{ pxe_default_netboot_path }}/initrd.gz,http://{{ pxe_ip }}/netboot/{{ pxe_default_netboot_path }}/firmware.cpio.gz {{ pxe_kernel_opts }} rescue/enable=true
+
+{% if pxe_ipxe_enabled %}
+LABEL ipxe-chainload
+  MENU LABEL Chainload iPXE (HTTP boot natif)
+  KERNEL ipxe.lkrn
+  APPEND dhcp && chain http://{{ pxe_ip }}/boot.ipxe
+{% endif %}
+LABEL local
+  MENU LABEL Demarrer sur le disque local
+  LOCALBOOT 0

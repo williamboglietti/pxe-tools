@@ -1,0 +1,54 @@
+#!/bin/sh
+# postboot.sh — exécuté UNE SEULE FOIS au premier boot d'une OS installée.
+# Rendu par le worker Python par action, déposé dans /usr/local/bin par le
+# late_command du preseed. Déclenché par la systemd unit pxe-postboot.service
+# (oneshot, RemainAfterExit + ConditionPathExists=!/var/lib/pxe-tools-postboot.done).
+#
+# Spec : docs/superpowers/specs/2026-05-16-actions-checkpoints-tracking-design.md
+# (§ Sources de signaux — checkpoint os_first_boot + § Trigger ansible event-driven)
+#
+# Variables Jinja injectées par le worker au rendu :
+#   pxe_ip : IP de l'orchestrateur PXE (setting pxe_ip)
+#   token  : token hex 64 chars de l'action (action.token)
+#   mac    : MAC de la machine cible (action.machine.mac)
+
+set -eu
+
+PXE_IP="{{ pxe_ip }}"
+TOKEN="{{ token }}"
+MAC="{{ mac }}"
+
+# Marqueur de complétion : empêche la systemd unit de relancer le script
+# (ConditionPathExists=!… lue par systemd avant chaque démarrage).
+DONE_MARKER="/var/lib/pxe-tools-postboot.done"
+
+# Recolte runtime — IP locale + version kernel — pour audit dans l'event.
+# IP : on prend la première IPv4 non-loopback (hostname -I retourne une liste
+# espace-séparée, awk '{print $1}' prend la 1ère). Fallback vide si rien.
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+KERNEL="$(uname -r 2>/dev/null || echo unknown)"
+
+# Body JSON minimal pour le checkpoint (ip + kernel observés sur la machine
+# bootée). Le serveur stocke ça dans machine_events.message pour debug.
+PAYLOAD="{\"ip\":\"${IP}\",\"kernel\":\"${KERNEL}\"}"
+
+# POST best-effort. Timeout court (5s) car la machine vient de booter et
+# le réseau n'est peut-être pas encore complètement stable. `|| true` car
+# on ne veut JAMAIS faire échouer le boot OS sur un échec checkpoint.
+#
+# SEC-02 : token transmis via header Authorization: Bearer (plus en query
+# string) — évite la journalisation du secret dans nginx access log.
+curl -s --max-time 5 -X POST \
+    "http://${PXE_IP}/api/internal/checkpoint?mac=${MAC}&code=os_first_boot" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H 'Content-Type: application/json' \
+    --data-raw "${PAYLOAD}" \
+    || true
+
+# Marqueur de complétion APRÈS le POST : si le POST échoue (réseau down),
+# la machine retentera au prochain boot. Si tout s'est bien passé, le marqueur
+# empêche les replays.
+mkdir -p "$(dirname "${DONE_MARKER}")" || true
+touch "${DONE_MARKER}" || true
+
+exit 0

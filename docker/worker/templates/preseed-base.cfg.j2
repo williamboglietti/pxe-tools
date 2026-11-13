@@ -1,0 +1,59 @@
+### Preseed Debian — template base
+### Géré par Ansible. Les placeholders {{ '{{XXX}}' }} sont substitués par preseed.php.
+### Distro choisie au runtime : {{ '{{DISTRO_CODENAME}}' }} (validée depuis DB)
+### Doc : https://www.debian.org/releases/stable/example-preseed.txt
+
+### --- Refactor checkpoints 2026-05-16 -----------------------------------
+### early_command : pings checkpoints émis AVANT partman (premier hook d-i
+### accessible). preseed.php injecte ici les wgets avec token Bearer si une
+### action est active. Bloc vide si pas d'action parent (legacy).
+{{ '{{EARLY_COMMAND_BLOCK}}' }}
+
+### --- Localisation -------------------------------------------------------
+{{ '{{LOCALIZATION_BLOCK}}' }}
+
+### --- Réseau -------------------------------------------------------------
+# La directive netcfg/choose_interface est désormais émise par preseed.php
+# dans le bloc dynamique réseau ci-dessous (multi-NIC : peut cibler une MAC
+# précise ; legacy single-NIC : 'auto').
+# Le bloc hostname est dynamique : si machines.hostname est NULL (cas "le DHCP
+# attribue le nom"), preseed.php omet les directives de nom et d-i utilise sa
+# configuration habituelle. Le domaine n'est émis que s'il est renseigné.
+{{ '{{HOSTNAME_BLOCK}}' }}
+d-i netcfg/wireless_wep string
+
+# Bloc dynamique réseau (DHCP par défaut, ou static si configuré)
+{{ '{{NETWORK_BLOCK}}' }}
+
+### --- Miroir -------------------------------------------------------------
+{{ '{{MIRROR_BLOCK}}' }}
+d-i mirror/suite string {{ '{{DISTRO_CODENAME}}' }}
+
+### --- Comptes utilisateur -----------------------------------------------
+# Bloc dynamique : selon root_login_mode du preset, soit root activé +
+# late_command useradd (legacy/compat), soit root désactivé + passwd/make-user
+# natif d-i (pattern preseed-board, user créé par d-i lui-même).
+{{ '{{ACCOUNTS_BLOCK}}' }}
+
+### --- Horloge ----------------------------------------------------------
+{{ '{{CLOCK_BLOCK}}' }}
+
+### --- Partitionnement -------------------------------------------------
+# Bloc dynamique selon preset : atomic_lvm | home_separate | var_separate | encrypted | custom
+{{ '{{PARTITION_BLOCK}}' }}
+
+### --- Système de base + paquets ---------------------------------------
+{{ '{{PACKAGES_BLOCK}}' }}
+
+### --- Composantes APT (firmware non-free + contrib activés) -----------
+{{ '{{APT_BLOCK}}' }}
+
+### --- Bootloader ------------------------------------------------------
+{{ '{{BOOTLOADER_BLOCK}}' }}
+
+### --- Fin de l'install ------------------------------------------------
+{{ '{{FINISH_BLOCK}}' }}
+
+### --- late_command : crée user 'ansible' + user admin custom + hardening + ping API
+# Bloc dynamique généré par preseed.php selon le preset
+{{ '{{ADMIN_USER_BLOCK}}' }}

@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+# Service s6 longrun : tail le log dnsmasq et émet les checkpoints DHCP/TFTP.
+# Démarre après dnsmasq (cf. dependencies.d/dnsmasq).
+exec /usr/local/bin/dnsmasq-tail.sh

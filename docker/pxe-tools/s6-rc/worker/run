@@ -1,0 +1,6 @@
+#!/command/with-contenv sh
+# worker.py poll la DB sqlite et exécute les init_jobs (bootstrap-mok,
+# bootstrap-download-debian, bootstrap-build-grub, etc.) ainsi que les
+# ansible-playbook jobs de provisioning.
+# Les clés des hôtes doivent être vérifiées avant toute connexion SSH.
+exec python3 /app/worker.py

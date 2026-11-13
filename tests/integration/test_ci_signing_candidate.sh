@@ -28,20 +28,34 @@ printf '%s\n' 'ci-fixture-passphrase' > "$fixture/passphrase"
 chmod 0600 "$fixture/passphrase"
 gpg --homedir "$gnupg" --batch --pinentry-mode loopback --passphrase-file "$fixture/passphrase" \
     --quick-generate-key 'CI Fixture <fixture@example.invalid>' ed25519 cert 1d >/dev/null 2>&1
-primary=$(gpg --homedir "$gnupg" --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1=="fpr" {print $10;exit}')
+primary=$(gpg --homedir "$gnupg" --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1=="fpr" && !found {print $10;found=1}')
 gpg --homedir "$gnupg" --batch --pinentry-mode loopback --passphrase-file "$fixture/passphrase" \
     --quick-add-key "$primary" ed25519 sign 1d >/dev/null 2>&1
-sub=$(gpg --homedir "$gnupg" --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1=="ssb" {s=1;next} s && $1=="fpr" {print $10;exit}')
+sub=$(gpg --homedir "$gnupg" --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1=="ssb" {s=1;next} s && $1=="fpr" && !found {print $10;found=1}')
 gpg --homedir "$gnupg" --batch --armor --pinentry-mode loopback --passphrase-file "$fixture/passphrase" \
     --export-secret-subkeys "$sub!" > "$fixture/sub.asc"
 gpg --homedir "$gnupg" --batch --armor --pinentry-mode loopback --passphrase-file "$fixture/passphrase" \
     --export-secret-keys "$primary" > "$fixture/full.asc"
 export APT_SIGNING_KEY="$(cat "$fixture/sub.asc")" APT_SIGNING_PASSPHRASE='ci-fixture-passphrase'
 helper="$root/packaging/native/ci-sign-apt-candidate.py"
+fixture_sha=$(sha256sum "$fixture/package.deb" | awk '{print $1}')
+fixture_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 python3 "$helper" "$fixture/package.deb" "$fixture/good" \
-    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 > "$fixture/good.log" 2>&1
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 \
+    --source-commit "$fixture_commit" --build-run-id 123 --approved-package-sha256 "$fixture_sha" > "$fixture/good.log" 2>&1
 test -s "$fixture/good/dists/stable/InRelease"
-gpg --homedir "$gnupg" --batch --status-fd 1 --verify "$fixture/good/dists/stable/InRelease" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $sub "
+grep -Fx "X-PXE-Source-Commit: $fixture_commit" "$fixture/good/dists/stable/Release" >/dev/null
+grep -Fx 'X-PXE-Build-Run: 123' "$fixture/good/dists/stable/Release" >/dev/null
+grep -Fx "X-PXE-Package-SHA256: $fixture_sha" "$fixture/good/dists/stable/Release" >/dev/null
+grep -Fx 'X-PXE-Package-Version: 1.0~fixture1' "$fixture/good/dists/stable/Release" >/dev/null
+if python3 "$helper" "$fixture/package.deb" "$fixture/wrong-provenance" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" \
+    --source-commit "$fixture_commit" --build-run-id 123 --approved-package-sha256 "$(printf '%064d' 0)" > "$fixture/provenance-error.log" 2>&1; then
+    echo 'Mismatched provenance unexpectedly signed' >&2; exit 1
+fi
+test ! -e "$fixture/wrong-provenance"
+gpg --homedir "$gnupg" --batch --status-fd 1 --verify "$fixture/good/dists/stable/InRelease" > "$fixture/verify.status" 2>/dev/null
+grep -q "^\[GNUPG:\] VALIDSIG $sub " "$fixture/verify.status"
 old_index="$fixture/good/dists/stable/main/binary-amd64/Packages.gz"
 old_hash=$(sha256sum "$old_index" | awk '{print $1}')
 sed -i 's/Version: 1.0~fixture1/Version: 1.0~fixture2/' "$fixture/package/DEBIAN/control"

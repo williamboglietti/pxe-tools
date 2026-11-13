@@ -1,0 +1,10 @@
+<?php use Admin\View; ?>
+<header class="page-heading"><div><p class="eyebrow">Exploitation</p><h1>Activité</h1><p class="page-intro">Installations, maintenance et jobs de l’appliance. Chaque opération conserve son propre suivi.</p></div><a href="/installations" class="btn btn-secondary">Historique des installations</a></header>
+<form method="get" action="/activity" id="activity-filters" class="filter-bar" role="search">
+<div class="field search-field"><label for="activity-search">Cible, auteur ou dernière information</label><input id="activity-search" type="search" name="q" value="<?= View::e($q) ?>" placeholder="Rechercher une opération"></div>
+<details class="filter-options" open><summary>Filtres de l’activité</summary><div class="filter-options-fields"><div class="field"><label for="activity-type">Type</label><select id="activity-type" name="type"><?php foreach([''=>'Tous les types','install'=>'Installation','discovery'=>'Inventaire','wipe'=>'Effacement','disktest'=>'Test disque','job'=>'Job appliance'] as $v=>$l): ?><option value="<?= $v ?>" <?= $type===$v?'selected':'' ?>><?= $l ?></option><?php endforeach ?></select></div>
+<div class="field"><label for="activity-status">État</label><select id="activity-status" name="status"><?php foreach([''=>'Tous les états','pending'=>'En attente','running'=>'En cours','success'=>'Réussie','failed'=>'Échec','cancelled'=>'Annulée','skipped'=>'Ignorée'] as $v=>$l): ?><option value="<?= $v ?>" <?= $status===$v?'selected':'' ?>><?= $l ?></option><?php endforeach ?></select></div>
+</div></details><input type="hidden" name="machine" value="<?= $machine ?>"><input type="hidden" name="page" value="<?= $page ?>"><button class="btn btn-primary">Filtrer</button><a class="btn btn-ghost" href="/activity">Réinitialiser</a>
+</form>
+<p class="freshness" data-freshness role="status">Dernière actualisation : <?= gmdate('H:i:s') ?> UTC</p>
+<?php View::partial('activity/_list',compact('items','total','page','pages','q','status','type','machine','sig')); ?>

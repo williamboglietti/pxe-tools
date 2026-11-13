@@ -1,0 +1,136 @@
+/*
+ * PXE Tools — palette commune, 11 octobre 2026.
+ *
+ * Les surfaces, la sidebar neutre, les teintes Material et les polices
+ * reprennent le main courant. Adaptations de lisibilité : gris de texte
+ * opaques en clair, couleurs de statut ajustées sur leurs fonds atténués,
+ * fonds d'action distingués des couleurs de texte et des accents graphiques.
+ * Le nom historique apple-blue reste compatible avec les CTA blancs :
+ * #1976d2 / hover #1565c0 dans les DEUX thèmes (4,60:1 / 5,75:1).
+ * Les actions danger pleines utilisent action-danger, jamais le texte danger.
+ * Contrastes sRGB calculés sur surface-0/1/2/3 + sidebar, alpha composé :
+ * clair : secondaire >= 6,19:1, tertiaire >= 4,83:1, lien >= 4,55:1 ;
+ * sombre : secondaire >= 7,65:1, tertiaire >= 5,16:1, lien >= 5,96:1 ;
+ * badges sur leur tint : minimum clair 4,52:1, sombre 4,62:1 ;
+ * actions danger blanches : 4,98:1, hover 6,57:1.
+ * Ces calculs de tokens ne remplacent pas le contrôle des vues composées.
+ *
+ * Un seul @theme : les utilities lisent les variables au runtime.
+ * Les cartes n'ont pas d'ombre visible ; le relief sert aux menus flottants.
+ */
+
+@theme {
+  /* Surfaces claires neutres. */
+  --color-surface-0: #ffffff;
+  --color-surface-1: #f6f7f9;
+  --color-surface-2: #eef0f3;
+  --color-surface-3: #e2e5ea;
+  --color-surface-input: #ffffff;
+  --color-sidebar: #f0f1f4;
+  --color-sidebar-active: rgba(0, 0, 0, 0.07);
+
+  /* Fonds d'action : texte blanc lisible, indépendants du thème. */
+  --color-action-primary: #1976d2;
+  --color-action-primary-hover: #1565c0;
+  --color-action-primary-foreground: #ffffff;
+  --color-action-danger: #d32f2f;
+  --color-action-danger-hover: #b71c1c;
+  --color-action-danger-foreground: #ffffff;
+
+  /* Compatibilité des classes PXE existantes. */
+  --color-apple-blue: #1976d2;
+  --color-apple-blue-hover: #1565c0;
+  --color-apple-blue-link: #1565c0;
+  --color-accent-graphic: #1976d2;
+  --color-focus-ring: #1565c0;
+
+  /* Les légendes restent lisibles sur toutes les surfaces claires. */
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #525252;
+  --color-text-tertiary: #626262;
+
+  --color-divider: rgba(0, 0, 0, 0.08);
+  --color-divider-strong: rgba(0, 0, 0, 0.28);
+  --color-border-input: rgba(0, 0, 0, 0.20);
+  --color-border-input-focus: #1976d2;
+
+  /* Textes sémantiques assombris ; les fonds restent ceux de Domains. */
+  --color-success: #256629;
+  --color-success-bg: rgba(76, 175, 80, 0.12);
+  --color-warning: #974100;
+  --color-warning-bg: rgba(255, 152, 0, 0.14);
+  --color-danger: #b71c1c;
+  --color-danger-bg: rgba(244, 67, 54, 0.12);
+  --color-info: #0d47a1;
+  --color-info-bg: rgba(25, 118, 210, 0.10);
+  --color-accent-purple: #7b1fa2;
+  --color-accent-purple-bg: rgba(156, 39, 176, 0.12);
+
+  /* Identités des distributions : compatibilité du set d'icônes existant. */
+  --color-distro-debian: #A81D33;
+  --color-distro-ubuntu: #E95420;
+  --color-distro-fedora: #294172;
+  --color-distro-centos: #262577;
+  --color-distro-almalinux: #0FB164;
+  --color-distro-rocky: #10B981;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+               "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, monospace;
+  --tracking-tight: -0.01em;
+
+  --radius-card: 0.5rem;
+  --radius-button: 0.5rem;
+  --radius-input: 0.5rem;
+  --radius-pill: 9999px;
+
+  /* Ombres transparentes valides aussi dans les utilities composées. */
+  --shadow-card: 0 0 0 0 rgba(0, 0, 0, 0);
+  --shadow-card-hover: 0 0 0 0 rgba(0, 0, 0, 0);
+  /* Indirection conservée lorsque Tailwind inline une utility shadow-*. */
+  --shadow-dropdown: var(--pxe-shadow-dropdown, 0 6px 18px rgba(0, 0, 0, 0.14));
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --pxe-shadow-dropdown: 0 6px 18px rgba(0, 0, 0, 0.14);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-surface-0: #181818;
+  --color-surface-1: #1f1f1f;
+  --color-surface-2: #262626;
+  --color-surface-3: #303030;
+  --color-surface-input: #262626;
+  --color-sidebar: #141414;
+  --color-sidebar-active: rgba(255, 255, 255, 0.10);
+
+  /* L'accent graphique suit Domains ; les fonds de CTA gardent leur contraste. */
+  --color-accent-graphic: #2196f3;
+  --color-apple-blue-link: #64b5f6;
+  --color-focus-ring: #64b5f6;
+
+  --color-text-primary: rgba(255, 255, 255, 0.92);
+  --color-text-secondary: rgba(255, 255, 255, 0.72);
+  --color-text-tertiary: rgba(255, 255, 255, 0.55);
+
+  --color-divider: rgba(255, 255, 255, 0.08);
+  --color-divider-strong: rgba(255, 255, 255, 0.28);
+  --color-border-input: rgba(255, 255, 255, 0.28);
+  --color-border-input-focus: #2196f3;
+
+  --color-success: #81c784;
+  --color-success-bg: rgba(76, 175, 80, 0.16);
+  --color-warning: #ffa726;
+  --color-warning-bg: rgba(255, 152, 0, 0.16);
+  --color-danger: #ff8a80;
+  --color-danger-bg: rgba(244, 67, 54, 0.18);
+  --color-info: #64b5f6;
+  --color-info-bg: rgba(66, 165, 245, 0.16);
+  --color-accent-purple: #ce93d8;
+  --color-accent-purple-bg: rgba(156, 39, 176, 0.18);
+
+  --pxe-shadow-dropdown: 0 6px 18px rgba(0, 0, 0, 0.32);
+}

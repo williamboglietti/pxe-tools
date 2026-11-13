@@ -1,0 +1,890 @@
+#!/bin/sh
+# Disk test boot script — exécuté par partman/early_command du disktest-preseed.
+# Récupère son job via /api/disktest-job?mac=, télécharge smartctl + badblocks
+# (binaires statiques servis par le serveur PXE), exécute les tests par disque,
+# POST les résultats individuels + verdict global, applique post_action.
+#
+# Chaque disque est identifié par son NUMÉRO DE SÉRIE (job.serial_b64), jamais par
+# son seul chemin /dev/sdX : tous les jobs sont vérifiés avant le premier test, et
+# un seul refus annule l'ensemble (aucune lecture ni écriture lancée).
+#
+# Tourne dans busybox ash de l'installateur Debian. POSIX-only.
+# Tolérant : ne doit JAMAIS faire échouer l'installateur.
+
+ORCH_IP="{{ pxe_ip }}"
+API_BASE="http://$ORCH_IP/api"
+STATIC_BIN_BASE="http://$ORCH_IP/static-bin"
+TEST_ID=0
+WORK_DIR=/tmp/dt
+# Purge systématique : en chemin in-session (enchaîné depuis discover.sh), une
+# exécution précédente a pu laisser des state-*/verdict-* qui fausseraient le
+# banner et l'agrégat de verdicts.
+rm -rf "$WORK_DIR" 2>/dev/null
+mkdir -p "$WORK_DIR"
+
+# ---- Helpers de log/ping ---------------------------------------------------
+ping_phase() {
+    line="$1"
+    if [ "$TEST_ID" -gt 0 ] 2>/dev/null; then
+        wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=$TEST_ID&line=$line" 2>/dev/null || true
+    fi
+}
+
+log_line() {
+    msg="[$(date +%H:%M:%S)] $1"
+    echo "$msg"
+    if [ "$TEST_ID" -gt 0 ] 2>/dev/null; then
+        enc=$(echo "$msg" | sed 's/%/%25/g; s/ /%20/g; s|/|%2F|g; s/:/%3A/g; s/=/%3D/g; s/&/%26/g; s/+/%2B/g')
+        wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=$TEST_ID&line=$enc" 2>/dev/null || true
+    fi
+}
+
+# POST un résultat structuré pour un disque (verdict + bad_blocks + duration_s)
+post_result() {
+    rdisk="$1"
+    rmode="$2"
+    rverdict="$3"
+    rbad="$4"
+    rdur="$5"
+    rdev="${6:-}"
+    revidence="${7:-}"
+    rextra=""
+    [ -n "$revidence" ] && rextra=",\"evidence\":$revidence"
+    # body JSON ; "disk" = clé du job, "device" = chemin réellement testé (relu par série)
+    body=$(printf '{"disk":"%s","mode":"%s","verdict":"%s","bad_blocks":%s,"duration_s":%s,"device":"%s"%s}' \
+        "$rdisk" "$rmode" "$rverdict" "${rbad:-null}" "${rdur:-null}" "$rdev" "$rextra")
+    # busybox wget ne supporte pas --post-data systématiquement ; on tente puis fallback
+    wget -q -O /dev/null --post-data="$body" --header="Content-Type: application/json" \
+        "$API_BASE/disktest-result?test_id=$TEST_ID" 2>/dev/null || \
+    wget -q -O /dev/null --header="Content-Type: application/json" --post-data="$body" \
+        "$API_BASE/disktest-result?test_id=$TEST_ID" 2>/dev/null || true
+}
+
+# URL-encode minimal pour un chemin /dev/xxx (jamais d'espaces).
+enc_disk() { echo "$1" | sed 's|/|%2F|g'; }
+
+# BEGIN disktest-smart-capture
+capture_smart() {
+    cs_disk="$1"
+    cs_dev="$2"
+    cs_phase="$3"
+    if [ -z "$SMARTCTL" ]; then
+        log_line "  [SMART] relevé $cs_phase ignoré : smartctl indisponible" >/dev/null
+        return 0
+    fi
+    cs_file="$WORK_DIR/smart-$(basename "$cs_disk")-$cs_phase.json"
+    "$SMARTCTL" -x --json=c "$cs_dev" > "$cs_file" 2>/dev/null || true
+    if [ ! -s "$cs_file" ]; then
+        rm -f "$cs_file" 2>/dev/null
+        log_line "  [SMART] relevé $cs_phase ignoré : sortie vide" >/dev/null
+        return 0
+    fi
+    cs_first_line=""
+    IFS= read -r cs_first_line < "$cs_file" || true
+    case "$cs_first_line" in
+        \{*) ;;
+        *)
+            rm -f "$cs_file" 2>/dev/null
+            log_line "  [SMART] relevé $cs_phase ignoré : sortie JSON invalide" >/dev/null
+            return 0
+            ;;
+    esac
+    cs_size=$(wc -c < "$cs_file" | tr -d '[:space:]')
+    if [ "$cs_size" -gt 1000000 ] 2>/dev/null; then
+        log_line "  [SMART] relevé $cs_phase ignoré : fichier trop volumineux ($cs_size octets)" >/dev/null
+        return 0
+    fi
+    if wget -q -O /dev/null --header="Content-Type: application/json" --post-file="$cs_file" \
+        "$API_BASE/disktest-smart?test_id=$TEST_ID&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
+        return 0
+    fi
+    if [ "$cs_size" -lt 100000 ] 2>/dev/null; then
+        if wget -q -O /dev/null --header="Content-Type: application/json" --post-data="$(cat "$cs_file")" \
+            "$API_BASE/disktest-smart?test_id=$TEST_ID&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    log_line "  [SMART] envoi du relevé $cs_phase impossible" >/dev/null
+    return 0
+}
+# END disktest-smart-capture
+
+# Progression structurée d'un disque → serveur (query string : busybox wget gère
+# mal les body POST, et le serveur clampe/whiteliste tout). La RÉPONSE sert de
+# canal retour : « ignored » = le test n'est plus actif côté serveur (annulé par
+# l'admin) → drapeau abort, consommé par les boucles de test en ≤10 s.
+post_progress() {
+    # $1=disk $2=phase $3=pct $4=pass $5=bad $6=elapsed_s $7=eta_s
+    [ "$TEST_ID" -gt 0 ] 2>/dev/null || return 0
+    pp_resp=$(wget -qO- "$API_BASE/disktest-disk-progress?test_id=$TEST_ID&disk=$(enc_disk "$1")&phase=$2&pct=$3&pass=$4&bad=$5&elapsed=$6&eta=$7" 2>/dev/null) || pp_resp=""
+    case "$pp_resp" in
+        *ignored*) touch "$WORK_DIR/abort" ;;
+    esac
+}
+
+# État local par disque pour le banner TTY : "mode|phase|pct|bad|eta_s|verdict".
+# Écriture atomique (tmp+mv) : le banner lit en concurrence depuis un sous-shell.
+write_state() {
+    # $1=disk $2=mode $3=phase $4=pct $5=bad $6=eta_s $7=verdict
+    s="$WORK_DIR/state-$(basename "$1")"
+    echo "$2|$3|$4|$5|$6|$7" > "$s.tmp" && mv "$s.tmp" "$s"
+}
+
+# ---- MAC interface principale ---------------------------------------------
+MAIN_IF=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+[ -z "$MAIN_IF" ] && MAIN_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$' | head -1)
+MAC=$(cat /sys/class/net/"$MAIN_IF"/address 2>/dev/null)
+[ -z "$MAC" ] && MAC="00:00:00:00:00:00"
+
+echo "================================================================"
+echo " Disktest boot — interface=$MAIN_IF mac=$MAC"
+echo "================================================================"
+
+# ---- Fetch job ------------------------------------------------------------
+JOB_FILE=/tmp/disktest-job.json
+if ! wget -q -O "$JOB_FILE" "$API_BASE/disktest-job?mac=$MAC"; then
+    echo "[FATAL] Impossible de fetch /api/disktest-job pour MAC $MAC"
+    exit 0
+fi
+# BEGIN disktest-job-parse
+JOB_BODY=$(tr -d '\n' < "$JOB_FILE" | tr -s ' ')
+echo "Job reçu : $JOB_BODY"
+
+TEST_ID=$(echo "$JOB_BODY" | sed -n 's/.*"test_id"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')
+ACTION_ID=$(echo "$JOB_BODY" | sed -n 's/.*"action_id"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')
+PARALLEL=$(echo "$JOB_BODY" | sed -n 's/.*"parallel"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
+POST_ACTION=$(echo "$JOB_BODY" | sed -n 's/.*"post_action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+# Extrait la liste jobs : on cherche le contenu entre "jobs":[ ... ] (gourmand jusqu'au crochet fermant)
+JOBS_RAW=$(echo "$JOB_BODY" | sed -n 's/.*"jobs"[[:space:]]*:[[:space:]]*\[\(.*\)\][[:space:]]*,[[:space:]]*"post_action".*/\1/p')
+# Si le pattern ne match pas (ordre différent), tente une autre forme
+[ -z "$JOBS_RAW" ] && JOBS_RAW=$(echo "$JOB_BODY" | sed -n 's/.*"jobs"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p')
+
+[ -z "$POST_ACTION" ] && POST_ACTION="poweroff"
+[ -z "$PARALLEL" ] && PARALLEL="false"
+
+if [ -z "$TEST_ID" ] || [ "$TEST_ID" -le 0 ] 2>/dev/null || [ -z "$JOBS_RAW" ]; then
+    echo "[FATAL] Job mal formé : test_id='$TEST_ID' jobs_raw='$JOBS_RAW'"
+    wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=0&line=fatal_parse_failed" 2>/dev/null || true
+    exit 0
+fi
+
+log_line "Test job #$TEST_ID démarré (parallel=$PARALLEL post_action=$POST_ACTION)"
+
+# URL de suivi affichée sur l'écran : la page action /tasks/{id} (canonique,
+# avec contrôles) ; repli /disktests si le job n'a pas d'action rattachée.
+TRACK_URL="http://$ORCH_IP/disktests/$TEST_ID"
+if [ -n "$ACTION_ID" ] && [ "$ACTION_ID" -gt 0 ] 2>/dev/null; then
+    TRACK_URL="http://$ORCH_IP/tasks/$ACTION_ID"
+fi
+
+# Parse les paires {"disk":"X","mode":"Y"} → on stocke "disk|mode" par ligne dans /tmp/dt-jobs.txt
+JOBS_FILE=/tmp/dt-jobs.txt
+: > "$JOBS_FILE"
+echo "$JOBS_RAW" | tr -d ' ' | sed 's/}{/\n/g; s/}/\n/g; s/{//g' | while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    d=$(echo "$entry" | sed -n 's/.*"disk":"\([^"]*\)".*/\1/p')
+    m=$(echo "$entry" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+    sb=$(echo "$entry" | sed -n 's/.*"serial_b64":"\([^"]*\)".*/\1/p')
+    [ -z "$sb" ] && sb="-"
+    [ -n "$d" ] && [ -n "$m" ] && echo "$d|$m|$sb" >> "$JOBS_FILE"
+done
+
+JOB_COUNT=$(wc -l < "$JOBS_FILE" | tr -d ' ')
+log_line "Tests planifiés : $JOB_COUNT"
+[ "$JOB_COUNT" -eq 0 ] && { log_line "[FATAL] Aucun test parsé"; exit 0; }
+# END disktest-job-parse
+
+# ---- Téléchargement des binaires statiques --------------------------------
+log_line "Téléchargement de smartctl + badblocks depuis $STATIC_BIN_BASE"
+SMARTCTL=$WORK_DIR/smartctl
+BADBLOCKS=$WORK_DIR/badblocks
+
+if wget -q -O "$SMARTCTL" "$STATIC_BIN_BASE/smartctl" && [ -s "$SMARTCTL" ]; then
+    chmod +x "$SMARTCTL"
+    log_line "  smartctl : OK ($(wc -c < "$SMARTCTL") octets)"
+else
+    log_line "  [WARN] smartctl introuvable — les modes smart_* échoueront"
+    SMARTCTL=""
+fi
+
+if wget -q -O "$BADBLOCKS" "$STATIC_BIN_BASE/badblocks" && [ -s "$BADBLOCKS" ]; then
+    chmod +x "$BADBLOCKS"
+    log_line "  badblocks : OK ($(wc -c < "$BADBLOCKS") octets)"
+else
+    # Fallback : badblocks peut être déjà dans /usr/sbin sur d-i
+    if command -v badblocks >/dev/null 2>&1; then
+        BADBLOCKS=$(command -v badblocks)
+        log_line "  badblocks : utilise binaire système ($BADBLOCKS)"
+    else
+        log_line "  [WARN] badblocks introuvable — les modes badblocks_* échoueront"
+        BADBLOCKS=""
+    fi
+fi
+
+# ---- Garde d'identité par numéro de série -----------------------------------
+# Un test n'a de valeur que sur le bon disque : une lecture sur le mauvais disque
+# produit un rapport de fiabilité faux, une écriture efface le mauvais disque. Les
+# noms /dev/sdX changent d'un démarrage à l'autre, le numéro de série non.
+# BEGIN disktest-identity-guard
+SYS_BLOCK="${DISKTEST_SYS_BLOCK:-/sys/block}"
+SYS_NVME="${DISKTEST_SYS_NVME:-/sys/class/nvme}"
+
+norm_serial() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+}
+valid_serial() {
+    case "$1" in ''|0|UNKNOWN|N/A|NA|NONE|NULL|DEFAULT|"NOT AVAILABLE") return 1 ;; esac
+    return 0
+}
+# Même ordre de sources que le discovery : sysfs, contrôleur NVMe, puis smartctl -i.
+read_disk_serial() {
+    rds_dir="$1"; rds_base="${rds_dir##*/}"
+    rds_s=$(norm_serial "$(cat "$rds_dir/device/serial" 2>/dev/null)")
+    valid_serial "$rds_s" || rds_s=""
+    if [ -z "$rds_s" ]; then
+        rds_ctrl=$(printf '%s' "$rds_base" | sed -n 's/^\(nvme[0-9][0-9]*\)n[0-9][0-9]*$/\1/p')
+        [ -n "$rds_ctrl" ] && rds_s=$(norm_serial "$(cat "$SYS_NVME/$rds_ctrl/serial" 2>/dev/null)")
+        valid_serial "$rds_s" || rds_s=""
+    fi
+    if [ -z "$rds_s" ] && [ -n "$SMARTCTL" ]; then
+        rds_s=$("$SMARTCTL" -i "/dev/$rds_base" 2>/dev/null | sed -n 's/^[Ss]erial [Nn]umber:[[:space:]]*//p' | head -1)
+    fi
+    norm_serial "$rds_s"
+}
+# Imprime le nom du disque dont la série vaut $1. Code 0 = exactement un,
+# 1 = aucun (absent, illisible ou différent), 2 = plusieurs (ambigu).
+find_disk_by_serial() {
+    fds_expected="$1"; fds_match=""; fds_count=0
+    for fds_cand in "$SYS_BLOCK"/*; do
+        [ -e "$fds_cand/size" ] || continue
+        fds_name=$(basename "$fds_cand")
+        case "$fds_name" in loop*|ram*|dm-*|md*|sr*|fd*|zram*|nbd*|mmcblk*boot*|mmcblk*gp*|mmcblk*rpmb) continue ;; esac
+        fds_serial=$(read_disk_serial "$fds_cand")
+        valid_serial "$fds_serial" || continue
+        [ "$fds_serial" = "$fds_expected" ] || continue
+        fds_match="$fds_name"; fds_count=$((fds_count + 1))
+    done
+    printf '%s' "$fds_match"
+    [ "$fds_count" -eq 1 ] && return 0
+    [ "$fds_count" -eq 0 ] && return 1
+    return 2
+}
+# Vérifie TOUS les jobs avant le premier test. $1 = "chemin|mode|serial_b64" par
+# ligne, $2 = sortie "chemin|mode|/dev/nom" ("-" à la place du nom si refusé).
+# Code 1 si au moins un job est refusé : l'appelant n'en lance alors aucun.
+# Chaque job laisse dev-<clé> (périphérique vérifié, "-" si refusé) et serial-<clé> dans
+# $WORK_DIR : la bannière affiche le disque réellement testé, pas le chemin du job.
+vjt_refuse() {
+    echo "$1|$2|-" >> "$vjt_out"; echo "-" > "$WORK_DIR/dev-$(basename "$1")"; vjt_bad=1
+}
+verify_job_targets() {
+    vjt_in="$1"; vjt_out="$2"; vjt_bad=0; : > "$vjt_out"
+    while IFS='|' read -r vjt_disk vjt_mode vjt_b64; do
+        [ -z "$vjt_disk" ] && continue
+        if [ -z "$vjt_b64" ] || [ "$vjt_b64" = "-" ]; then
+            log_line "[BLOCKED] $vjt_disk : identité série absente du job (créé avant la garde ? relancez-le depuis un discovery)"
+            vjt_refuse "$vjt_disk" "$vjt_mode"; continue
+        fi
+        vjt_expected=$(printf '%s' "$vjt_b64" | base64 -d 2>/dev/null || printf '%s' "$vjt_b64" | base64 -D 2>/dev/null)
+        vjt_expected=$(norm_serial "$vjt_expected")
+        if ! valid_serial "$vjt_expected"; then
+            log_line "[BLOCKED] $vjt_disk : identité série du job invalide"
+            vjt_refuse "$vjt_disk" "$vjt_mode"; continue
+        fi
+        vjt_name=$(find_disk_by_serial "$vjt_expected"); vjt_rc=$?
+        if [ "$vjt_rc" -ne 0 ]; then
+            if [ "$vjt_rc" -eq 1 ]; then vjt_reason="aucun disque ne porte la série attendue (absent, illisible ou différent)"; else vjt_reason="numéro de série ambigu (plusieurs disques)"; fi
+            log_line "[BLOCKED] $vjt_disk : $vjt_reason"
+            vjt_refuse "$vjt_disk" "$vjt_mode"; continue
+        fi
+        if [ "$vjt_disk" != "/dev/$vjt_name" ]; then
+            log_line "Disque remappé par numéro de série : $vjt_disk → /dev/$vjt_name"
+        fi
+        log_line "  $vjt_disk → /dev/$vjt_name (série $vjt_expected)"
+        echo "$vjt_disk|$vjt_mode|/dev/$vjt_name" >> "$vjt_out"
+        echo "/dev/$vjt_name" > "$WORK_DIR/dev-$(basename "$vjt_disk")"
+        echo "$vjt_expected" > "$WORK_DIR/serial-$(basename "$vjt_disk")"
+    done < "$vjt_in"
+    return "$vjt_bad"
+}
+# END disktest-identity-guard
+
+# ---- Helpers d'exécution par mode -----------------------------------------
+# Renvoie verdict (passed/failed/unknown) + bad_blocks (entier)
+# Format de retour : "verdict|bad_blocks|duration_s"
+# BEGIN disktest-smart-proof
+# Les journaux sont une HISTOIRE, pas l'état courant : une ancienne entrée saine
+# ou « in progress » ne prouve ni le lancement ni l'achèvement du nouveau test.
+smart_sample() {
+    ss_prefix="$1"
+    if [ "$rs_protocol" = nvme ]; then
+        LC_ALL=C "$SMARTCTL" -l selftest "$rdev" > "$ss_prefix.log" 2>&1
+        rs_log_rc=$?
+        cp "$ss_prefix.log" "$ss_prefix.cap"
+        rs_cap_rc=$rs_log_rc
+    else
+        LC_ALL=C "$SMARTCTL" -c "$rdev" > "$ss_prefix.cap" 2>&1
+        rs_cap_rc=$?
+        # Demande le journal étendu, avec repli standard natif de smartctl.
+        LC_ALL=C "$SMARTCTL" -l xselftest,selftest "$rdev" > "$ss_prefix.log" 2>&1
+        rs_log_rc=$?
+    fi
+}
+
+smart_current_state() {
+    scs_file="$1"
+    if [ "$rs_protocol" = nvme ]; then
+        scs_line=$(sed -n 's/^Self-test status:[[:space:]]*//p' "$scs_file" | head -1)
+        case "$scs_line" in
+            "No self-test in progress"*) echo 'stopped|0' ;;
+            "Short self-test in progress"*|"Extended self-test in progress"*)
+                case "$selftype:$scs_line" in
+                    short:Short*|long:Extended*)
+                        scs_pct=$(printf '%s\n' "$scs_line" | sed -n 's/.*(\([0-9][0-9]*\)% completed).*/\1/p')
+                        case "$scs_pct" in ''|*[!0-9]*) scs_pct=0 ;; esac
+                        echo "running|$scs_pct" ;;
+                    *) echo 'other|0' ;;
+                esac ;;
+            *) echo 'unknown|0' ;;
+        esac
+    else
+        scs_code=$(sed -n 's/^[[:space:]]*Self-test execution status:[[:space:]]*([[:space:]]*\([0-9][0-9]*\)).*/\1/p' "$scs_file" | head -1)
+        case "$scs_code" in ''|*[!0-9]*) echo 'unknown|0'; return ;; esac
+        if [ "$scs_code" -ge 240 ] && [ "$scs_code" -le 255 ] \
+            && grep -q 'Self-test routine in progress' "$scs_file"; then
+            echo "running|$((100 - (scs_code % 16) * 10))"
+        elif [ "$scs_code" -lt 16 ]; then
+            echo 'stopped|0'
+        elif [ "$scs_code" -lt 64 ]; then
+            echo 'interrupted|0'
+        elif [ "$scs_code" -lt 144 ]; then
+            echo 'failed|0'
+        else
+            echo 'unknown|0'
+        fi
+    fi
+}
+
+smart_latest_entry() {
+    if [ "$rs_protocol" = nvme ]; then
+        # NVMe numérote à partir de 0 et n'ajoute pas de # à ses lignes.
+        sed -n '/^[[:space:]]*0[[:space:]]/p' "$1" | head -1 | tr -s '[:space:]' ' '
+    else
+        sed -n '/^[[:space:]]*#[[:space:]]*1[[:space:]]/p' "$1" | head -1 | tr -s '[:space:]' ' '
+    fi
+}
+
+smart_entry_matches_type() {
+    semt_type=Short; [ "$selftype" = long ] && semt_type=Extended
+    printf '%s\n' "$1" | grep -qE "^[[:space:]]*(#[[:space:]]*1|0)[[:space:]]+$semt_type([[:space:]]|$)"
+}
+
+smart_proof_result() {
+    dur=$(( $(date +%s) - t_start ))
+    printf '{"schema":1,"tool":"smartctl","status":"%s","type":"%s","passed":%s,"start_exit_code":%s,"seen_running":%s,"new_entry":%s}\n' \
+        "$rs_status" "$selftype" "$rs_passed" "$rs_start_rc" "$rs_seen_running" "$rs_new_entry" \
+        > "$WORK_DIR/evidence-$(basename "$rdisk").json"
+    rs_final_pct=$rs_pct; [ "$rs_status" = completed ] && rs_final_pct=100
+    post_progress "$rdisk" "done" "$rs_final_pct" 1 0 "$dur" 0
+    write_state "$rdisk" "smart_$selftype" "done" "$rs_final_pct" 0 0 "$v"
+    echo "$v|0|$dur"
+}
+
+run_smart() {
+    rdisk="$1"     # clé du job (suivi serveur et banner)
+    selftype="$2"  # short | long
+    rdev="$3"       # périphérique vérifié par numéro de série (jamais le chemin du job)
+    t_start=$(date +%s)
+    rs_status=unknown; rs_passed=null; rs_start_rc=-1
+    rs_seen_running=false; rs_new_entry=false; rs_pct=0; v=unknown
+    rs_prefix="$WORK_DIR/smart-$(basename "$rdisk")-$selftype"
+    rm -f "$WORK_DIR/evidence-$(basename "$rdisk").json" \
+        "$rs_prefix-before.cap" "$rs_prefix-before.log" "$rs_prefix-after.cap" "$rs_prefix-after.log" "$rs_prefix-start.log"
+    [ -b "$rdev" ] || { smart_proof_result; return; }
+    [ -n "$SMARTCTL" ] || { smart_proof_result; return; }
+    rs_expected=$(cat "$WORK_DIR/serial-$(basename "$rdisk")" 2>/dev/null)
+    if ! valid_serial "$rs_expected" || [ "$(read_disk_serial "$SYS_BLOCK/${rdev##*/}")" != "$rs_expected" ]; then
+        log_line "  [BLOCKED] SMART : numéro de série absent ou différent pour $rdev"
+        smart_proof_result; return
+    fi
+    case "${rdev##*/}" in nvme*) rs_protocol=nvme ;; *) rs_protocol=ata ;; esac
+    smart_sample "$rs_prefix-before"
+    # Les bits 0..2 sont des erreurs de commande/accès. Les bits supérieurs
+    # décrivent la santé ou d'anciennes erreurs du disque, pas un refus de -t.
+    if [ "$((rs_cap_rc & 3))" -eq 0 ] \
+        && grep -qiE '^(No Self-test supported\.|[[:space:]]*No Self-test supported\.|Self-tests not supported|Self-test functions not supported)' "$rs_prefix-before.cap"; then
+        rs_status=unsupported; smart_proof_result; return
+    fi
+    rs_before_state=$(smart_current_state "$rs_prefix-before.cap")
+    # Ne remplace et n'annule jamais un autotest qui tournait avant notre job.
+    case "${rs_before_state%%|*}" in stopped|failed|interrupted) rs_before_terminal=1 ;; *) rs_before_terminal=0 ;; esac
+    if [ "$((rs_cap_rc & 7))" -ne 0 ] || [ "$((rs_log_rc & 3))" -ne 0 ] \
+        || [ "$rs_before_terminal" -ne 1 ]; then
+        log_line "  [SMART] état initial illisible ou autotest déjà en cours : aucun lancement"
+        smart_proof_result; return
+    fi
+    rs_before_entry=$(smart_latest_entry "$rs_prefix-before.log")
+    if [ -z "$rs_before_entry" ] \
+        && ! grep -qiE 'No self-tests have been logged|No Self-tests Logged' "$rs_prefix-before.log"; then
+        log_line "  [SMART] journal initial inexploitable : aucun lancement"
+        smart_proof_result; return
+    fi
+    log_line "  SMART $selftype: lance le selftest sur $rdev"
+    LC_ALL=C "$SMARTCTL" -t "$selftype" "$rdev" > "$rs_prefix-start.log" 2>&1
+    rs_start_rc=$?
+    if grep -qiE '^(Self-tests not supported|Self-test functions not supported)' "$rs_prefix-start.log" \
+        && [ "$((rs_start_rc & 3))" -eq 0 ]; then
+        rs_status=unsupported; smart_proof_result; return
+    fi
+    if [ "$((rs_start_rc & 7))" -ne 0 ] \
+        || ! grep -qE '^(Testing has begun|Self-test has begun|Short Background Self Test has begun|Extended Background Self Test has begun)' "$rs_prefix-start.log"; then
+        log_line "  [SMART] lancement non confirmé (rc=$rs_start_rc)"
+        smart_proof_result; return
+    fi
+    # Interroge l'état firmware tout de suite, puis toutes les 20 s. Le journal
+    # standard/étendu/NVMe sert uniquement à vérifier l'entrée finale du bon type.
+    poll=0
+    max_poll=2160  # ticks de 20 s = ~12 h max
+    while [ "$poll" -lt "$max_poll" ]; do
+        if [ -f "$WORK_DIR/abort" ]; then
+            LC_ALL=C "$SMARTCTL" -X "$rdev" >/dev/null 2>&1
+            rs_status=interrupted; v=aborted; smart_proof_result; return
+        fi
+        if [ "$(read_disk_serial "$SYS_BLOCK/${rdev##*/}")" != "$rs_expected" ]; then
+            log_line "  [BLOCKED] SMART : identité changée pendant le test"
+            smart_proof_result; return
+        fi
+        smart_sample "$rs_prefix-after"
+        if [ "$(read_disk_serial "$SYS_BLOCK/${rdev##*/}")" != "$rs_expected" ]; then
+            log_line "  [BLOCKED] SMART : identité changée pendant le relevé final"
+            smart_proof_result; return
+        fi
+        if [ "$((rs_cap_rc & 7))" -ne 0 ] || [ "$((rs_log_rc & 3))" -ne 0 ]; then
+            log_line "  [SMART] lecture de l'état courant impossible"
+            smart_proof_result; return
+        fi
+        rs_current=$(smart_current_state "$rs_prefix-after.cap")
+        rs_state=${rs_current%%|*}
+        rs_after_entry=$(smart_latest_entry "$rs_prefix-after.log")
+        rs_new_entry=false
+        if smart_entry_matches_type "$rs_after_entry" && [ "$rs_after_entry" != "$rs_before_entry" ]; then rs_new_entry=true; fi
+        if [ "$rs_state" = interrupted ]; then
+            rs_status=interrupted; smart_proof_result; return
+        elif [ "$rs_state" = stopped ] || [ "$rs_state" = failed ]; then
+            if smart_entry_matches_type "$rs_after_entry" \
+                && { [ "$rs_new_entry" = true ] || [ "$rs_seen_running" = true ]; }; then
+                case "$rs_after_entry" in
+                    *"Completed without error"*)
+                        if [ "$rs_state" = stopped ]; then rs_status=completed; rs_passed=true; v=passed; fi ;;
+                    *"Completed:"*) rs_status=completed; rs_passed=false; v=failed ;;
+                    *Aborted*|*Interrupted*|*"Fatal or unknown"*) rs_status=interrupted ;;
+                esac
+            fi
+            smart_proof_result; return
+        elif [ "$rs_state" = running ]; then
+            rs_seen_running=true
+            rs_pct=${rs_current#*|}
+            [ "$rs_pct" -gt 100 ] && rs_pct=100
+        else
+            # État réservé/illisible ou autre test NVMe : aucune preuve valide.
+            smart_proof_result; return
+        fi
+        elapsed=$(( $(date +%s) - t_start ))
+        eta=0; [ "$rs_pct" -gt 0 ] && eta=$(( elapsed * (100 - rs_pct) / rs_pct ))
+        post_progress "$rdisk" "smart" "$rs_pct" 1 0 "$elapsed" "$eta"
+        write_state "$rdisk" "smart_$selftype" "smart" "$rs_pct" 0 "$eta" ""
+        poll=$((poll + 1))
+        sleep 20
+    done
+    LC_ALL=C "$SMARTCTL" -X "$rdev" >/dev/null 2>&1
+    log_line "  [SMART] délai maximal atteint : test interrompu, résultat indéterminé"
+    rs_status=interrupted; smart_proof_result
+}
+# END disktest-smart-proof
+
+run_badblocks() {
+    rdisk="$1"      # clé du job (suivi serveur et banner)
+    rmode="$2"      # quick_ro | long_ro | fixed_rw | quick_rw | long_rw
+    rdev="$3"       # périphérique vérifié par numéro de série (jamais le chemin du job)
+    [ -b "$rdev" ] || { echo "failed|0|0"; return; }
+    [ -z "$BADBLOCKS" ] && { echo "failed|0|0"; return; }
+    # RO = lecture PURE (-sv). L'ancien -n « non-destructif » ÉCRIVAIT sur le
+    # disque (motifs + réécriture de l'original) : ×4 plus lent et risqué sur un
+    # disque mourant, pour un label UI qui promettait « lecture seule ».
+    # RW : la réallocation firmware se déclenche à l'ÉCRITURE — 1 motif suffit
+    # pour réallouer. fixed_rw = 0xaa (qualification HDD, équivalent write1fixed).
+    # quick_rw = motif aléatoire (déjoue la compression des
+    # contrôleurs SSD) ; long_rw = 0xaa puis 0x55 (chaque bit testé à 0 ET à 1,
+    # sans l'usure des 4 motifs d'usine). long_ro gardé pour d'anciens jobs.
+    case "$rmode" in
+        quick_ro) opts="-sv"                    ; ro=1 ; expected_passes=1 ; expected_patterns=0 ; patterns_json='[]' ;;
+        long_ro)  opts="-sv -p 4"               ; ro=1 ; expected_passes=4 ; expected_patterns=0 ; patterns_json='[]' ;;
+        fixed_rw) opts="-wsv -t 0xaa"           ; ro=0 ; expected_passes=1 ; expected_patterns=1 ; patterns_json='["0xaa"]' ;;
+        quick_rw) opts="-wsv -t random"         ; ro=0 ; expected_passes=1 ; expected_patterns=1 ; patterns_json='["random"]' ;;
+        long_rw)  opts="-wsv -t 0xaa -t 0x55"   ; ro=0 ; expected_passes=1 ; expected_patterns=2 ; patterns_json='["0xaa","0x55"]' ;;
+        *) echo "failed|0|0"; return ;;
+    esac
+    base=$(basename "$rdisk")
+    bad_file="$WORK_DIR/bb-$base.bad"    # STDOUT badblocks = numéros de blocs défectueux, 1/ligne
+    err_file="$WORK_DIR/bb-$base.err"    # STDERR = progression \b/\r + annonces de phase
+    t_start=$(date +%s)
+    log_line "  badblocks $rmode: lance sur $rdev (opts=$opts)"
+    # Le protocole de progression/preuve lit les marqueurs anglais du binaire.
+    LC_ALL=C "$BADBLOCKS" $opts "$rdev" >"$bad_file" 2>"$err_file" &
+    bbpid=$!
+    while kill -0 "$bbpid" 2>/dev/null; do
+        sleep 10
+        # Annulation admin (drapeau posé par post_progress) : stoppe badblocks net.
+        if [ -f "$WORK_DIR/abort" ]; then
+            kill "$bbpid" 2>/dev/null
+            wait "$bbpid" 2>/dev/null
+            write_state "$rdisk" "$rmode" "done" 0 0 0 "aborted"
+            echo "aborted|0|0"
+            return
+        fi
+        bad=$(wc -l < "$bad_file" 2>/dev/null | tr -d ' '); [ -z "$bad" ] && bad=0
+        # badblocks réécrit « NN.NN% done » par-dessus lui-même avec des \b sans
+        # newline : normaliser en lignes pour attraper la DERNIÈRE mesure (c'est
+        # ce que l'ancien poll wc -l ne voyait jamais).
+        flat=$(tr '\b\r' '\n\n' < "$err_file" 2>/dev/null)
+        pct=$(echo "$flat" | grep -o '[0-9][0-9]*\.[0-9][0-9]*% done' | tail -1 | cut -d. -f1)
+        case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+        if [ "$ro" -eq 1 ]; then
+            phase="read"
+        else
+            # -w annonce chaque phase : « Testing with pattern 0xaa » (écriture)
+            # puis « Reading and comparing » (relecture). Le % repart à 0 à chaque
+            # phase → on remonte phase + % de phase, jamais un faux % global.
+            # « Testing with pattern 0xaa » (motif fixe) OU « Testing with
+            # random pattern » (-t random) : l'ordre des mots diffère.
+            nwrite=$(grep -c 'Testing with.*pattern' "$err_file" 2>/dev/null); [ -z "$nwrite" ] && nwrite=0
+            nread=$(echo "$flat" | grep -c 'Reading and comparing'); [ -z "$nread" ] && nread=0
+            if [ "$nread" -gt 0 ] && [ "$nread" -ge "$nwrite" ]; then phase="verify$nread"
+            elif [ "$nwrite" -gt 0 ]; then phase="write$nwrite"
+            else phase="init"; fi
+        fi
+        elapsed=$(( $(date +%s) - t_start ))
+        eta=0
+        [ "$pct" -gt 0 ] && eta=$(( elapsed * (100 - pct) / pct ))
+        post_progress "$rdisk" "$phase" "$pct" 1 "$bad" "$elapsed" "$eta"
+        write_state "$rdisk" "$rmode" "$phase" "$pct" "$bad" "$eta" ""
+    done
+    wait "$bbpid"
+    rc=$?
+    dur=$(( $(date +%s) - t_start ))
+    bad=$(wc -l < "$bad_file" 2>/dev/null | tr -d ' '); [ -z "$bad" ] && bad=0
+    # Croise avec le résumé stderr « Pass completed, N bad blocks found » (au cas
+    # où des blocs auraient été détectés sans numéro listé sur stdout).
+    sb=$(tr '\b\r' '\n\n' < "$err_file" 2>/dev/null | grep -oE '[0-9]+ bad block' | tail -1 | awk '{print $1}')
+    if [ -n "$sb" ] && [ "$sb" -gt "$bad" ] 2>/dev/null; then bad=$sb; fi
+    # Un pourcentage ou rc=0 seul n'est pas une preuve de couverture complète.
+    # e2fsprogs émet « Pass completed » après tous les motifs de la passe ;
+    # on exige aussi toutes les phases écriture/relecture attendues en RW.
+    flat=$(tr '\b\r' '\n\n' < "$err_file" 2>/dev/null)
+    pass_count=$(printf '%s\n' "$flat" | grep -cE '^Pass completed, [0-9]+ bad blocks found\.'); [ -z "$pass_count" ] && pass_count=0
+    nwrite=$(printf '%s\n' "$flat" | grep -c 'Testing with.*pattern'); [ -z "$nwrite" ] && nwrite=0
+    nread=$(printf '%s\n' "$flat" | grep -c 'Reading and comparing'); [ -z "$nread" ] && nread=0
+    completed=false
+    if [ "$rc" -eq 0 ] && [ "$pass_count" -ge "$expected_passes" ] \
+        && ! printf '%s\n' "$flat" | grep -qiE 'Interrupted|aborting test'; then
+        if [ "$ro" -eq 1 ] || { [ "$nwrite" -eq "$expected_patterns" ] && [ "$nread" -eq "$expected_patterns" ]; }; then
+            completed=true
+        fi
+    fi
+    evidence_status=interrupted; [ "$completed" = true ] && evidence_status=completed
+    # Le résumé expose erreurs de lecture/écriture/comparaison ; null si absent.
+    error_counts=$(printf '%s\n' "$flat" | sed -n 's/.*(\([0-9][0-9]*\)\/\([0-9][0-9]*\)\/\([0-9][0-9]*\) errors).*/\1 \2 \3/p' | tail -1)
+    errors=null
+    if [ -n "$error_counts" ]; then
+        errors=$(printf '%s\n' "$error_counts" | awk '{ print $1 + $2 + $3 }')
+    fi
+    # Les stalls ne sont pas mesurés par ce worker : null, jamais zéro supposé.
+    printf '{"schema":1,"tool":"badblocks","status":"%s","exit_code":%s,"pass_completed":%s,"passes_completed":%s,"patterns":%s,"write_phases":%s,"verify_phases":%s,"errors":%s,"bad_blocks":%s,"stalls":null}\n' \
+        "$evidence_status" "$rc" "$completed" "$pass_count" "$patterns_json" "$nwrite" "$nread" "$errors" "$bad" \
+        > "$WORK_DIR/evidence-$base.json"
+    if [ "$bad" -gt 0 ] || { [ "$errors" != null ] && [ "$errors" -gt 0 ]; }; then v=failed
+    elif [ "$completed" = true ] && [ "$errors" = 0 ]; then v=passed
+    else v=unknown; fi
+    post_progress "$rdisk" "done" 100 1 "$bad" "$dur" 0
+    write_state "$rdisk" "$rmode" "done" 100 "$bad" 0 "$v"
+    echo "$v|$bad|$dur"
+}
+
+run_one_test() {
+    onedisk="$1"   # clé du job
+    onemode="$2"
+    onedev="$3"    # périphérique vérifié par numéro de série
+    # Un refus ou une sortie anticipée ne peut pas réutiliser une preuve d'un
+    # ancien job, même si le répertoire de travail a survécu à cette exécution.
+    rm -f "$WORK_DIR/evidence-$(basename "$onedisk").json"
+    log_line "▶ Démarrage test : $onedisk ($onedev) · $onemode"
+    if [ ! -b "$onedev" ]; then
+        log_line "  [SKIP] $onedev : block device introuvable"
+        post_result "$onedisk" "$onemode" "failed" 0 0 "$onedev"
+        echo "failed" > "$WORK_DIR/verdict-$(basename "$onedisk")"
+        return
+    fi
+    capture_smart "$onedisk" "$onedev" before
+    # tail -n 1 : les log_line internes aux run_* sortent aussi sur stdout et
+    # polluaient la substitution — le triplet verdict|bad|dur est la DERNIÈRE ligne.
+    case "$onemode" in
+        smart_short)        result=$(run_smart "$onedisk" "short" "$onedev" | tail -n 1) ;;
+        smart_long)         result=$(run_smart "$onedisk" "long" "$onedev" | tail -n 1) ;;
+        badblocks_quick_ro) result=$(run_badblocks "$onedisk" "quick_ro" "$onedev" | tail -n 1) ;;
+        badblocks_long_ro)  result=$(run_badblocks "$onedisk" "long_ro" "$onedev" | tail -n 1) ;;
+        badblocks_fixed_rw) result=$(run_badblocks "$onedisk" "fixed_rw" "$onedev" | tail -n 1) ;;
+        badblocks_quick_rw) result=$(run_badblocks "$onedisk" "quick_rw" "$onedev" | tail -n 1) ;;
+        badblocks_long_rw)  result=$(run_badblocks "$onedisk" "long_rw" "$onedev" | tail -n 1) ;;
+        *) result="unknown|0|0" ;;
+    esac
+    verdict=$(echo "$result" | cut -d'|' -f1)
+    bad=$(echo "$result" | cut -d'|' -f2)
+    dur=$(echo "$result" | cut -d'|' -f3)
+    if [ "$verdict" = "aborted" ]; then
+        # Le serveur a déjà acté l'annulation. Envoie seulement sa preuve si le
+        # runner en a produit une, avec verdict unknown (jamais une réussite).
+        evidence=$(cat "$WORK_DIR/evidence-$(basename "$onedisk").json" 2>/dev/null)
+        [ -z "$evidence" ] || post_result "$onedisk" "$onemode" "unknown" "$bad" "$dur" "$onedev" "$evidence"
+        log_line "✕ Annulé : $onedisk · $onemode"
+        echo "aborted" > "$WORK_DIR/verdict-$(basename "$onedisk")"
+        return
+    fi
+    capture_smart "$onedisk" "$onedev" after
+    log_line "✓ Fini : $onedisk · $onemode → $verdict (bad=$bad, ${dur}s)"
+    evidence=$(cat "$WORK_DIR/evidence-$(basename "$onedisk").json" 2>/dev/null)
+    post_result "$onedisk" "$onemode" "$verdict" "$bad" "$dur" "$onedev" "$evidence"
+    # Verdict posé en FICHIER : en mode parallèle run_one_test tourne en sous-shell,
+    # une variable n'atteindrait jamais l'agrégat final (bug historique : verdict
+    # global toujours « success »).
+    echo "$verdict" > "$WORK_DIR/verdict-$(basename "$onedisk")"
+}
+
+# ---- Banner TTY : suivi visuel sur l'écran de la machine -------------------
+# BEGIN disktest-banner
+# Pattern repris de discover.sh (chvt tty4 + reset + cursor home + clear-to-end ;
+# dupliqué sciemment : le banner discovery est couplé à ses propres variables).
+echo 1 > /proc/sys/kernel/printk 2>/dev/null || true
+HAVE_CHVT=0
+if wget -q -O "$WORK_DIR/chvt" "$STATIC_BIN_BASE/chvt" 2>/dev/null; then
+    chmod +x "$WORK_DIR/chvt" 2>/dev/null
+    HAVE_CHVT=1
+fi
+B_COLS=0; B_ROWS=0
+_sz=$(stty -F /dev/tty4 size 2>/dev/null); set -- $_sz
+case "${1:-x}" in ''|*[!0-9]*) ;; *) case "${2:-x}" in ''|*[!0-9]*) ;; *) B_ROWS=$1; B_COLS=$2 ;; esac ;; esac
+[ "${B_COLS:-0}" -le 0 ] 2>/dev/null && { B_COLS=100; B_ROWS=37; }
+PADX=$(( (B_COLS - 100) / 2 )); [ "$PADX" -lt 0 ] && PADX=0
+PADY=$(( (B_ROWS - 30) / 2 )); [ "$PADY" -lt 0 ] && PADY=0
+LPAD=""; [ "$PADX" -gt 0 ] && LPAD=$(printf "%${PADX}s" "")
+
+# Barre ASCII 30 colonnes (pas d'UTF-8 exotique : console d-i).
+draw_bar() {
+    f=$(( ${1:-0} * 30 / 100 )); i=0; b=""
+    while [ $i -lt 30 ]; do
+        if [ $i -lt $f ]; then b="${b}#"; else b="${b}."; fi
+        i=$((i+1))
+    done
+    printf '%s' "$b"
+}
+
+# Total de motifs/passes par mode → affichage « motif 1/2 ».
+dt_mode_total() {
+    case "$1" in
+        *long_rw)  echo 2 ;;
+        *long_ro)  echo 4 ;;
+        *)         echo 1 ;;
+    esac
+}
+
+# Libellé court du type de test affiché pendant son exécution.
+dt_mode_label() {
+    case "$1" in
+        *fixed_rw)        echo "qualification HDD motif fixe (efface)" ;;
+        *quick_rw)        echo "REPARATION (efface)" ;;
+        *long_rw)         echo "REPARATION approfondie (efface)" ;;
+        *_ro)             echo "verification lecture seule" ;;
+        smart_*)          echo "autodiagnostic SMART" ;;
+        *)                echo "$1" ;;
+    esac
+}
+
+dt_phase_label() {
+    t=$(dt_mode_total "${2:-}")
+    case "$1" in
+        read)    echo "lecture du disque" ;;
+        smart)   echo "autodiagnostic en cours" ;;
+        write*)  echo "ecriture motif ${1#write}/$t" ;;
+        verify*) echo "verification motif ${1#verify}/$t" ;;
+        done)    echo "termine" ;;
+        *)       echo "preparation" ;;
+    esac
+}
+
+DT_RENDERED_ONCE=0
+render_dt_banner() {
+    if [ "$DT_RENDERED_ONCE" -eq 0 ]; then
+        printf '\033c\033[2J\033[H\033[?25l' > /dev/tty4 2>/dev/null
+        DT_RENDERED_ONCE=1
+    else
+        printf '\033[H' > /dev/tty4 2>/dev/null
+    fi
+    {
+        _i=0; while [ "$_i" -lt "$PADY" ]; do echo; _i=$((_i + 1)); done
+        echo
+        echo "                  ================================================================"
+        echo "                                    TESTS DE DISQUE EN COURS"
+        echo "                  ================================================================"
+        echo
+        for st in "$WORK_DIR"/state-*; do
+            [ -f "$st" ] || continue
+            dkey=$(basename "$st" | sed 's/^state-//')
+            d="/dev/$dkey"
+            # Disque réellement testé (relu par numéro de série), pas le chemin du job.
+            dv=$(cat "$WORK_DIR/dev-$dkey" 2>/dev/null)
+            sn=$(cat "$WORK_DIR/serial-$dkey" 2>/dev/null)
+            [ -n "$dv" ] && [ "$dv" != "-" ] && d="$dv"
+            IFS='|' read -r smode sphase spct sbad seta sverdict < "$st"
+            case "$spct" in ''|*[!0-9]*) spct=0 ;; esac
+            case "$sbad" in ''|*[!0-9]*) sbad=0 ;; esac
+            case "$seta" in ''|*[!0-9]*) seta=0 ;; esac
+            if [ "$dv" = "-" ]; then
+                printf "                    %-12s REFUSE - numero de serie absent, ambigu ou different\n" "$d"
+                printf "                    %-12s %s\n" "" "aucun test lance (voir le journal du suivi)"
+            elif [ -n "$sverdict" ]; then
+                if [ "$sverdict" = "passed" ]; then
+                    printf "                    %-12s [%s] 100%%  OK - aucun defaut\n" "$d" "$(draw_bar 100)"
+                else
+                    printf "                    %-12s [%s] 100%%  %s - defauts: %s\n" "$d" "$(draw_bar 100)" "$sverdict" "$sbad"
+                fi
+                printf "                    %-12s %s%s\n" "" "$(dt_mode_label "$smode")" "${sn:+ · serie $sn}"
+            else
+                em=$(( seta / 60 ))
+                printf "                    %-12s [%s] %3s%%  defauts: %-5s reste ~%s min\n" "$d" "$(draw_bar "$spct")" "$spct" "$sbad" "$em"
+                printf "                    %-12s %s · %s%s\n" "" "$(dt_mode_label "$smode")" "$(dt_phase_label "$sphase" "$smode")" "${sn:+ · serie $sn}"
+            fi
+            echo
+        done
+        echo
+        echo "                    Suivi detaille : $TRACK_URL"
+        echo
+        echo "                  ================================================================"
+    } | sed "s/^/$LPAD/" > /dev/tty4 2>/dev/null || true
+    printf '\033[J' > /dev/tty4 2>/dev/null
+    [ "$HAVE_CHVT" -eq 1 ] && "$WORK_DIR/chvt" 4 2>/dev/null || true
+}
+
+# END disktest-banner
+# Sous-shell de rendu : rafraîchit toutes les 5 s jusqu'au drapeau all-done.
+# DT_RENDERED_ONCE vit dans le sous-shell (le reset plein écran n'a lieu qu'une fois).
+(
+    while [ ! -f "$WORK_DIR/all-done" ]; do
+        render_dt_banner
+        sleep 5
+    done
+    render_dt_banner
+) &
+BANNER_PID=$!
+
+# ---- Boucle principale : parallèle ou séquentiel --------------------------
+overall_status="success"
+
+# BEGIN disktest-run-gate
+# Garde d'identité : AUCUN test (lecture comme écriture) ne démarre tant que tous les
+# disques n'ont pas été retrouvés par leur numéro de série. Un refus annule tout.
+VERIFIED_FILE="$WORK_DIR/dt-jobs-verified.txt"
+if verify_job_targets "$JOBS_FILE" "$VERIFIED_FILE"; then
+    PREFLIGHT_OK=1
+else
+    PREFLIGHT_OK=0
+    log_line "[BLOCKED] Contrôle d'identité refusé : aucun test lancé, aucune écriture effectuée."
+    while IFS='|' read -r pd pm pdev; do
+        [ -z "$pd" ] && continue
+        # failed = disque refusé ; unknown = disque valide mais non testé à cause d'un autre refus.
+        if [ "$pdev" = "-" ]; then pv=failed; else pv=unknown; fi
+        post_result "$pd" "$pm" "$pv" 0 0 ""
+        write_state "$pd" "$pm" "done" 100 0 0 "$pv"
+        echo "$pv" > "$WORK_DIR/verdict-$(basename "$pd")"
+    done < "$VERIFIED_FILE"
+fi
+
+if [ "$PREFLIGHT_OK" -ne 1 ]; then
+    : # rien à lancer
+elif [ "$PARALLEL" = "true" ]; then
+    log_line "Lancement des $JOB_COUNT tests en parallèle"
+    while IFS='|' read -r d m dev; do
+        [ -z "$d" ] && continue
+        run_one_test "$d" "$m" "$dev" &
+    done < "$VERIFIED_FILE"
+    wait
+else
+    log_line "Lancement des $JOB_COUNT tests en séquentiel"
+    while IFS='|' read -r d m dev; do
+        [ -z "$d" ] && continue
+        run_one_test "$d" "$m" "$dev"
+    done < "$VERIFIED_FILE"
+fi
+# END disktest-run-gate
+
+# ---- Verdict global : agrégé depuis les fichiers verdict-* écrits par chaque
+# run_one_test (seul canal fiable en mode parallèle — les sous-shells ne peuvent
+# pas remonter de variable). Le serveur recompute de toute façon depuis
+# results_json à disktest-end : ce statut n'est qu'un fallback.
+for vf in "$WORK_DIR"/verdict-*; do
+    [ -f "$vf" ] || continue
+    if grep -q "failed" "$vf" 2>/dev/null; then
+        overall_status="failed"
+    fi
+done
+
+# Arrêt du banner : dernier rendu (verdicts affichés) puis fin du sous-shell.
+touch "$WORK_DIR/all-done"
+sleep 6
+kill "$BANNER_PID" 2>/dev/null
+
+if [ -f "$WORK_DIR/abort" ]; then
+    # Test annulé par l'admin : le serveur a déjà tout acté (aborted) — un POST
+    # end serait ignoré. Retour à l'attente en in-session, extinction sinon
+    # (le case 'wait' du post_action gère les deux).
+    log_line "Test job #$TEST_ID annulé par l'admin"
+    POST_ACTION="wait"
+else
+    log_line "Test job #$TEST_ID terminé (status global=$overall_status)"
+    # ---- POST end : la réponse porte le post_action FRAIS (modifiable par
+    # l'admin pendant le test) — il prime sur celui du fetch initial.
+    ENDRESP=$(wget -qO- "$API_BASE/disktest-end?test_id=$TEST_ID&status=$overall_status" 2>/dev/null) || ENDRESP=""
+    PA_FRESH=$(echo "$ENDRESP" | tr -d ' \n' | sed -n 's/.*"post_action":"\([^"]*\)".*/\1/p')
+    [ -n "$PA_FRESH" ] && POST_ACTION="$PA_FRESH"
+fi
+
+# ---- Post-action : reboot, poweroff, ou retour à l'attente (in-session) ----
+echo "================================================================"
+case "$POST_ACTION" in
+    reboot)
+        echo " Redémarrage dans 5 secondes..."
+        sleep 5
+        reboot -f 2>/dev/null
+        # Si reboot foire, fallback poweroff
+        ;;
+    wait)
+        # Test enchaîné depuis l'écran d'attente discovery : on rend la main à
+        # discover.sh qui reprend sa boucle de poll (fenêtre d'attente réarmée
+        # côté serveur par disktest-end). Hors in-session, 'wait' n'a pas de
+        # sens (personne à qui rendre la main) → fallback poweroff plus bas.
+        if [ "${DT_IN_SESSION:-0}" = "1" ]; then
+            echo " Retour à l'écran d'attente..."
+            exit 0
+        fi
+        echo " (post_action=wait hors session discovery — extinction de secours)"
+        sleep 5
+        ;;
+    *)
+        echo " Extinction dans 5 secondes..."
+        sleep 5
+        ;;
+esac
+echo "================================================================"
+poweroff -f 2>/dev/null
+halt -p 2>/dev/null
+halt -f 2>/dev/null
+exit 0

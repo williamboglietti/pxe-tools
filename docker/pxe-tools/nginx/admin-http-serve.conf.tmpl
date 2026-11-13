@@ -1,0 +1,45 @@
+# UI admin — HTTP listener sur ${ADMIN_HTTP_PORT}, sert l'app en clair.
+# Rendu par render-nginx-conf.sh quand la setting `https_enabled = 'off'`
+# (= "Forcer la redirection HTTPS" désactivé). Use case : derrière un reverse
+# proxy externe qui gère le TLS (Traefik, nginx-proxy-manager, Caddy,
+# Cloudflare Tunnel) et tape directement le port HTTP.
+#
+# Variables substituées au boot :
+#   ${ADMIN_HTTP_PORT} port HTTP admin (default 8080)
+
+server {
+    listen ${ADMIN_HTTP_PORT} default_server;
+    listen [::]:${ADMIN_HTTP_PORT} default_server;
+    server_name _;
+    root /app/public;
+    index index.php;
+
+    access_log /var/log/nginx/admin-access.log main;
+    error_log  /var/log/nginx/admin-error.log;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    location ~ /\. { deny all; }
+    location ~ ^/(src|db|worker\.py|README\.md)(/|$) { deny all; }
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_read_timeout 60s;
+    }
+
+    location ~* \.(css|js|png|jpg|svg|woff2?)$ {
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+}

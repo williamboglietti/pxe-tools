@@ -1,0 +1,21 @@
+# UI admin — HTTP listener sur ${ADMIN_HTTP_PORT}, redirection 301 vers HTTPS.
+# Rendu par render-nginx-conf.sh quand la setting `https_enabled = 'on'`.
+# Variables substituées au boot :
+#   ${ADMIN_HTTP_PORT} port HTTP source (default 8080)
+#   ${ADMIN_PORT}      port HTTPS cible (default 8443)
+
+server {
+    listen ${ADMIN_HTTP_PORT} default_server;
+    listen [::]:${ADMIN_HTTP_PORT} default_server;
+    server_name _;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        return 301 https://$host:${ADMIN_PORT}$request_uri;
+    }
+}

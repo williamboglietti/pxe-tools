@@ -1,0 +1,23 @@
+[Unit]
+# pxe-postboot.service — oneshot exécuté au premier boot post-install.
+# Spec : docs/superpowers/specs/2026-05-16-actions-checkpoints-tracking-design.md
+# (§ Trigger ansible event-driven — ligne 177-185)
+#
+# ConditionPathExists=!… : systemd skip le service si le marqueur de
+# complétion existe. Garantit l'exécution unique (vs `ExecStartPre=-` qui
+# laisserait le service "started" mais inerte aux yeux de systemctl).
+Description=PXE Tools — post-install first-boot checkpoint
+ConditionPathExists=!/var/lib/pxe-tools-postboot.done
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# RemainAfterExit=yes : systemctl status reste "active (exited)" après run.
+# Sans ça, l'unit retombe en "inactive" et un boot subséquent pourrait la
+# relancer même avec le marqueur (cas où la condition est ré-évaluée).
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/postboot.sh
+
+[Install]
+WantedBy=multi-user.target

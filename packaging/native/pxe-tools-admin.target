@@ -1,0 +1,7 @@
+[Unit]
+Description=PXE Tools administration and worker
+Wants=pxe-tools-nginx.service pxe-tools-worker.service
+After=network.target
+
+[Install]
+WantedBy=multi-user.target

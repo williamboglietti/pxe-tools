@@ -1,0 +1,92 @@
+# Installation native et exploitation
+
+Le paquet natif vise actuellement Debian 13 amd64 avec systemd. Il installe
+l'application et ses dépendances sans Docker ni Ansible. L'installation APT,
+l'assistant, une installation Debian PXE et Secure Boot ont été vérifiés sur
+un banc Hyper-V isolé ; le matériel physique et les autres distributions ne
+sont pas encore validés.
+
+## Premier démarrage et réseau
+
+Sur une machine sans données PXE Tools existantes, le paquet démarre
+l'administration sur HTTP 8080. Le serveur HTTP PXE et le proxy DHCP ne sont
+pas démarrés avant la confirmation de la configuration réseau dans l'assistant.
+L'administrateur doit choisir l'interface et le sous-réseau adaptés et s'assurer
+que son réseau dispose d'un serveur DHCP compatible.
+
+Le serveur HTTP PXE utilise TCP 80. Si le nginx installé par Debian ou un autre
+service occupe ce port, l'assistant signale le conflit. L'action proposée pour
+`nginx.service` vérifie l'identité des processus et nécessite une confirmation
+explicite : elle arrête ce service et désactive son démarrage automatique. Les
+sites qui en dépendent deviennent alors indisponibles. Sa configuration reste en
+place. Aucun autre service n'est arrêté automatiquement ; en présence d'un autre
+occupant, résolvez le conflit avant d'activer le réseau PXE.
+
+L'assistant prépare une clé MOK propre à l'instance pour signer GRUB. Pour un
+client Secure Boot, l'administrateur doit enrôler la clé publique de cette
+instance dans le client. Le test documenté utilise une MOK jetable et un client
+Hyper-V ; la procédure d'enrôlement varie selon le matériel.
+
+## Mise à niveau et conservation des données
+
+La mise à niveau est refusée si les services PXE Tools sont encore actifs. Dans
+une fenêtre de maintenance, arrêtez-les avant la mise à niveau, puis redémarrez les
+services appropriés une fois l'opération terminée :
+
+```sh
+sudo systemctl stop pxe-tools.target pxe-tools-admin.target pxe-tools-worker.service pxe-tools-dnsmasq-tail.service pxe-tools-nginx.service pxe-tools-pxe-http.service pxe-tools-php.service pxe-tools-dnsmasq.service pxe-tools-init.service
+sudo apt install --only-upgrade pxe-tools
+sudo systemctl start pxe-tools-admin.target
+# Si le réseau PXE avait déjà été configuré et doit être réactivé :
+sudo systemctl start pxe-tools.target
+```
+
+La suppression et la purge préservent les données sous `/var/lib/pxe-tools`, la
+configuration et les clés sous `/etc/pxe-tools`, ainsi que les journaux. Une
+sauvegarde cohérente doit couvrir ensemble la base, la clé de chiffrement, les
+fichiers persistants et, si elle doit être réutilisée, la clé MOK. La restauration
+complète et la migration ne sont pas encore validées de bout en bout.
+
+SQLite est la seule base prise en charge. Une configuration MySQL/MariaDB
+existante est refusée avant connexion ; elle et ses données sont conservées,
+sans migration automatique vers SQLite.
+
+## Proxy inverse
+
+Le contrôle d'origine des formulaires accepte `X-Forwarded-Host` uniquement
+lorsque le pair réseau qui se connecte à PHP figure dans la liste explicite
+`AUTHENTIK_TRUSTED_PROXY_CIDRS`. Cette règle s'applique aussi à l'authentification
+locale. La liste accepte des adresses ou CIDR IPv4/IPv6 séparés par des virgules ;
+elle ne doit pas désigner les clients. Une liste vide, invalide ou attrape-tout
+n'autorise aucun proxy.
+
+Pour la configuration native, créez un override avec
+`sudo systemctl edit pxe-tools-php.service`, en adaptant par exemple :
+
+```ini
+[Service]
+Environment="AUTHENTIK_TRUSTED_PROXY_CIDRS=192.0.2.7/32"
+```
+
+Le proxy autorisé doit supprimer ou remplacer les en-têtes `X-Forwarded-Host`,
+`X-Forwarded-Proto` et `X-Forwarded-User` fournis par ses clients. Limitez aussi
+l'accès direct aux ports d'administration. Les essais couvrent les proxys
+simulés ; ils ne constituent pas une validation d'un fournisseur SSO réel.
+
+
+## Fraîcheur des métadonnées Debian netboot
+
+Avant de servir les fichiers de démarrage Debian, PXE Tools vérifie la
+signature de `InRelease`, la fraîcheur des champs authentifiés, puis les
+empreintes des fichiers. Si `Valid-Until` existe, une date expirée est
+refusée. Si ce champ est absent, les métadonnées dont la date dépasse 180 jours
+sont refusées. Une date située à plus de cinq minutes dans le futur, absente,
+malformée ou dupliquée est également refusée.
+
+Cette vérification exige une horloge système fiable. La limite de 180 jours
+est une politique de PXE Tools : Debian ne garantit pas qu'une suite stable
+sera actualisée dans ce délai. Si Debian ne republie pas à temps les
+métadonnées stables, la récupération de l'image échouera jusqu'à leur mise à
+jour ou à une évolution réfléchie de cette politique. Ce contrôle réduit la
+fenêtre de rejeu sans garantir qu'une métadonnée signée encore acceptée
+correspond à la toute dernière version disponible.

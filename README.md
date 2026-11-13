@@ -1,33 +1,59 @@
-# PXE Tools — préparation de la CI APT
+# PXE Tools
 
-Ce dépôt contient pour l’instant uniquement les outils et tests de préparation de
-la signature APT. L’application PXE Tools existante est en cours de révision pour
-sa publication ; ce dépôt ne fournit pas encore de version installable.
+PXE Tools fournit une interface web pour découvrir des machines et installer
+Debian par le réseau. Le socle comprend les services PXE, l'interface et son
+worker. Ansible n'est pas installé par le paquet ; son module complémentaire
+n'est pas encore publié.
 
-Le workflow manuel de vérification signe un paquet **fictif** et ne publie ni
-ne téléverse le dépôt produit. Il permet de vérifier la sous-clé de production
-sans utiliser ni exposer la clé principale. Les modifications proposées sont
-vérifiées avec des clés jetables avant l’étape de signature protégée.
+La première cible native vérifiée est **Debian 13 amd64**. Les essais couvrent
+une installation APT, une installation Debian PXE et Secure Boot sur des VM
+Hyper-V isolées. Le matériel physique, Ubuntu et les autres distributions ne
+sont pas encore validés. Consultez les limites et instructions de sécurité dans
+[la documentation native](docs/native-preparation.md).
 
-`packaging/native/prepare-static-apt.py` contrôle une copie d'un instantané signé
-avec une clé publique et les empreintes principales et de signature attendues. Il
-vérifie les signatures, les index, les paquets, les objets immuables et la taille
-des fichiers avant de préparer un nouveau dossier contenant les actifs statiques
-et la seule clé publique. La CI exécute ce contrôle sur un paquet fictif, puis
-teste à blanc `packaging/cloudflare/wrangler.jsonc` avec Wrangler.
+## Installation avec APT
 
-Le workflow manuel `APT release preparation`, limité à `main` protégée et à
-l'environnement `production`, pourra préparer un instantané lorsqu'une release
-publique stable fournira un paquet Debian amd64. Il vérifie l'empreinte SHA-256
-indiquée par GitHub, signe avec la sous-clé CI existante, valide les fichiers et
-exécute Wrangler à blanc. Un numéro d'exécution précédente permet de reprendre
-son instantané vérifié. Le résultat est un artefact GitHub temporaire, conservé
-90 jours au maximum ; ce mécanisme n'est pas un stockage durable de production.
+Téléchargez la clé publique, puis vérifiez son empreinte avant de l'utiliser :
 
-Ces outils ne publient encore rien : la provenance de construction du paquet,
-la conservation durable du dernier instantané entre exécutions, le renouvellement
-des métadonnées, les autorisations Cloudflare et le workflow de déploiement réel
-restent à raccorder avant la sortie du produit.
+```sh
+sudo apt update
+sudo apt install --no-install-recommends ca-certificates curl gpg
+curl -fsSLo pxe-tools-archive-keyring.gpg https://packages.pxetools.com/pxe-tools-archive-keyring.gpg
+gpg --show-keys --fingerprint pxe-tools-archive-keyring.gpg
+```
 
-Le code de ces outils est distribué sous LGPL-3.0 ; consulter COPYING et
-COPYING.LESSER. Les paquets de test sont générés localement et fictifs.
+L'empreinte attendue de la clé principale est :
+
+```text
+CD8B 4493 876B 4FBD 1009 FE2D B195 E5DE 0268 07EC
+```
+
+Après comparaison, ajoutez le dépôt et installez le paquet :
+
+```sh
+sudo install -m 0644 pxe-tools-archive-keyring.gpg /usr/share/keyrings/pxe-tools-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/pxe-tools-archive-keyring.gpg] https://packages.pxetools.com/apt/ stable main' | sudo tee /etc/apt/sources.list.d/pxe-tools.list >/dev/null
+sudo apt update
+sudo apt install --no-install-recommends pxe-tools
+```
+
+Ouvrez ensuite `http://adresse-du-serveur:8080/` et suivez l'assistant. Aucun
+proxy DHCP PXE n'est activé avant votre confirmation réseau. Un serveur DHCP
+approprié et un réseau PXE sont nécessaires. Si un autre service occupe le
+port 80, l'assistant permet d'examiner le conflit ; l'arrêt de `nginx.service`
+nécessite une confirmation explicite.
+
+Pour Secure Boot, la clé MOK de votre instance doit être enrôlée sur chaque
+client concerné avant d'utiliser le chargeur signé par cette instance.
+
+## Données et limites
+
+La base SQLite, la clé de chiffrement et les fichiers persistants doivent être
+sauvegardés ensemble. Une désinstallation du paquet conserve les données.
+MySQL et MariaDB sont actuellement désactivés : une configuration existante
+est conservée mais n'est pas migrée automatiquement.
+
+Le code du socle est distribué sous [LGPL-3.0](COPYING.LESSER). Les composants
+tiers et leurs notices sont recensés dans [THIRD-PARTY.md](THIRD-PARTY.md).
+Les sources et matériaux de reliage des utilitaires embarqués sont disponibles
+dans [la notice et les archives correspondantes](https://packages.pxetools.com/sources/static-helpers/2026-11-12/README.md).

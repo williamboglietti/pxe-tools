@@ -1,0 +1,15 @@
+[Unit]
+Description=PXE Tools boot HTTP service
+Requires=pxe-tools-php.service
+After=pxe-tools-php.service
+[Service]
+Type=forking
+RuntimeDirectory=pxe-tools-pxe-http
+PIDFile=/run/pxe-tools-pxe-http/nginx.pid
+ExecStartPre=-/usr/bin/rm -f /run/pxe-tools-pxe-http/ready
+ExecStartPre=/usr/sbin/nginx -t -c /usr/lib/pxe-tools/native/pxe-nginx.conf
+ExecStart=/usr/sbin/nginx -c /usr/lib/pxe-tools/native/pxe-nginx.conf
+ExecStartPost=/usr/bin/touch /run/pxe-tools-pxe-http/ready
+ExecReload=/usr/sbin/nginx -s reload -c /usr/lib/pxe-tools/native/pxe-nginx.conf
+ExecStop=/usr/sbin/nginx -s quit -c /usr/lib/pxe-tools/native/pxe-nginx.conf
+Restart=on-failure

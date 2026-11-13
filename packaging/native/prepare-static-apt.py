@@ -17,6 +17,7 @@ import tempfile
 
 LIMIT = 25 * 1024 * 1024
 HEX = r'[0-9a-f]{64}'
+HEX512 = r'[0-9a-f]{128}'
 
 
 def run(*args: str) -> bytes:
@@ -26,9 +27,9 @@ def run(*args: str) -> bytes:
     return result.stdout
 
 
-def digest(path: Path) -> str:
+def digest(path: Path, algorithm: str = 'sha256') -> str:
     with path.open('rb') as source:
-        return hashlib.file_digest(source, 'sha256').hexdigest()
+        return hashlib.file_digest(source, algorithm).hexdigest()
 
 
 def allowed(relative: str) -> bool:
@@ -36,6 +37,7 @@ def allowed(relative: str) -> bool:
              'dists/stable/main/binary-amd64/Packages', 'dists/stable/main/binary-amd64/Packages.gz'}
     return (relative in fixed
             or re.fullmatch(rf'dists/stable/main/binary-amd64/by-hash/SHA256/{HEX}', relative) is not None
+            or re.fullmatch(rf'dists/stable/main/binary-amd64/by-hash/SHA512/{HEX512}', relative) is not None
             or re.fullmatch(rf'pool/main/p/pxe-tools/pxe-tools-{HEX}\.deb', relative) is not None)
 
 
@@ -56,8 +58,9 @@ def validate(root: Path, keyring: Path, primary: str, signing: str) -> None:
             if not path.is_file() or not allowed(relative) or path.stat().st_size > LIMIT:
                 raise ValueError(f'unexpected or oversized asset: {relative}')
             files.add(relative)
-            match = re.search(rf'({HEX})(?:\.deb)?$', relative)
-            if match and digest(path) != match.group(1):
+            match = re.search(rf'({HEX})(?:\.deb)?$', relative) if '/SHA512/' not in relative else re.search(rf'({HEX512})$', relative)
+            algorithm = 'sha512' if '/SHA512/' in relative else 'sha256'
+            if match and digest(path, algorithm) != match.group(1):
                 raise ValueError(f'content-addressed object is corrupt: {relative}')
 
     release = root / 'dists/stable/Release'
@@ -104,6 +107,22 @@ def validate(root: Path, keyring: Path, primary: str, signing: str) -> None:
             raise ValueError('signed index or by-hash object is missing')
         if digest(index) != checksum or digest(by_hash) != checksum:
             raise ValueError('signed index or by-hash object is corrupt')
+    sha512_section = re.search(r'(?ms)^SHA512:\s*\n((?: [^\n]+\n)+)', text)
+    if not sha512_section:
+        raise ValueError('release metadata lacks SHA512 checksums')
+    sha512_entries = {}
+    for line in sha512_section.group(1).splitlines():
+        checksum, size, name = line.split()
+        if name in sha512_entries or not re.fullmatch(HEX512, checksum):
+            raise ValueError('invalid SHA512 release checksums')
+        sha512_entries[name] = checksum, int(size)
+    for name in ('Packages', 'Packages.gz'):
+        index = index_dir / name
+        checksum, size = sha512_entries.get(f'main/binary-amd64/{name}', ('', -1))
+        by_hash = index_dir / 'by-hash/SHA512' / checksum
+        if (not index.is_file() or not by_hash.is_file() or index.stat().st_size != size
+                or digest(index, 'sha512') != checksum or digest(by_hash, 'sha512') != checksum):
+            raise ValueError('signed SHA512 index or by-hash object is missing or corrupt')
     with gzip.open(index_dir / 'Packages.gz', 'rb') as compressed:
         if compressed.read(LIMIT + 1) != (index_dir / 'Packages').read_bytes():
             raise ValueError('compressed index differs from its uncompressed form')

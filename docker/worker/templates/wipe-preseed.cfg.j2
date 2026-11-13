@@ -1,0 +1,73 @@
+# {{ ansible_managed }}
+# Preseed pour le wipe boot.
+# But : faire netcfg DHCP, atteindre partman/early_command (drivers chargés),
+# exécuter wipe.sh, poweroff. Ne PAS installer Debian.
+
+# Localisation (évite les questions interactives)
+d-i debian-installer/locale string fr_FR.UTF-8
+d-i keyboard-configuration/xkb-keymap select fr
+d-i debian-installer/language string fr
+d-i debian-installer/country string FR
+
+# Réseau — DHCP auto sur la première interface
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string wipe
+d-i netcfg/get_domain string lan
+d-i netcfg/dhcp_timeout string 30
+d-i netcfg/disable_autoconfig boolean false
+
+# Mirror Debian — utilisé par anna-install pour télécharger les udebs drivers SATA/NVMe
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+
+# Clock — non-interactif
+d-i clock-setup/utc boolean true
+d-i time/zone string Europe/Paris
+d-i clock-setup/ntp boolean true
+
+# Comptes — wipe user dummy (on n'install pas)
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string Wipe
+d-i passwd/username string wipe
+d-i passwd/user-password password wipe
+d-i passwd/user-password-again password wipe
+d-i user-setup/encrypt-home boolean false
+d-i user-setup/allow-password-weak boolean true
+
+# apt-setup minimal
+d-i apt-setup/contrib boolean false
+d-i apt-setup/non-free boolean false
+d-i apt-setup/non-free-firmware boolean true
+d-i apt-setup/services-select multiselect security, updates
+
+# === Wipe boot — déclenchement du script ===
+#
+# preseed/early_command : ping legacy "boot started" (debug uniquement).
+# Refactor checkpoints 2026-05-16 : on N'émet PAS preseed_loaded_wipe ici
+# parce que wipe-preseed.cfg est rendu une fois au bootstrap (pas d'accès au
+# token par-machine au render time). C'est wipe.sh qui émet preseed_loaded_wipe
+# dès le démarrage (token + mac + action_id inlinés au render dynamique).
+d-i preseed/early_command string \
+    wget -q "http://{{ pxe_ip }}/api/wipe-progress?wipe_id=0&line=preseed_early_loaded" -O /dev/null || true
+
+# partman/early_command : drivers SATA/NVMe chargés → /sys/block peuplé.
+# wipe.sh est rendu dynamiquement par MAC côté serveur (PxeController::wipeScript) :
+# disques, token, action et wipe_id sont inlinés à la requête → plus de fetch
+# /api/wipe-job. La MAC est calculée localement et passée en query string.
+#
+# Hardening Spec A : log explicite via /api/wipe-progress en cas de 404 ou run failed,
+# avant le poweroff de fallback. Avant ce hardening, un 404 sur /wipe.sh éteignait
+# silencieusement la machine sans aucune trace côté serveur.
+d-i partman/early_command string \
+    MAIN_IF=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'); \
+    [ -z "$MAIN_IF" ] && MAIN_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$' | head -1); \
+    MAC=$(cat /sys/class/net/"$MAIN_IF"/address 2>/dev/null); \
+    [ -z "$MAC" ] && MAC="00:00:00:00:00:00"; \
+    if wget -q "http://{{ pxe_ip }}/wipe.sh?mac=$MAC" -O /tmp/w.sh 2>/dev/null; then \
+        sh /tmp/w.sh || wget -q "http://{{ pxe_ip }}/api/wipe-progress?wipe_id=0&line=wipe_sh_run_failed" -O /dev/null 2>/dev/null; \
+    else \
+        wget -q "http://{{ pxe_ip }}/api/wipe-progress?wipe_id=0&line=wipe_sh_404" -O /dev/null 2>/dev/null; \
+    fi; \
+    poweroff -f || halt -p || true

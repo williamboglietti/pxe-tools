@@ -84,8 +84,65 @@ chown root:www-data /etc/pxe-tools 2>/dev/null || true
 # -----------------------------------------------------------------------------
 MASTER_KEY="/etc/pxe-tools/master.key"
 set_master_key_owner() {
-    # A native base installation need not have the optional Ansible account.
-    chown www-data:ansible "$1" 2>/dev/null || chown www-data:www-data "$1"
+    # /etc/pxe-tools is writable by the setup wizard. Pin the regular file
+    # before changing its owner or mode so a concurrent symlink cannot redirect
+    # a root operation outside that directory.
+    python3 - "$1" <<'PYTHON'
+import grp
+import os
+import pwd
+import stat
+import sys
+
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError('master.key must be a private regular file')
+    uid = pwd.getpwnam('www-data').pw_uid
+    try:
+        gid = grp.getgrnam('ansible').gr_gid
+    except KeyError:
+        gid = grp.getgrnam('www-data').gr_gid
+    if stat.S_IMODE(info.st_mode) != 0o440:
+        os.fchmod(fd, 0o440)
+    if info.st_uid != uid or info.st_gid != gid:
+        os.fchown(fd, uid, gid)
+finally:
+    os.close(fd)
+PYTHON
+}
+run_as_web() {
+    if [ -x /usr/sbin/runuser ]; then
+        /usr/sbin/runuser -u www-data -- "$@"
+    else
+        /command/s6-setuidgid www-data "$@"
+    fi
+}
+prepare_sessions() {
+    python3 - <<'PYTHON'
+import os
+import pwd
+
+account = pwd.getpwnam('www-data')
+os.makedirs('/var/lib/pxe-tools', mode=0o755, exist_ok=True)
+root = os.open('/var/lib/pxe-tools', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    try:
+        os.mkdir('sessions', 0o700, dir_fd=root)
+    except FileExistsError:
+        pass
+    sessions = os.open('sessions', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                       dir_fd=root)
+    try:
+        os.fchmod(sessions, 0o700)
+        os.fchown(sessions, account.pw_uid, account.pw_gid)
+    finally:
+        os.close(sessions)
+finally:
+    os.close(root)
+PYTHON
 }
 if [ -L "$MASTER_KEY" ]; then
     echo "[php-init] ERREUR: master.key ne doit pas être un lien symbolique" >&2
@@ -126,7 +183,6 @@ if [ ! -e "$MASTER_KEY" ]; then
         echo "[php-init] ERREUR: master.key générée avec une taille inattendue" >&2
         exit 1
     fi
-    chmod 0440 "$TEMP_MASTER_KEY"
     set_master_key_owner "$TEMP_MASTER_KEY"
     if ! ln "$TEMP_MASTER_KEY" "$MASTER_KEY" 2>/dev/null; then
         rm -f "$TEMP_MASTER_KEY"
@@ -145,7 +201,6 @@ if [ "$KEY_SIZE" != "32" ]; then
     echo "[php-init] ERREUR: master.key doit contenir exactement 32 octets" >&2
     exit 1
 fi
-chmod 0440 "$MASTER_KEY"
 set_master_key_owner "$MASTER_KEY"
 
 # -----------------------------------------------------------------------------
@@ -176,17 +231,42 @@ fi
 if [ ! -f "$DB_CONF" ]; then
     echo "[php-init] db.conf absent → wizard /init/db prendra le relais"
     # On crée juste le répertoire sessions PHP + perms (toujours nécessaires)
-    mkdir -p /var/lib/pxe-tools/sessions
-    chown -R www-data:www-data /var/lib/pxe-tools/sessions
-    chmod 0700 /var/lib/pxe-tools/sessions
+    prepare_sessions
     mkdir -p /run/php
     chown www-data:www-data /run/php
-    # Force ownership www-data sur tout /var/lib/pxe-tools : le worker.py
-    # tourne en root et peut créer orchestrator.sqlite (0 byte) en root au
-    # 1er sqlite3.connect, ce qui bloquerait le wizard ensuite (PDO readonly).
-    chown -R www-data:www-data /var/lib/pxe-tools 2>/dev/null || true
-    # Même vide, un fichier de base existant appartient à l'administrateur.
-    # Le wizard peut initialiser un fichier vide sans le supprimer.
+    # Le wizard doit pouvoir créer sa base ; ne jamais parcourir récursivement
+    # un arbre de données susceptible de contenir des entrées non fiables.
+    if [ -L /var/lib/pxe-tools ] || [ ! -d /var/lib/pxe-tools ]; then
+        echo '[php-init] ERREUR : répertoire de données absent ou lié.' >&2
+        exit 1
+    fi
+    chown www-data:www-data /var/lib/pxe-tools
+    # Le worker historique peut avoir créé une base vide en root avant le
+    # wizard. Ne toucher qu'à ces deux fichiers connus, avec O_NOFOLLOW.
+    python3 - <<'PYTHON'
+import os
+import pwd
+import stat
+
+directory = os.open('/var/lib/pxe-tools', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    account = pwd.getpwnam('www-data')
+    for name in ('pxe-tools.sqlite', 'orchestrator.sqlite'):
+        try:
+            database = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        except FileNotFoundError:
+            continue
+        try:
+            info = os.fstat(database)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+                raise ValueError('unexpected database before setup')
+            os.fchown(database, account.pw_uid, account.pw_gid)
+        finally:
+            os.close(database)
+finally:
+    os.close(directory)
+PYTHON
+    # Le wizard peut initialiser le fichier vide sans le supprimer.
     exit 0
 fi
 
@@ -204,11 +284,27 @@ web_can_read() {
     fi
 }
 if ! web_can_read; then
-    if [ -L "$DB_CONF" ] || ! chgrp www-data "$DB_CONF" || ! chmod g+r "$DB_CONF" || \
-       ! web_can_read; then
+    if [ -L "$DB_CONF" ] || ! python3 - "$DB_CONF" <<'PYTHON'
+import grp
+import os
+import stat
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError('db.conf must be a regular file')
+    os.fchmod(fd, stat.S_IMODE(info.st_mode) | 0o040)
+    os.fchown(fd, -1, grp.getgrnam('www-data').gr_gid)
+finally:
+    os.close(fd)
+PYTHON
+    then
         echo '[php-init] ERREUR : db.conf doit être lisible par le service web ; contenu conservé.' >&2
         exit 1
     fi
+    web_can_read || { echo '[php-init] ERREUR : db.conf reste illisible pour le service web.' >&2; exit 1; }
 fi
 
 # -----------------------------------------------------------------------------
@@ -228,12 +324,56 @@ echo "[php-init] driver=$DRIVER"
 if [ "$DRIVER" = "sqlite" ]; then
     DB_PATH=$(grep -o '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$DB_CONF" | sed 's/.*"\([^"]*\)"$/\1/')
     DB_DIR=$(dirname "$DB_PATH")
-    mkdir -p "$DB_DIR"
+    # Le paquet et l'image montent les données dans ce répertoire. Un chemin
+    # externe ne doit jamais commander une écriture ou un chown exécutés en root.
+    if [ "$DB_DIR" != /var/lib/pxe-tools ] || [ ! -d "$DB_DIR" ] || [ -L "$DB_DIR" ] \
+       || [ -L "$DB_PATH" ] || { [ -e "$DB_PATH" ] && [ ! -f "$DB_PATH" ]; }; then
+        echo '[php-init] ERREUR : chemin SQLite hors du répertoire de données ou lié ; configuration conservée.' >&2
+        exit 1
+    fi
+    # Changer seulement la propriété du répertoire et du fichier de base,
+    # sans suivre de lien ni parcourir d'autres fichiers de l'instance.
+    python3 - "$DB_PATH" <<'PYTHON'
+import os
+import pwd
+import stat
+import sys
+
+root = '/var/lib/pxe-tools'
+path = sys.argv[1]
+if os.path.dirname(path) != root:
+    raise ValueError('SQLite path outside the data directory')
+name = os.path.basename(path)
+if name in ('', '.', '..'):
+    raise ValueError('invalid SQLite filename')
+uid = pwd.getpwnam('www-data').pw_uid
+gid = pwd.getpwnam('www-data').pw_gid
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    if not stat.S_ISDIR(os.fstat(directory).st_mode):
+        raise ValueError('invalid SQLite directory')
+    try:
+        database = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except FileNotFoundError:
+        database = None
+    try:
+        if database is not None:
+            info = os.fstat(database)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('SQLite database must be a regular file')
+            os.fchown(database, uid, gid)
+        os.fchown(directory, uid, gid)
+    finally:
+        if database is not None:
+            os.close(database)
+finally:
+    os.close(directory)
+PYTHON
 
     if [ ! -f "$DB_PATH" ]; then
         if [ -f "$SCHEMA_SQLITE" ]; then
             echo "[php-init] DB SQLite absente — init depuis $SCHEMA_SQLITE"
-            sqlite3 "$DB_PATH" < "$SCHEMA_SQLITE"
+            run_as_web sqlite3 "$DB_PATH" < "$SCHEMA_SQLITE"
         else
             echo "[php-init] WARN: $SCHEMA_SQLITE introuvable, DB non initialisée" >&2
         fi
@@ -241,18 +381,14 @@ if [ "$DRIVER" = "sqlite" ]; then
 
     if [ -f "$MIGRATE_PHP" ] && [ -f "$DB_PATH" ]; then
         echo "[php-init] Migrations data SQLite : $MIGRATE_PHP"
-        php "$MIGRATE_PHP" || { echo "[php-init] ERREUR : migration refusée ou échouée ; démarrage arrêté." >&2; exit 1; }
+        run_as_web php "$MIGRATE_PHP" || { echo "[php-init] ERREUR : migration refusée ou échouée ; démarrage arrêté." >&2; exit 1; }
     fi
-
-    chown -R www-data:www-data "$DB_DIR" 2>/dev/null || true
 fi
 
 # -----------------------------------------------------------------------------
 # 5. Sessions PHP + socket php-fpm — toujours nécessaires
 # -----------------------------------------------------------------------------
-mkdir -p /var/lib/pxe-tools/sessions
-chown -R www-data:www-data /var/lib/pxe-tools/sessions
-chmod 0700 /var/lib/pxe-tools/sessions
+prepare_sessions
 
 mkdir -p /run/php
 chown www-data:www-data /run/php

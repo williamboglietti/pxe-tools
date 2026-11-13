@@ -78,6 +78,11 @@ disponible pour SQLite ; la migration guidée reste à développer.
 SQLite est la seule base prise en charge. Une configuration MySQL/MariaDB
 existante est refusée avant connexion ; elle et ses données sont conservées,
 sans migration automatique vers SQLite.
+Le fichier SQLite doit être un fichier ordinaire directement sous
+`/var/lib/pxe-tools`, sans lien symbolique. L'initialisation refuse un chemin
+extérieur et exécute la création et les migrations avec le compte `www-data`.
+Une instance utilisant un autre emplacement doit être déplacée explicitement
+avec sa configuration et sa clé avant de démarrer cette version.
 
 ### Chemins natifs protégés et instances existantes
 
@@ -85,6 +90,10 @@ Sur une nouvelle installation, le TFTP se trouve dans
 `/var/lib/pxe-tools-tftp`, les fichiers HTTP dans `/var/lib/pxe-tools-http`,
 les rendus dans `/var/lib/pxe-tools-native/rendered` et la MOK dans
 `/var/lib/pxe-tools-native/mok`.
+La configuration dnsmasq générée reste dans ce répertoire root, hors de
+`/etc/pxe-tools` qui est accessible en écriture à l'assistant web.
+Un ancien `/etc/pxe-tools/dnsmasq.conf` est conservé lors d'une mise à niveau,
+mais le service natif ne le lit plus.
 Le fichier root `/var/lib/pxe-tools-native/runtime.env` transmet ces chemins
 aux unités systemd. Le programme de préparation refuse tout chemin existant :
 aucune donnée n'est remplacée, déplacée ou supprimée automatiquement.

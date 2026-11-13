@@ -251,6 +251,14 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                         digest = hashlib.file_digest(old, algorithm).hexdigest()
                     if digest != match.group(1):
                         raise ValueError('previous immutable object has an invalid digest')
+                    if relative == 'pool/main/p/pxe-tools' and release_candidate:
+                        old_name = command('dpkg-deb', '--field', str(item), 'Package').decode().strip()
+                        old_version = command('dpkg-deb', '--field', str(item), 'Version').decode().strip()
+                        if old_name != 'pxe-tools':
+                            raise ValueError('unexpected package in previous release pool')
+                        if (old_version == versions['pxe-tools']
+                                and digest != hashlib.sha256(package.read_bytes()).hexdigest()):
+                            raise ValueError('Debian version already has different package bytes')
                     dest = target / item.name
                     if dest.exists():
                         if dest.read_bytes() != item.read_bytes():

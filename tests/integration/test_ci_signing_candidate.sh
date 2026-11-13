@@ -72,8 +72,8 @@ python3 "$prepare" "$fixture/next" "$fixture/static" --keyring "$fixture/public.
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1 || {
     cat "$fixture/static.log" >&2; exit 1;
 }
-cmp "$old_index" "$fixture/static/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
-gpgv --keyring "$fixture/static/pxe-tools-archive-keyring.gpg" "$fixture/static/dists/stable/InRelease" > /dev/null 2>&1
+cmp "$old_index" "$fixture/static/apt/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
+gpgv --keyring "$fixture/static/pxe-tools-archive-keyring.gpg" "$fixture/static/apt/dists/stable/InRelease" > /dev/null 2>&1
 if [[ "${PXE_STATIC_WRANGLER:-}" == 1 ]]; then
     "$root/packaging/cloudflare/node_modules/.bin/wrangler" deploy \
         --config "$root/packaging/cloudflare/wrangler.jsonc" --assets "$fixture/static" --dry-run

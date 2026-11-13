@@ -155,8 +155,12 @@ def main() -> None:
     validate(snapshot, keyring, primary, signing)
     with tempfile.TemporaryDirectory(prefix='.pxe-static-', dir=output.parent) as temporary:
         candidate = Path(temporary) / 'assets'
-        shutil.copytree(snapshot, candidate, symlinks=True)
-        validate(candidate, keyring, primary, signing)
+        candidate.mkdir()
+        shutil.copytree(snapshot, candidate / 'apt', symlinks=True)
+        validate(candidate / 'apt', keyring, primary, signing)
+        (candidate / '_headers').write_text(
+            '/apt/dists/*\n  Cache-Control: no-cache, max-age=0, must-revalidate\n'
+            '/apt/pool/*\n  Cache-Control: public, max-age=31536000, immutable\n', encoding='utf-8')
         # Export only the public key. Never copy the supplied keyring verbatim.
         home = Path(temporary) / 'gpg'
         home.mkdir(mode=0o700)

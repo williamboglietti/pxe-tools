@@ -24,6 +24,8 @@ jobs:
         run: npm ci --prefix packaging/cloudflare
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Verify persistent Worker snapshot recovery
+        run: python3 -m unittest discover -s tests -p 'test_worker_snapshot.py' -v
       - name: Verify release asset selection
         run: python3 -m unittest discover -s tests -p 'test_release_asset.py' -v
       - name: Verify CI signer with disposable keys

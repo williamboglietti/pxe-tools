@@ -67,6 +67,12 @@ cmp "$old_object" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$
 cmp "$old_object512" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA512/$old_hash512"
 cmp "$old_package" "$fixture/next/pool/main/p/pxe-tools/$(basename "$old_package")"
 test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
+printf 'different content\n' > "$fixture/pkg-pxe-tools/changed.txt"
+dpkg-deb --build --root-owner-group "$fixture/pkg-pxe-tools" "$fixture/collision.deb" >/dev/null
+if python3 "$builder" "$fixture/collision.deb" "$fixture/rejected-collision" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --previous "$fixture/next" > "$fixture/collision.log" 2>&1; then
+    echo 'Same Debian version with different bytes unexpectedly accepted' >&2; exit 1
+fi
+test ! -e "$fixture/rejected-collision"
 cp -a "$fixture/repository" "$fixture/sha256-only-previous"
 rm -rf -- "$fixture/sha256-only-previous/dists/stable/main/binary-amd64/by-hash/SHA512"
 python3 "$builder" "$fixture/new.deb" "$fixture/sha256-only-upgrade" --gnupg-home "$gnupg" --fingerprint "$fingerprint" --valid-days 1 --previous "$fixture/sha256-only-previous" >/dev/null

@@ -156,10 +156,17 @@ changement réseau pour maintenir l’isolation souhaitée.
 
 Pour une configuration héritée sans clés `pxe_interface` ou `pxe_ip` dans
 SQLite, les trois services natifs HTTP PXE, dnsmasq et worker lisent également
-le fichier optionnel `/etc/pxe-tools/network.env`. Il peut contenir par exemple
+le fichier optionnel protégé `/var/lib/pxe-tools-native/network.env`. Il peut contenir par exemple
 `PXE_INTERFACE=eth1` et `PXE_IP=192.0.2.1` ; l’ancien nom `ORCHESTRATOR_IP`
 reste accepté pour l’adresse. Une clé présente dans SQLite, même vide, prime
 sur cet environnement. Un ancien override systemd attaché à un seul service
 n’est pas transmis automatiquement aux autres : reporter ses valeurs réseau
 dans ce fichier commun. Sans valeurs cohérentes le service HTTP refuse de
 démarrer.
+
+L'ancien fichier `/etc/pxe-tools/network.env` n'est plus chargé par les unités :
+son répertoire parent est modifiable par le service web et ne peut pas servir
+de source fiable pour l'environnement d'un processus privilégié. Après arrêt,
+l'administrateur doit examiner les anciennes valeurs et reporter explicitement
+uniquement les réglages requis dans le nouveau fichier root. Ne recopiez pas
+automatiquement un fichier dont l'origine ou le contenu sont incertains.

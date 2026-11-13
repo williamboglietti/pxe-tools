@@ -27,6 +27,9 @@ class ConfigureSecureRuntime(unittest.TestCase):
             self.assertEqual((base / setup.HTTP).stat().st_mode & 0o777, 0o755)
             self.assertEqual((base / setup.RUNTIME / 'rendered').stat().st_mode & 0o777, 0o755)
             self.assertEqual(marker.stat().st_mode & 0o777, 0o644)
+            network = base / setup.RUNTIME / 'network.env'
+            self.assertEqual(network.read_bytes(), b'')
+            self.assertEqual(network.stat().st_mode & 0o777, 0o644)
             with self.assertRaises(FileExistsError):
                 setup.prepare(base)
             self.assertEqual(marker.read_bytes(), setup.MARKER)

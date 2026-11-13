@@ -24,5 +24,5 @@ Ce fichier figé ne reçoit pas automatiquement les retraits et rotations de
 clés Debian. Il doit être revu et mis à jour avec PXE Tools lors d'une rotation
 ou révocation, après contrôle de la provenance et des signatures. Un
 administrateur peut configurer un trousseau Debian récent et authentifié via
-`DEBIAN_ARCHIVE_KEYRING` dans `/etc/pxe-tools/network.env`, puis redémarrer le
+`DEBIAN_ARCHIVE_KEYRING` dans `/var/lib/pxe-tools-native/network.env`, puis redémarrer le
 worker. Le téléchargement ne doit jamais contourner la validation `gpgv`.

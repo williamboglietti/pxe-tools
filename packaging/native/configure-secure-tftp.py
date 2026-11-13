@@ -54,6 +54,12 @@ def prepare(base=BASE):
                 os.fchmod(rendered, 0o755)
             finally:
                 os.close(rendered)
+            network = os.open('network.env', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o644, dir_fd=runtime)
+            with os.fdopen(network, 'wb') as stream:
+                os.fchmod(stream.fileno(), 0o644)
+                stream.flush()
+                os.fsync(stream.fileno())
             marker = os.open('runtime.env', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o644, dir_fd=runtime)
             with os.fdopen(marker, 'wb') as stream:

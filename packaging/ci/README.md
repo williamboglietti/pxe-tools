@@ -5,6 +5,9 @@ copiées doivent être suivies et lisibles selon les modes publics. Une archive
 source sans métadonnées Git est refusée ; reconstruisez depuis un checkout
 authentifié. Les fichiers suivis mais modifiés restent des entrées possibles :
 la revue de leur contenu et des secrets demeure indispensable avant publication.
+Un checkout dont les fichiers sont privés (par exemple créé sous `umask 0077`)
+est refusé : préparez un checkout public lisible après vérification, sans
+modifier les permissions de vos fichiers locaux privés.
 Les modes sont normalisés dans le seul arbre temporaire des paquets, sans
 modifier le checkout. La CI de construction destinée à la publication exige en
 plus que HEAD corresponde au commit approuvé et que l'index et l'arbre de travail

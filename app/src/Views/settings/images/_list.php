@@ -2,7 +2,7 @@
 use Admin\View;
 use Admin\Models\OsImage;
 $refresh_running = $refresh_running ?? false;
-$active = $refresh_running || count(array_filter($images, static fn(array $image): bool => in_array($image['status'], ['pending', 'downloading'], true) && (int)$image['enabled'] === 1)) > 0;
+$active = $refresh_running || count(array_filter($images, static fn(array $image): bool => (in_array($image['status'], ['pending', 'downloading'], true) && (int)$image['enabled'] === 1) || OsImage::deletePending((int)$image['id']))) > 0;
 ?>
 <section id="images-list" aria-label="Images demandées" data-refreshed-at="<?= time() ?>"
          hx-get="/api/images-status" <?= $active ? 'hx-trigger="every 3s"' : '' ?> hx-swap="outerHTML">
@@ -17,6 +17,7 @@ $active = $refresh_running || count(array_filter($images, static fn(array $image
 <div class="grid gap-4">
 <?php foreach ($images as $img):
     $id = (int)$img['id'];
+    $deleting = OsImage::deletePending($id);
     $status = (string)$img['status'];
     $label = ucfirst($img['distro']) . ' ' . ($img['version_full'] ?: $img['version']) . ' · ' . $img['arch'];
     $dependencies = $img['dependencies'] ?? OsImage::dependencies($id);
@@ -78,7 +79,7 @@ $active = $refresh_running || count(array_filter($images, static fn(array $image
     <form method="post" action="/settings/images/<?= $id ?>"
       onsubmit="return confirm(<?= View::e(json_encode('Supprimer ' . $label . ' et ses fichiers locaux ? ' . count($dependencies['usages']) . ' usage(s) enregistré(s). Consultez les usages avant de continuer.')) ?>);">
       <input type="hidden" name="_method" value="DELETE">
-      <button type="submit" id="image-delete-<?= $id ?>" class="btn btn-danger" <?= $blocked !== [] ? 'disabled' : '' ?> aria-label="<?= View::e('Supprimer ' . $label) ?>">Supprimer</button>
+      <button type="submit" id="image-delete-<?= $id ?>" class="btn btn-danger" <?= $blocked !== [] || $deleting ? 'disabled' : '' ?> aria-label="<?= View::e('Supprimer ' . $label) ?>"><?= $deleting ? 'Suppression en cours…' : 'Supprimer' ?></button>
     </form>
   </div>
 </article>

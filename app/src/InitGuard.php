@@ -65,6 +65,7 @@ final class InitGuard
     /** Préfixes pour job_types paramétrés (suivis d'un ID dynamique).
      * Le matching est fait dans listJobs() après le lookup exact JOB_TITLES. */
     public const JOB_TITLE_PREFIXES = [
+        'image:delete:' => 'Suppression d’une image',
         'preset:push_github:' => 'Sauvegarde du modèle sur GitHub',
     ];
 

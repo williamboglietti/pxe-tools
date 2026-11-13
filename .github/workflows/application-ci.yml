@@ -23,7 +23,7 @@ jobs:
         run: docker build --tag pxe-tools-application-test:local tests/ci
       - name: Exercise application behavior in isolation
         run: |
-          docker run --rm --network none --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+          docker run --rm --network none --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add KILL --cap-add SETUID --cap-add SETGID --security-opt no-new-privileges \
             --tmpfs /tmp:rw,nosuid,nodev,exec,size=256m \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --workdir /tmp pxe-tools-application-test:local bash -c '
@@ -33,6 +33,12 @@ jobs:
               cd workspace
               exec bash tests/ci/run-application-tests.sh
             '
+      - name: Verify writable-volume deletion as the web user
+        run: |
+          docker run --rm --network none --user www-data \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --workdir /source pxe-tools-application-test:local \
+            bash tests/integration/test_image_delete_web_legacy.sh
       - name: Exercise PXE menu coordination in isolation
         run: |
           docker run --rm --network none --cap-drop ALL \

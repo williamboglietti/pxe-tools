@@ -60,7 +60,7 @@ class MenuSafety(unittest.TestCase):
     def test_real_renderer_preserves_target_and_existing_menus_on_bad_data(self):
         menu = self.tftp/'pxelinux.cfg'; menu.mkdir()
         with closing(sqlite3.connect(self.database)) as db, db:
-            db.execute("UPDATE machines SET hostname='PC HP | Étage' WHERE id=1")
+            db.execute("UPDATE machines SET hostname='Bureau | Étage' WHERE id=1")
         sentinel = self.root/'sentinel'; sentinel.write_text('unchanged')
         selected = menu/'01-02-00-00-00-00-01'; selected.symlink_to(sentinel)
         stale = menu/'01-02-00-00-00-00-03'; stale.symlink_to(sentinel)
@@ -69,7 +69,7 @@ class MenuSafety(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), 'unchanged')
         self.assertFalse(selected.is_symlink())
         self.assertIn('LABEL install', selected.read_text())
-        self.assertIn('PC HP | Étage', selected.read_text())
+        self.assertIn('Bureau | Étage', selected.read_text())
         self.assertIn('LABEL rescue', (menu/'01-02-00-00-00-00-02').read_text())
         self.assertFalse(stale.is_symlink())
         before = {p.name:p.read_bytes() for p in menu.iterdir() if p.is_file()}

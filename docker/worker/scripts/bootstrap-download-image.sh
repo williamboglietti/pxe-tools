@@ -60,9 +60,11 @@ else
 fi
 if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
     python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$distro/${version_full:-$version}/$arch"
-else
-    mkdir -p "$dest_dir"
 fi
+stage_dir=$(mktemp -d /var/tmp/pxe-image.XXXXXXXX)
+trap 'rm -rf -- "$stage_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+publisher="$(dirname "${BASH_SOURCE[0]}")/publish-verified-image.py"
 
 echo "[download-image] ▶ id=$IMAGE_ID $label"
 
@@ -155,22 +157,6 @@ probe_all_sizes() {
 download_with_progress() {
     local url="$1" dest="$2" key="$3" prior="$4" idx="$5" count="$6"
     local flabel="${FILE_LABELS[$key]:-$key} ($idx/$count)"
-    if [ -s "$dest" ]; then
-        echo "[download-image]   skip (existe) : $dest"
-        # Publish briefly pour éviter un freeze visuel côté UI entre 2 fichiers
-        # (sinon le sub-message reste sur la frame précédente jusqu'au début
-        # du fichier suivant).
-        local final_size
-        final_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
-        local cumulative=$(( prior + final_size ))
-        local skip_pct=0
-        if [ "$TOTAL_BYTES" -gt 0 ]; then
-            skip_pct=$(( cumulative * 100 / TOTAL_BYTES ))
-            [ "$skip_pct" -gt 99 ] && skip_pct=99
-        fi
-        publish "Déjà présent · $flabel · $(human_size "$final_size")" "$skip_pct"
-        return 0
-    fi
     if [ -z "$url" ]; then
         return 0  # firmware peut être vide pour certaines distros
     fi
@@ -182,8 +168,7 @@ download_with_progress() {
     # ratait TOUJOURS, $total valait 0 en permanence, d'où le message sans
     # total ("· 35 Mo téléchargés") quel que soit l'état réel du réseau.
     local total="${TOTALS[$key]:-0}"
-    rm -f "$dest.tmp"
-    wget -c -L --tries=3 --timeout=60 -q -O "$dest.tmp" "$url" &
+    wget -L --tries=3 --timeout=60 -q -O "$dest.tmp" "$url" &
     local wget_pid=$!
 
     # Boucle de monitoring (1 update/s).
@@ -243,14 +228,14 @@ err=""
 total_files=2
 [ -n "$firmware_url" ] && total_files=3
 
-if ! download_with_progress "$kernel_url" "$dest_dir/linux" "kernel" "$prior" 1 "$total_files"; then
+if ! download_with_progress "$kernel_url" "$stage_dir/linux" "kernel" "$prior" 1 "$total_files"; then
     err="Échec du téléchargement"
 else
     prior=$(( prior + TOTALS["kernel"] ))
 fi
 
 if [ -z "$err" ]; then
-    if ! download_with_progress "$initrd_url" "$dest_dir/initrd.gz" "initrd" "$prior" 2 "$total_files"; then
+    if ! download_with_progress "$initrd_url" "$stage_dir/initrd.gz" "initrd" "$prior" 2 "$total_files"; then
         err="Échec du téléchargement"
     else
         prior=$(( prior + TOTALS["initrd"] ))
@@ -258,11 +243,14 @@ if [ -z "$err" ]; then
 fi
 
 if [ -z "$err" ] && [ -n "$firmware_url" ]; then
-    if ! download_with_progress "$firmware_url" "$dest_dir/firmware.cpio.gz" "firmware" "$prior" 3 "$total_files"; then
+    if ! download_with_progress "$firmware_url" "$stage_dir/firmware.cpio.gz" "firmware" "$prior" 3 "$total_files"; then
         err="Échec du téléchargement"
     fi
 fi
 
+if [ -z "$err" ] && { [ ! -s "$stage_dir/linux" ] || [ ! -s "$stage_dir/initrd.gz" ]; }; then
+    err="Image incomplète"
+fi
 if [ -n "$err" ]; then
     publish_error "$err"
     echo "[download-image] ✗ id=$IMAGE_ID $err" >&2
@@ -272,19 +260,17 @@ fi
 # ============================================================================
 # Vérification d'intégrité (F-05) — AVANT de promouvoir l'artefact comme servable.
 # Debian netboot : chaîne InRelease signée → SHA256SUMS → linux/initrd. Fail-closed :
-# au moindre doute on supprime les fichiers, marque l'image 'failed' et on sort.
+# au moindre doute on conserve les fichiers déjà publiés, marque l'image 'failed' et on sort.
 # ============================================================================
 if [ "$distro" = "debian" ]; then
     publish "$label · vérification d'intégrité…" 99
-    if ! verify_debian_netboot "$dest_dir" "$kernel_url" "$arch"; then
-        rm -f "$dest_dir/linux" "$dest_dir/initrd.gz"
+    if ! verify_debian_netboot "$stage_dir" "$kernel_url" "$arch"; then
         publish_error "Vérification d'intégrité échouée (signature ou somme de contrôle invalide) — artefact rejeté."
         echo "[download-image] ✗ id=$IMAGE_ID intégrité netboot Debian INVALIDE" >&2
         exit 1
     fi
-    if [ -n "$firmware_url" ] && [ -f "$dest_dir/firmware.cpio.gz" ]; then
-        if ! verify_firmware "$dest_dir/firmware.cpio.gz" "$firmware_url"; then
-            rm -f "$dest_dir/linux" "$dest_dir/initrd.gz" "$dest_dir/firmware.cpio.gz"
+    if [ -n "$firmware_url" ] && [ -f "$stage_dir/firmware.cpio.gz" ]; then
+        if ! verify_firmware "$stage_dir/firmware.cpio.gz" "$firmware_url"; then
             publish_error "Vérification d'intégrité du firmware échouée — artefact rejeté."
             echo "[download-image] ✗ id=$IMAGE_ID intégrité firmware INVALIDE" >&2
             exit 1
@@ -297,23 +283,29 @@ else
     echo "[download-image]   ⚠ $distro : intégrité non vérifiée (best-effort)" >&2
 fi
 
+# Nothing in the HTTP tree is replaced until the complete download is verified.
+# The publisher copies from root-private staging through no-follow dirfds.
+python3 "$publisher" "$stage_dir/linux" "$dest_dir/linux"
+python3 "$publisher" "$stage_dir/initrd.gz" "$dest_dir/initrd.gz"
+if [ -n "$firmware_url" ]; then
+    python3 "$publisher" "$stage_dir/firmware.cpio.gz" "$dest_dir/firmware.cpio.gz"
+fi
+
 # Symlink codename → version_full (idempotent, calqué sur le script ISO). Les
 # menus rescue/discovery (pxe_default_netboot_path) et certains chemins legacy
 # résolvent par codename. Uniquement en layout v2 (version_full + codename).
 if [ -n "$version_full" ] && [ -n "$codename" ]; then
     if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
         python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$codename"
-    else
-        mkdir -p "$HTTP_ROOT/netboot/$codename"
     fi
-    ln -sfn "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
+    python3 "$publisher" --alias "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
     echo "[download-image]   symlink netboot/$codename/$arch → ../$distro/$version_full/$arch"
 fi
 
 # Mark downloaded : taille totale + status='downloaded'.
-size=$(( $(stat -c%s "$dest_dir/linux" 2>/dev/null || echo 0) \
-      + $(stat -c%s "$dest_dir/initrd.gz" 2>/dev/null || echo 0) \
-      + $(stat -c%s "$dest_dir/firmware.cpio.gz" 2>/dev/null || echo 0) ))
+size=$(( $(stat -c%s "$stage_dir/linux" 2>/dev/null || echo 0) \
+      + $(stat -c%s "$stage_dir/initrd.gz" 2>/dev/null || echo 0) \
+      + $(stat -c%s "$stage_dir/firmware.cpio.gz" 2>/dev/null || echo 0) ))
 # Commit the completed image and a subsequent menu render together. A render
 # already running may have read the old image state, so only a pending render
 # can be reused.

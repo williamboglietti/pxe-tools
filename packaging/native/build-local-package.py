@@ -75,6 +75,9 @@ if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
     # Leave its startup under the administrator's control.
     if [ -z "${2:-}" ] && [ ! -e /var/lib/pxe-tools ] && [ ! -L /var/lib/pxe-tools ] \
        && [ ! -e /etc/pxe-tools ] && [ ! -L /etc/pxe-tools ]; then
+        # Only truly new native installations receive the protected TFTP root.
+        # Existing paths are never overwritten or silently migrated.
+        python3 /usr/lib/pxe-tools/native/configure-secure-tftp.py
         if ! systemctl enable pxe-tools-admin.target; then
             echo 'PXE Tools: could not enable the administration service.' >&2
         elif ! systemctl start pxe-tools-admin.target; then
@@ -86,7 +89,7 @@ fi
 POSTRM = '''#!/bin/sh
 set -eu
 if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
-if [ "$1" = purge ]; then echo 'PXE Tools: instance data and configuration were kept.' >&2; fi
+if [ "$1" = purge ]; then echo 'PXE Tools: instance data, native runtime and configuration were kept.' >&2; fi
 '''
 
 
@@ -147,8 +150,9 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
             shutil.copy2(checked(ROOT/name), docs/name)
         copy_tree(ROOT/'third_party/licenses', docs/'licenses', tracked)
         native=root/'usr/lib/pxe-tools/native'; native.mkdir(parents=True)
-        for name in ('default.env','init.sh','start-php-fpm.sh','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
+        for name in ('default.env','init.sh','start-php-fpm.sh','start-worker.py','configure-secure-tftp.py','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
             shutil.copy2(checked(ROOT/'packaging/native'/name), native/name)
+        copy_tree(ROOT/'packaging/native/keyrings', native/'keyrings', tracked)
         units=root/'usr/lib/systemd/system'; units.mkdir(parents=True)
         for unit in (sorted((ROOT/'packaging/native').glob('pxe-tools.*'))
                      + sorted((ROOT/'packaging/native').glob('pxe-tools-*.service'))
@@ -166,7 +170,7 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
         pxe=replace_exact(pxe,'listen 80 default_server;', 'listen @@PXE_IPV4@@:80 default_server;\n    listen 127.0.0.1:80;')
         pxe=replace_exact(pxe,'    listen [::]:80 default_server;\n', '')
         pxe=replace_exact(pxe,'/app/public','/usr/lib/pxe-tools/app/public')
-        pxe=replace_exact(pxe,'/srv/http','/var/lib/pxe-tools/http')
+        pxe=replace_exact(pxe,'    root /srv/http;', '    root @@HTTP_ROOT@@;')
         pxe=replace_exact(pxe,'/run/php/php8.4-fpm.sock','/run/pxe-tools-php/fpm.sock')
         pxe=pxe.replace('/var/log/nginx/','/var/log/pxe-tools/')
         pxe=replace_exact(pxe,'include fastcgi_params;','include /etc/nginx/fastcgi_params;')

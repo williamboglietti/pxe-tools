@@ -12,7 +12,17 @@ set -euo pipefail
 : "${MOK_KEY_BITS:=2048}"
 : "${REGEN:=0}"
 
-mkdir -p "$MOK_DIR"
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" mok "$MOK_DIR"
+    if [ "$REGEN" != 1 ] && [ "$MOK_DIR" != /etc/pxe-tools/mok ] \
+        && [ ! -e "$MOK_DIR/MOK.key" ] && [ ! -L "$MOK_DIR/MOK.key" ] \
+        && { [ -e /etc/pxe-tools/mok/MOK.key ] || [ -L /etc/pxe-tools/mok/MOK.key ]; }; then
+        echo '[bootstrap-mok] Une ancienne clé MOK existe : migrer et vérifier son identité avant de démarrer.' >&2
+        exit 1
+    fi
+else
+    mkdir -p "$MOK_DIR"
+fi
 
 if [ "$REGEN" = "1" ]; then
     # Backup ancien keypair (utile si l'utilisateur veut rollback)
@@ -47,8 +57,10 @@ chmod 0600 "$MOK_DIR/MOK.key"
 chmod 0644 "$MOK_DIR/MOK.pem" "$MOK_DIR/MOK.der"
 
 # Expose MOK.der via HTTP pour enrôlement client (mokutil --import MOK.der)
-mkdir -p "$HTTP_ROOT"
-cp "$MOK_DIR/MOK.der" "$HTTP_ROOT/MOK.der"
-chmod 0644 "$HTTP_ROOT/MOK.der"
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/publish-public-mok.py" "$MOK_DIR" "$HTTP_ROOT"
+else
+    python3 "$(dirname "${BASH_SOURCE[0]}")/atomic_publish.py" "$MOK_DIR/MOK.der" "$HTTP_ROOT/MOK.der"
+fi
 
 echo "[bootstrap-mok] OK"

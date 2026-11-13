@@ -11,6 +11,11 @@ set -euo pipefail
 : "${BOOTSTRAP_SCRIPTS_DIR:=/opt/pxe-tools/bootstrap}"
 : "${REBUILD:=0}"
 
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" tftp "$TFTP_ROOT"
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" mok "$MOK_DIR"
+fi
+
 # PXE_IP : IP du serveur PXE Tools (anciennement ORCHESTRATOR_IP). Settings DB en
 # priorité (posée par le wizard /init/network), fallback env legacy. Aligné sur
 # render-dnsmasq-conf.sh et render_template.py. Sans cette source, on fail proprement.
@@ -132,16 +137,27 @@ build_one_arch() {
 # new loader has been built and signed successfully.
 build_one_arch x86_64-efi grubx64.efi 1
 build_one_arch arm64-efi  grubnetaa64.efi 0
-shim=/usr/lib/shim/shimx64.efi.signed
-if [ ! -f "$shim" ] || [ ! -f "$TFTP_ROOT/grubx64.efi" ]; then
-    echo '[bootstrap-grub] ERREUR : shim ou GRUB signé indisponible.' >&2
+if [ ! -f "$TFTP_ROOT/grubx64.efi" ]; then
+    echo '[bootstrap-grub] ERREUR : GRUB signé indisponible.' >&2
     exit 1
 fi
-tmp_shim=$(mktemp "$TFTP_ROOT/.shim.XXXXXXXX")
-trap 'rm -f -- "$tmp_shim"' EXIT
-cp "$shim" "$tmp_shim"
-chmod 0644 "$tmp_shim"
-mv -f -- "$tmp_shim" "$TFTP_ROOT/grubnetx64.efi"
-trap - EXIT
+host_id=''
+if [ -r /etc/os-release ]; then host_id=$(. /etc/os-release; printf '%s' "${ID:-}"); fi
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ] && [ "$host_id" = ubuntu ]; then
+    : "${DEBIAN_ARCHIVE_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg}"
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/prepare-debian-shim.py" "$TFTP_ROOT" "$DEBIAN_ARCHIVE_KEYRING"
+else
+    shim=/usr/lib/shim/shimx64.efi.signed
+    if [ ! -f "$shim" ]; then
+        echo '[bootstrap-grub] ERREUR : shim indisponible.' >&2
+        exit 1
+    fi
+    tmp_shim=$(mktemp "$TFTP_ROOT/.shim.XXXXXXXX")
+    trap 'rm -f -- "$tmp_shim"' EXIT
+    cp "$shim" "$tmp_shim"
+    chmod 0644 "$tmp_shim"
+    mv -f -- "$tmp_shim" "$TFTP_ROOT/grubnetx64.efi"
+    trap - EXIT
+fi
 
 echo "[bootstrap-grub] OK"

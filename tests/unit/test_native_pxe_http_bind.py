@@ -26,7 +26,7 @@ class RendererTests(unittest.TestCase):
         self.addCleanup(self.work.cleanup)
         root = Path(self.work.name)
         self.db, self.template, self.output = root / 'db', root / 'template', root / 'pxe.conf'
-        self.template.write_text('server { listen @@PXE_IPV4@@:80 default_server; listen 127.0.0.1:80; }\n')
+        self.template.write_text('server { listen @@PXE_IPV4@@:80 default_server; listen 127.0.0.1:80; root @@HTTP_ROOT@@; }\n')
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('CREATE TABLE settings (key TEXT, value TEXT)')
             db.executemany('INSERT INTO settings VALUES (?, ?)', [('pxe_interface', 'eth1'), ('pxe_ip', '192.0.2.1')])
@@ -61,13 +61,24 @@ class RendererTests(unittest.TestCase):
                     self.assertEqual(member.mode & 0o7022, 0, member.name)
         self.assertIn('listen @@PXE_IPV4@@:80 default_server;', template)
         self.assertIn('listen 127.0.0.1:80;', template)
+        self.assertIn('root @@HTTP_ROOT@@;', template)
         self.assertNotIn('listen 80 default_server;', template)
         self.assertNotIn('listen [::]:80', template)
 
     def test_renders_only_selected_ipv4(self):
         self.run_renderer()
-        self.assertEqual(self.output.read_text(), 'server { listen 192.0.2.1:80 default_server; listen 127.0.0.1:80; }\n')
+        self.assertEqual(self.output.read_text(), 'server { listen 192.0.2.1:80 default_server; listen 127.0.0.1:80; root /var/lib/pxe-tools/http; }\n')
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o644)
+
+    def test_http_root_is_configurable_but_not_an_nginx_directive(self):
+        with patch.object(renderer.subprocess, 'check_output', return_value=self.ip_result):
+            renderer.render(self.db, self.template, self.output,
+                            environ={'HTTP_ROOT': '/var/lib/pxe-tools-http'})
+        self.assertIn('root /var/lib/pxe-tools-http;', self.output.read_text())
+        for value in ('/tmp/foo; listen 80', '/tmp/../etc', 'relative', '/tmp/$arg'):
+            with self.subTest(value=value), patch.object(renderer.subprocess, 'check_output', return_value=self.ip_result):
+                with self.assertRaises(ValueError):
+                    renderer.render(self.db, self.template, self.output, environ={'HTTP_ROOT': value})
 
     def test_rejects_missing_and_duplicate_settings(self):
         with closing(sqlite3.connect(self.db)) as db, db:

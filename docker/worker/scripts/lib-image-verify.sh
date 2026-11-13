@@ -18,7 +18,7 @@
 
 # Keyrings de confiance. Chemins par défaut = image (COPY Dockerfile + apt) ;
 # overridables par env pour les tests hors-conteneur.
-: "${DEBIAN_ARCHIVE_KEYRING:=/usr/share/keyrings/debian-archive-keyring.gpg}"
+: "${DEBIAN_ARCHIVE_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg}"
 : "${DEBIAN_CD_KEYRING:=/usr/share/keyrings/pxe/pxe-debian-cd.gpg}"
 : "${UBUNTU_CD_KEYRING:=/usr/share/keyrings/pxe/pxe-ubuntu-cd.gpg}"
 

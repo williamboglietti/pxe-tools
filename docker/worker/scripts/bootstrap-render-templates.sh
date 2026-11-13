@@ -20,7 +20,13 @@ set -euo pipefail
 : "${BOOTSTRAP_TEMPLATES_DIR:=/opt/pxe-tools/templates}"
 : "${BOOTSTRAP_SCRIPTS_DIR:=/opt/pxe-tools/bootstrap}"
 
-mkdir -p "$TFTP_ROOT/pxelinux.cfg" "$TFTP_ROOT/grub" "$HTTP_ROOT" "$PXE_TOOLS_DATA_DIR"
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    for directory in "$TFTP_ROOT" "$HTTP_ROOT" "$PXE_TOOLS_DATA_DIR"; do
+        python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" tftp "$directory"
+    done
+fi
+python3 "$BOOTSTRAP_SCRIPTS_DIR/atomic_publish.py" --prepare-menu "$TFTP_ROOT"
+mkdir -p "$TFTP_ROOT/grub" "$HTTP_ROOT" "$PXE_TOOLS_DATA_DIR"
 
 render() {
     local src="$1" dst="$2"

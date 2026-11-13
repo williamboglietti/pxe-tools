@@ -1,5 +1,11 @@
 #!/bin/sh
 set -eu
+# Validate all root-owned publication roots before any privileged creation or
+# rendering. Existing installations with untrusted ancestors must be migrated
+# explicitly; their data is preserved.
+for directory in "$HTTP_ROOT" "$TFTP_ROOT" "$PXE_TOOLS_DATA_DIR"; do
+    python3 /opt/pxe-tools/scripts/validate-native-runtime.py tftp "$directory"
+done
 # Create only absent directories; never replace existing user data or links.
 for directory in /var/lib/pxe-tools "$HTTP_ROOT" "$TFTP_ROOT" /var/log/pxe-tools; do
     if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then

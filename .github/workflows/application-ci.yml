@@ -39,3 +39,16 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --workdir /source pxe-tools-application-test:local \
             bash tests/integration/test_image_delete_web_legacy.sh
+      - name: Exercise PXE menu coordination in isolation
+        run: |
+          docker run --rm --network none --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --workdir /tmp pxe-tools-application-test:local bash -c '
+              set -euo pipefail
+              mkdir workspace
+              tar -C /source --exclude=./.git -cf - . | tar -C workspace --no-same-owner -xf -
+              cd workspace
+              PXE_MENU_FIXTURE=1 python3 tests/integration/test_pxe_menu_safety.py
+            '

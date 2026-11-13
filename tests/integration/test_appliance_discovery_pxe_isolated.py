@@ -140,6 +140,8 @@ def main():
                        '--mount',f'type=bind,src={preseed_file},dst=/opt/pxe-tools/templates/discovery-preseed.cfg.j2,readonly',
                        '--mount',f'type=bind,src={discovery_file},dst=/opt/pxe-tools/templates/discover.sh.j2,readonly',
                        '--mount',f'type=bind,src={ROOT}/docker/worker/scripts/render_template.py,dst=/opt/pxe-tools/scripts/render_template.py,readonly',
+                       '--mount',f'type=bind,src={ROOT}/docker/worker/scripts/atomic_publish.py,dst=/opt/pxe-tools/scripts/atomic_publish.py,readonly',
+                       '--mount',f'type=bind,src={ROOT}/docker/worker/scripts/validate-pxe-menu-rows.py,dst=/opt/pxe-tools/scripts/validate-pxe-menu-rows.py,readonly',
                        '--mount',f'type=bind,src={render_per_mac},dst=/opt/pxe-tools/scripts/render-per-mac-pxelinux.sh,readonly',
                        '--mount',f'type=bind,src={render_dnsmasq},dst=/opt/pxe-tools/init/render-dnsmasq-conf.sh,readonly']
             docker('run','-d','--name',app,'--network','none','--cap-add','NET_ADMIN','--cap-add','NET_RAW',

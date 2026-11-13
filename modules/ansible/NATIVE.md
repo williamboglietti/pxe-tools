@@ -7,7 +7,7 @@ playbooks sous le compte système non privilégié `pxe-tools-ansible`. Son
 répertoire personnel et son espace de travail sont sous
 `/var/lib/pxe-tools-ansible` et restent présents après purge du module.
 
-Une fois le paquet additionnel publié dans le dépôt APT de PXE Tools :
+Après avoir configuré le dépôt APT selon le [README](../../README.md#installation-avec-apt), installez le paquet facultatif :
 
 ```sh
 sudo apt update
@@ -33,7 +33,7 @@ l’espace de travail et ne demande pas la suppression automatique d’Ansible C
 Pour compiler localement un candidat sans le publier :
 
 ```sh
-python3 packaging/native/build-local-ansible-package.py /chemin/absolu/nouveau.deb --release --version 0.1.0~beta1
+python3 packaging/native/build-local-ansible-package.py /chemin/absolu/nouveau.deb --release --version 0.1.0~beta2
 ```
 
 La vérification du runtime refuse un exécutable Ansible non attribué au paquet

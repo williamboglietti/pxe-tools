@@ -2,9 +2,8 @@
 
 PXE Tools fournit une interface web pour découvrir des machines et installer
 Debian par le réseau. Le socle comprend les services PXE, l'interface et son
-worker. Ansible reste facultatif et absent du socle. Le module complémentaire
-[en préparation](modules/ansible/NATIVE.md) s’utilise avec le worker existant ;
-son paquet APT n’est pas encore publié.
+worker. Ansible reste facultatif et absent du socle. Le [module complémentaire](modules/ansible/NATIVE.md) est disponible dans le
+dépôt APT et s’utilise avec le worker existant.
 
 La première cible native vérifiée est **Debian 13 amd64**. Les essais couvrent
 une installation APT, une installation Debian PXE et Secure Boot sur des VM
@@ -37,6 +36,15 @@ echo 'deb [signed-by=/usr/share/keyrings/pxe-tools-archive-keyring.gpg] https://
 sudo apt update
 sudo apt install --no-install-recommends pxe-tools
 ```
+
+Pour ajouter le module Ansible facultatif après l’installation du socle :
+
+```sh
+sudo apt install --no-install-recommends pxe-tools-ansible
+```
+
+Consultez le [guide du module natif](modules/ansible/NATIVE.md) pour préparer
+les accès, redémarrer le worker et activer explicitement le module.
 
 Ouvrez ensuite `http://adresse-du-serveur:8080/` et suivez l'assistant. Aucun
 proxy DHCP PXE n'est activé avant votre confirmation réseau. Un serveur DHCP

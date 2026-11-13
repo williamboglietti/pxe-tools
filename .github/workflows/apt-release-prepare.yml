@@ -81,6 +81,9 @@ jobs:
           [[ "$asset" =~ ^pxe-tools_[A-Za-z0-9._-]+_amd64\.deb$ ]]
           tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
           git merge-base --is-ancestor "$source" "$GITHUB_SHA"
+          # An upcoming release may already have advanced main's version. The
+          # approved package is bound to the version at its own source commit.
+          git show "$source:packaging/ci/release-version.txt" > "$RUNNER_TEMP/approved-version.txt"
           mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/candidate"
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/build-run.json"
@@ -96,7 +99,7 @@ jobs:
           python3 packaging/ci/verify-approved-release.py --manifest "$manifest" \
             --release-json "$RUNNER_TEMP/release.json" --build-json "$RUNNER_TEMP/build-run.json" \
             --build-jobs-json "$RUNNER_TEMP/build-jobs.json" \
-            --package "$RUNNER_TEMP/package/$asset" --version-file packaging/ci/release-version.txt \
+            --package "$RUNNER_TEMP/package/$asset" --version-file "$RUNNER_TEMP/approved-version.txt" \
             --tag-commit "$tag_commit" "${module_args[@]}"
           # First publication must compare exact bytes to the CI build. Once
           # GitHub's temporary artifact expires, renew only if the existing

@@ -65,6 +65,10 @@ class SnapshotTest(unittest.TestCase):
         jobs={'jobs':[{'name':'package','conclusion':'success'},
                       {'name':'application-behavior / Application behavior (Debian 13)','conclusion':'success'}]}
         approved.verify(manifest,release,build,jobs,package,vf,source)
+        vf.write_text('2.0~next\n')
+        with self.assertRaisesRegex(ValueError,'tracked version'):
+            approved.verify(manifest,release,build,jobs,package,vf,source)
+        vf.write_text(version+'\n')
         with self.assertRaisesRegex(ValueError,'tag'):
             approved.verify(manifest,release,build,jobs,package,vf,'b'*40)
         changed=dict(build,head_sha='b'*40)

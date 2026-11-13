@@ -22,6 +22,7 @@ MAC="<?= $mac ?>"
 WIPE_ID=<?= $wipe_id ?>
 
 ACTION_TOKEN="<?= $action_token ?? '' ?>"
+BOOT_TOKEN="<?= $boot_token ?>"
 ACTION_ID="<?= $action_id ?? '' ?>"
 ACTION_TYPE="<?= $action_type ?? '' ?>"
 POST_ACTION="<?= $post_action ?>"
@@ -85,7 +86,8 @@ log_line() {
     echo "$msg"
     if [ "$WIPE_ID" -gt 0 ] 2>/dev/null; then
         enc=$(echo "$msg" | sed 's/%/%25/g; s/ /%20/g; s|/|%2F|g; s/:/%3A/g; s/=/%3D/g; s/&/%26/g; s/+/%2B/g')
-        wget -q -O /dev/null "$API_BASE/wipe-progress?wipe_id=$WIPE_ID&line=$enc" 2>/dev/null || true
+        wget -q -O /dev/null --header="Authorization: Bearer $BOOT_TOKEN" \
+            "$API_BASE/wipe-progress?wipe_id=$WIPE_ID&mac=$MAC&line=$enc" 2>/dev/null || true
     fi
 }
 
@@ -336,7 +338,8 @@ else
 fi
 
 # ---- POST end --------------------------------------------------------------
-wget -q -O /dev/null "$API_BASE/wipe-end?wipe_id=$WIPE_ID&status=$overall_status" 2>/dev/null || true
+wget -q -O /dev/null --header="Authorization: Bearer $BOOT_TOKEN" \
+    "$API_BASE/wipe-end?wipe_id=$WIPE_ID&mac=$MAC&status=$overall_status" 2>/dev/null || true
 
 echo "================================================================"
 case "$POST_ACTION" in

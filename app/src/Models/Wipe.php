@@ -128,11 +128,13 @@ final class Wipe
         )->execute([$line, $id]);
     }
 
-    public static function end(int $id, string $status): void
+    public static function end(int $id, string $status): bool
     {
-        Db::get()->prepare(
-            'UPDATE wipes SET wipe_status = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ?'
-        )->execute([$status, $id]);
+        $stmt = Db::get()->prepare(
+            "UPDATE wipes SET wipe_status = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ? AND wipe_status IN ('pending','running')"
+        );
+        $stmt->execute([$status, $id]);
+        if ($stmt->rowCount() !== 1) return false;
 
         // Hook : recompute l'état agrégé de l'action parente si ce wipe lui est rattaché.
         // Guard null : les sous-jobs legacy (action_id IS NULL) sont silencieusement ignorés.
@@ -140,5 +142,6 @@ final class Wipe
         if ($row && !empty($row['action_id'])) {
             Action::recomputeEndState((int)$row['action_id']);
         }
+        return true;
     }
 }

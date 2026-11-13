@@ -496,11 +496,13 @@ final class DiskTest
         return $out;
     }
 
-    public static function end(int $id, string $status): void
+    public static function end(int $id, string $status): bool
     {
-        Db::get()->prepare(
-            'UPDATE disk_tests SET job_status = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ?'
-        )->execute([$status, $id]);
+        $stmt = Db::get()->prepare(
+            "UPDATE disk_tests SET job_status = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ? AND job_status IN ('pending','running')"
+        );
+        $stmt->execute([$status, $id]);
+        if ($stmt->rowCount() !== 1) return false;
 
         // Hook : recompute l'état agrégé de l'action parente si ce disk_test lui est rattaché.
         // Guard null : les sous-jobs legacy (action_id IS NULL) sont silencieusement ignorés.
@@ -508,6 +510,7 @@ final class DiskTest
         if ($row && !empty($row['action_id'])) {
             Action::recomputeEndState((int)$row['action_id']);
         }
+        return true;
     }
 
     /**

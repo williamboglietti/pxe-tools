@@ -9,6 +9,7 @@ use Admin\Models\BootSession;
 use Admin\Models\Discovery;
 use Admin\Models\Machine;
 use Admin\Models\MachineEvent;
+use Admin\Models\PxeBootObservation;
 use Admin\Models\Installation;
 use Admin\Models\Wipe;
 use Admin\Util\DiskIdentity;
@@ -21,7 +22,8 @@ use Admin\View;
 
 /**
  * Endpoints PXE — appelés par le preseed pendant l'install.
- * Pas d'auth (le client est la machine en cours d'install, pas un user).
+ * Pas de session utilisateur pour les clients PXE ; les callbacks qui écrivent
+ * l'état d'un job exigent un jeton limité à l'action et au boot de l'agent.
  */
 final class PxeController
 {
@@ -137,23 +139,22 @@ final class PxeController
         }
         $matches = Machine::findAllByMacs($payloadMacs);
 
+        // A client-reported interface list is not proof that two registered
+        // machines are the same host. Keep both records for administrator
+        // review, including an inventorying stub whose primary MAC would
+        // otherwise mask the established machine on later lookups.
+        if (count($matches) > 1) {
+            foreach ($matches as $row) {
+                MachineEvent::log((int)$row['id'], MachineEvent::LEVEL_WARNING,
+                    'Conflit de découverte multi-NIC : plusieurs fiches correspondent aux MAC déclarées. Vérifiez leur identité avant rapprochement manuel.');
+            }
+            View::json(['error' => 'conflicting machine identities'], 409);
+        }
+
         $existing = null;
         $mergedIds = [];
         if ($matches !== []) {
-            $existing = Machine::pickWinner($matches);
-            foreach ($matches as $row) {
-                if ((int)$row['id'] === (int)$existing['id']) continue;
-                MachineEvent::log(
-                    (int)$existing['id'],
-                    MachineEvent::LEVEL_INFO,
-                    "Fusion stub orphelin id={$row['id']} mac={$row['mac']} status={$row['status']}"
-                );
-                Machine::delete((int)$row['id']);
-                $mergedIds[] = (int)$row['id'];
-            }
-            if ($mergedIds !== []) {
-                error_log("PxeController::discovery: merged " . count($mergedIds) . " duplicate(s) into machine_id={$existing['id']} (ids=" . implode(',', $mergedIds) . ")");
-            }
+            $existing = $matches[0];
         }
 
         // Fenêtre d'attente post-discovery : 1h pour que l'admin choisisse une
@@ -501,23 +502,29 @@ final class PxeController
             return;
         }
 
+        $action = self::activeAgentAction($w, 'wipe');
+        if ($action === null) {
+            http_response_code(404);
+            return;
+        }
+        // Proxy DHCP may report only a MAC, and TFTP-only mode has no local
+        // DHCP hook. In those modes the isolated PXE subnet is the issuance
+        // boundary; bind the callback to IP only when DHCP observed the pair.
+        $observedIp = PxeBootObservation::recentMatches((int)$w['machine_id'], $mac, $remoteIp)
+            ? $remoteIp : null;
+        $boot_token = BootSession::issueAgentToken(
+            (int)$w['machine_id'], (int)$action['id'], $mac, 'wipe', $observedIp
+        );
+
         // Side-effect : passer le wipe en running dès que le client fetch son
         // script (équivalent au comportement legacy wipeJob).
         if ($w['wipe_status'] === 'pending') {
             Wipe::setStatus((int)$w['id'], 'running');
         }
 
-        $action_token = null;
-        $action_id    = null;
-        $action_type  = null;
-        if (!empty($w['action_id'])) {
-            $action = Action::findById((int)$w['action_id']);
-            if ($action !== null) {
-                $action_token = (string)($action['token'] ?? '');
-                $action_id    = (int)$action['id'];
-                $action_type  = (string)($action['type'] ?? '');
-            }
-        }
+        $action_token = (string)$action['token'];
+        $action_id    = (int)$action['id'];
+        $action_type  = (string)$action['type'];
 
         // Construit DISKS_PARSED au format "name|mode\nname|mode...\n" consommé
         // tel quel par la boucle while du script (plus de parsing JSON côté
@@ -560,7 +567,10 @@ final class PxeController
         if ($wipeId <= 0) {
             View::json(['status' => 'debug_ack']);
         }
-        if (!Wipe::find($wipeId)) View::json(['error' => 'wipe not found'], 404);
+        $w = Wipe::find($wipeId);
+        if (!$w) View::json(['error' => 'wipe not found'], 404);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($w, $mac, 'wipe')) View::json(['error' => 'not found'], 404);
 
         $line = '';
         // Cascade body, b64, line query
@@ -606,7 +616,10 @@ final class PxeController
         $w = Wipe::find($wipeId);
         if (!$w) View::json(['error' => 'wipe not found'], 404);
 
-        Wipe::end($wipeId, $statusParam);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($w, $mac, 'wipe')) View::json(['error' => 'not found'], 404);
+
+        if (!Wipe::end($wipeId, $statusParam)) View::json(['status' => 'ignored']);
 
         $machineId = (int)$w['machine_id'];
         $chainJson = $w['chain_install_config_json'] ?? null;
@@ -754,11 +767,43 @@ final class PxeController
         readfile($realPath);
     }
 
-    /**
-     * Vérif IPv4 dans CIDR (mini-clone de InternalApiController::ipInCidr
-     * pour éviter un couplage entre les 2 controllers). IPv4-only par design
-     * (cf. ipv6.disable=1 dans kernel cmdline du serveur PXE).
-     */
+    /** The job and action must describe the same live machine operation. */
+    private static function activeAgentAction(array $job, string $menu): ?array
+    {
+        $actionId = (int)($job['action_id'] ?? 0);
+        $machineId = (int)($job['machine_id'] ?? 0);
+        $action = $actionId > 0 ? Action::findById($actionId) : null;
+        $allowedTypes = $menu === 'wipe' ? [Action::TYPE_WIPE_ONLY, Action::TYPE_REINSTALL] : [Action::TYPE_DISKTEST];
+        if ($action === null || (int)$action['machine_id'] !== $machineId
+            || !in_array((string)$action['type'], $allowedTypes, true)
+            || !in_array((string)$action['status'], [Action::STATUS_PENDING, Action::STATUS_RUNNING], true)) return null;
+        return $action;
+    }
+
+    /** A boot token is valid only for its job, machine, MAC and HTTP peer. */
+    private static function agentCallbackAllowed(array $job, string $mac, string $menu): bool
+    {
+        $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+        $subnet = Setting::get(Setting::KEY_PXE_SUBNET, '') ?? '';
+        if ($mac === '' || !self::ipInPxeSubnet($remoteIp, $subnet)) return false;
+        $jobStatus = $menu === 'wipe' ? ($job['wipe_status'] ?? null) : ($job['job_status'] ?? null);
+        if (!in_array($jobStatus, ['pending', 'running'], true)) return false;
+        $machine = Machine::findByAnyMac($mac);
+        if ($machine === null || (int)$machine['id'] !== (int)$job['machine_id']) return false;
+        $action = self::activeAgentAction($job, $menu);
+        if ($action === null) return false;
+        $raw = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? '');
+        if ($raw === '' && function_exists('apache_request_headers')) {
+            foreach ((array)apache_request_headers() as $name => $value) {
+                if (strcasecmp((string)$name, 'Authorization') === 0) { $raw = (string)$value; break; }
+            }
+        }
+        $token = stripos($raw, 'Bearer ') === 0 ? trim(substr($raw, 7)) : '';
+        return BootSession::agentTokenValid($token, (int)$machine['id'], (int)$action['id'],
+            $mac, $menu, $remoteIp);
+    }
+
+    /** IPv4 PXE subnet check; never trust a forwarded client address. */
     private static function ipInPxeSubnet(string $ip, string $cidr): bool
     {
         if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return false;
@@ -777,10 +822,23 @@ final class PxeController
      */
     public function diskTestJob(array $params): void
     {
+        $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+        $subnet = Setting::get(Setting::KEY_PXE_SUBNET, '') ?? '';
+        if (!self::ipInPxeSubnet($remoteIp, $subnet)) View::json(['error' => 'not found'], 404);
         $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
         if ($mac === '') View::json(['error' => 'mac required'], 400);
         $t = DiskTest::activeByMac($mac);
         if (!$t) View::json(['error' => 'no active disk test job'], 404);
+        $action = self::activeAgentAction($t, 'disktest');
+        if ($action === null) {
+            View::json(['error' => 'not found'], 404);
+        }
+        // Same subnet fallback as wipeScript for proxy DHCP and TFTP-only.
+        $observedIp = PxeBootObservation::recentMatches((int)$t['machine_id'], $mac, $remoteIp)
+            ? $remoteIp : null;
+        $bootToken = BootSession::issueAgentToken(
+            (int)$t['machine_id'], (int)$action['id'], $mac, 'disktest', $observedIp
+        );
 
         if ($t['job_status'] === 'pending') {
             DiskTest::setStatus((int)$t['id'], 'running');
@@ -802,9 +860,11 @@ final class PxeController
             }
         }
         $jobs = DiskTest::agentJobs(json_decode((string)$t['jobs_json'], true) ?: []);
+        header('Cache-Control: no-store');
         View::json([
             'test_id'     => (int)$t['id'],
             'action_id'   => isset($t['action_id']) ? (int)$t['action_id'] : 0,
+            'boot_token'  => $bootToken,
             'parallel'    => (int)($t['parallel'] ?? 0) === 1,
             'jobs'        => $jobs,
             'post_action' => $t['post_action'] ?? 'poweroff',
@@ -827,6 +887,8 @@ final class PxeController
         if (!$t || !in_array((string)$t['job_status'], ['pending', 'running'], true)) {
             View::json(['status' => 'ignored']); // test fini/annulé : pas d'écriture posthume
         }
+        $mac = Machine::normalizeMac($src['mac'] ?? '');
+        if (!self::agentCallbackAllowed($t, $mac, 'disktest')) View::json(['error' => 'not found'], 404);
 
         $disk = rawurldecode((string)($src['disk'] ?? ''));
         $jobs = json_decode((string)$t['jobs_json'], true) ?: [];
@@ -864,7 +926,10 @@ final class PxeController
         if ($testId <= 0) {
             View::json(['status' => 'debug_ack']);
         }
-        if (!DiskTest::find($testId)) View::json(['error' => 'test not found'], 404);
+        $t = DiskTest::find($testId);
+        if (!$t) View::json(['error' => 'test not found'], 404);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($t, $mac, 'disktest')) View::json(['error' => 'not found'], 404);
 
         $line = '';
         $body = file_get_contents('php://input');
@@ -898,7 +963,10 @@ final class PxeController
     {
         $testId = (int)($_GET['test_id'] ?? $_POST['test_id'] ?? 0);
         if ($testId <= 0) View::json(['error' => 'test_id required'], 400);
-        if (!DiskTest::find($testId)) View::json(['error' => 'test not found'], 404);
+        $test = DiskTest::find($testId);
+        if (!$test) View::json(['error' => 'test not found'], 404);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($test, $mac, 'disktest')) View::json(['error' => 'not found'], 404);
 
         $body = file_get_contents('php://input');
         $payload = is_string($body) ? json_decode($body, true) : null;
@@ -946,7 +1014,11 @@ final class PxeController
     public function diskTestSmart(array $params): void
     {
         $testId = (int)($_GET['test_id'] ?? $_POST['test_id'] ?? 0);
-        $test = $testId > 0 ? DiskTest::find($testId) : null;
+        if ($testId <= 0) View::json(['error' => 'test_id required'], 400);
+        $test = DiskTest::find($testId);
+        if ($test === null) View::json(['error' => 'test not found'], 404);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($test, $mac, 'disktest')) View::json(['error' => 'not found'], 404);
         $raw = file_get_contents('php://input', false, null, 0, 1_048_577);
         $body = is_string($raw) ? $raw : '';
         $validation = DiskSmartSnapshot::validate(
@@ -990,13 +1062,15 @@ final class PxeController
         if ($testId <= 0) View::json(['error' => 'test_id required'], 400);
         $test = DiskTest::find($testId);
         if (!$test) View::json(['error' => 'test not found'], 404);
+        $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
+        if (!self::agentCallbackAllowed($test, $mac, 'disktest')) View::json(['error' => 'not found'], 404);
         $machineId = (int)$test['machine_id'];
         $result = \Admin\Util\MachineOperation::run($machineId, null, static function (array $machine) use ($machineId, $testId, $status): array {
             $test = DiskTest::find($testId);
             if (!$test || !in_array($test['job_status'], ['pending', 'running'], true)) return ['status' => 'ignored'];
             $outcome = DiskTest::completionOutcome($test, $status);
             $status = $outcome['status'];
-            DiskTest::end($testId, $status);
+            if (!DiskTest::end($testId, $status)) return ['status' => 'ignored'];
             $actionId = isset($test['action_id']) ? (int)$test['action_id'] : null;
             MachineEvent::log($machineId, $status === 'failed' ? MachineEvent::LEVEL_ERROR : MachineEvent::LEVEL_ACTION,
                 $outcome['incomplete'] ? 'Tests des disques incomplets ou indéterminés' : 'Tests des disques terminés', 'disktest_finished', $actionId);

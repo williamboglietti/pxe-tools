@@ -8,6 +8,7 @@ use Admin\Models\ActionCheckpoints;
 use Admin\Models\Installation;
 use Admin\Models\Machine;
 use Admin\Models\MachineEvent;
+use Admin\Models\PxeBootObservation;
 use Admin\Models\Setting;
 use Admin\Util\NetworkDetector;
 use Admin\Db;
@@ -285,6 +286,7 @@ final class InternalApiController
                         MachineEvent::LEVEL_INFO,
                         "Machine vue en DHCP (IP $ip) — en attente de discover.sh"
                     );
+                    $this->recordPxeBoot($newId, $mac, $ip);
                 } catch (\Throwable $e) {
                     // Race condition (2 DHCP simultanés sur même MAC), peu
                     // probable. Le 2e create lève une exception unique
@@ -295,6 +297,7 @@ final class InternalApiController
                 return;
             }
             $machineId = (int)$machine['id'];
+            $this->recordPxeBoot($machineId, $mac, $ip);
 
             // Cherche action en cours (running ou pending) pour la machine.
             // On prend la plus récente (cas reinstall : 2 actions chainable mais
@@ -595,12 +598,14 @@ final class InternalApiController
                     MachineEvent::LEVEL_INFO,
                     "Machine vue en DHCP proxy" . ($ip !== '' ? " (IP $ip)" : '') . " — en attente de discover.sh"
                 );
+                $this->recordPxeBoot($newId, $mac, $ip);
             } catch (\Throwable $e) {
                 error_log('[internal-api] dnsmasq-tail early-reg failed: ' . $e->getMessage());
             }
             return;
         }
         $machineId = (int)$machine['id'];
+        $this->recordPxeBoot($machineId, $mac, $ip);
 
         // Cherche action en cours pour la machine, comme dhcpEvent.
         $stmt = Db::get()->prepare(
@@ -964,6 +969,15 @@ final class InternalApiController
         header('X-Content-Type-Options: nosniff');
         echo json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         exit;
+    }
+
+    /** Only the local DHCP hook can establish a boot MAC/IP pair. */
+    private function recordPxeBoot(int $machineId, string $mac, string $ip): void
+    {
+        $subnet = Setting::get(self::SETTING_PXE_SUBNET, '') ?? '';
+        if ($this->ipInCidr($ip, $subnet)) {
+            PxeBootObservation::record($machineId, $mac, $ip);
+        }
     }
 
     /** Extrait l'IP source (REMOTE_ADDR). */

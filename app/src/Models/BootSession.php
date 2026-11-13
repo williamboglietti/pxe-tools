@@ -9,6 +9,7 @@ use Admin\Db;
 final class BootSession
 {
     public const MENUS = ['discovery', 'wipe', 'install', 'disktest', 'rescue', 'local', 'other'];
+    private const AGENT_MARKER = 'agent_callback';
 
     public static function label(string $menu): string
     {
@@ -85,14 +86,67 @@ final class BootSession
         return $stmt->fetchColumn() === $menu;
     }
 
+    /** Mint a callback-only token at the script/job fetch for one active action. */
+    public static function issueAgentToken(int $machineId, int $actionId, string $mac, string $menu, ?string $observedIp): string
+    {
+        if ($machineId <= 0 || $actionId <= 0 || $mac === ''
+            || !in_array($menu, ['wipe', 'disktest'], true)) {
+            throw new \InvalidArgumentException('Invalid PXE agent session');
+        }
+        $token = bin2hex(random_bytes(32));
+        $pdo = Db::get();
+        $owns = !$pdo->inTransaction();
+        if ($owns) $pdo->beginTransaction();
+        try {
+            // Serialize repeated script/job fetches and revoke every previous
+            // callback capability for this action before issuing the new one.
+            $pdo->prepare('UPDATE actions SET id = id WHERE id = ?')->execute([$actionId]);
+            $pdo->prepare('DELETE FROM boot_sessions WHERE machine_id = ? AND action_id = ? '
+                . 'AND mac = ? AND default_menu = ? AND selected_menu = ?')
+                ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER]);
+            $pdo->prepare('INSERT INTO boot_sessions '
+                . '(machine_id, action_id, mac, default_menu, selected_menu, token, client_ip) '
+                . 'VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER, $token, $observedIp]);
+            if ($owns) $pdo->commit();
+        } catch (\Throwable $error) {
+            if ($owns && $pdo->inTransaction()) $pdo->rollBack();
+            throw $error;
+        }
+        return $token;
+    }
+
+    public static function agentTokenValid(
+        string $token,
+        int $machineId,
+        int $actionId,
+        string $mac,
+        string $menu,
+        string $clientIp
+    ): bool {
+        if (strlen($token) !== 64 || !ctype_xdigit($token) || $machineId <= 0 || $actionId <= 0
+            || $mac === '' || $clientIp === '' || !in_array($menu, ['wipe', 'disktest'], true)) return false;
+        $stmt = Db::get()->prepare('SELECT token, client_ip FROM boot_sessions '
+            . 'WHERE token = ? AND machine_id = ? AND action_id = ? AND mac = ? '
+            . 'AND default_menu = ? AND selected_menu = ? '
+            . "AND COALESCE(selected_at, served_at) >= datetime('now', '-24 hours') LIMIT 1");
+        $stmt->execute([$token, $machineId, $actionId, $mac, $menu, self::AGENT_MARKER]);
+        $row = $stmt->fetch();
+        if (!is_array($row) || !hash_equals((string)$row['token'], $token)
+            || ($row['client_ip'] !== null && !hash_equals((string)$row['client_ip'], $clientIp))) return false;
+        $refresh = Db::get()->prepare('UPDATE boot_sessions SET selected_at = CURRENT_TIMESTAMP WHERE token = ?');
+        $refresh->execute([$token]);
+        return $refresh->rowCount() === 1;
+    }
+
     /** @return array<int,array<string,mixed>> */
     public static function recentForMachine(int $machineId, int $limit = 8): array
     {
         if ($machineId <= 0) return [];
         $stmt = Db::get()->prepare('SELECT id, action_id, mac, default_menu, selected_menu, '
             . 'served_at, selected_at FROM boot_sessions WHERE machine_id = ? '
-            . 'ORDER BY id DESC LIMIT ?');
-        $stmt->execute([$machineId, max(1, min($limit, 30))]);
+            . 'AND (selected_menu IS NULL OR selected_menu != ?) ORDER BY id DESC LIMIT ?');
+        $stmt->execute([$machineId, self::AGENT_MARKER, max(1, min($limit, 30))]);
         return $stmt->fetchAll() ?: [];
     }
 }

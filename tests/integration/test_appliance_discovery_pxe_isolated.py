@@ -206,6 +206,18 @@ def main():
                 return (inventory.get('boot_mac')=='02:00:00:00:00:01'
                         and inventory.get('inventory',{}).get('cpu_arch')=='x86_64')
             wait_for(discovered,1500,'Discovery inventory')
+            with sqlite3.connect(data/'pxe-tools.sqlite') as db:
+                row=db.execute('SELECT id,inventory_json FROM machines WHERE mac=?',
+                               ('02:00:00:00:00:01',)).fetchone()
+                inventory=json.loads(row[1])
+                observed='PXE DHCP observed '+json.dumps(
+                    {'mac':'02:00:00:00:00:01','ip':inventory['discovery_ip']},
+                    separators=(',',':'))
+                found=db.execute("SELECT 1 FROM machine_events WHERE machine_id=? "
+                                 "AND checkpoint='pxe_boot_observed' AND message=? LIMIT 1",
+                                 (row[0],observed)).fetchone()
+            if not found:
+                raise RuntimeError('proxy DHCP did not establish a MAC/IP boot observation')
             wait_for(lambda:'/api/discovery-action' in docker('exec',app,'cat','/var/log/nginx/pxe-access.log').stdout,
                      60,'first Discovery action poll')
             logs=docker('exec',app,'cat','/var/log/nginx/pxe-access.log').stdout

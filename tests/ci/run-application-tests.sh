@@ -47,6 +47,7 @@ echo '::endgroup::'
 echo '::group::Signed Debian netboot freshness and integrity'
 python3 tests/unit/test_debian_release_freshness.py
 PXE_FRESHNESS_ISOLATED=1 python3 tests/integration/test_debian_netboot_freshness.py
+PXE_DOWNLOAD_ISOLATED=1 python3 tests/integration/test_verified_image_publication.py
 python3 tests/unit/test_prototype_debian_netboot_freshness.py
 echo '::endgroup::'
 

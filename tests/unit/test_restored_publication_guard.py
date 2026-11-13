@@ -40,6 +40,24 @@ class GuardTests(unittest.TestCase):
                 guard.check(root)
             self.assertEqual(asset.read_text(), 'fixture')
 
+    def test_only_complete_netboot_aliases_are_accepted(self):
+        with tempfile.TemporaryDirectory(prefix='pxe-publication-check-', dir='/root') as tmp:
+            root = Path(tmp) / 'http'
+            target = root/'netboot/debian/13/amd64'
+            target.mkdir(mode=0o755, parents=True)
+            for name in ('linux', 'initrd.gz'):
+                (target/name).write_text('fixture')
+                (target/name).chmod(0o644)
+            parent = root/'netboot/trixie'
+            parent.mkdir(mode=0o755)
+            alias = parent/'amd64'
+            alias.symlink_to('../debian/13/amd64')
+            guard.check(root)
+            (target/'linux').unlink()
+            with self.assertRaises(ValueError):
+                guard.check(root)
+            self.assertTrue(alias.is_symlink())
+
     def test_tftp_exception_and_service_readability(self):
         with tempfile.TemporaryDirectory(prefix='pxe-publication-check-', dir='/root') as tmp:
             root = Path(tmp) / 'tftp'

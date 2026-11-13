@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 import stat
 import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backup.assets import netboot_alias_target
+from backup.openpgp import BackupError
 
 
 def check(path, *, tftp=False):
@@ -12,8 +15,20 @@ def check(path, *, tftp=False):
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError(f'chemin absolu sans .. requis : {path}')
 
+    aliases = {}
+    kinds = {}
+
     def verify(p, directory=False, staged=False):
         info = p.lstat()
+        if staged and stat.S_ISLNK(info.st_mode):
+            if tftp or info.st_uid != 0:
+                raise ValueError(f'lien interdit : {p}')
+            name = 'http/' + str(p.relative_to(path))
+            aliases[name] = os.readlink(p)
+            return
+        if staged:
+            name = ('tftp' if tftp else 'http') + ('/' + str(p.relative_to(path)) if p != path else '')
+            kinds[name] = 'dir' if stat.S_ISDIR(info.st_mode) else 'file'
         menu = staged and tftp and p == path / 'pxelinux.cfg'
         lock = staged and tftp and p == path / '.pxe-menu.lock'
         permitted_group_write = menu or lock
@@ -41,6 +56,11 @@ def check(path, *, tftp=False):
     for root, dirs, files in os.walk(path, followlinks=False, onerror=lambda e: (_ for _ in ()).throw(e)):
         for name in dirs + files:
             verify(Path(root) / name, staged=True)
+    for name, target in aliases.items():
+        try:
+            netboot_alias_target(name, target, kinds)
+        except BackupError as exc:
+            raise ValueError(f'alias netboot invalide : {name}') from exc
 
 
 def main():
@@ -57,7 +77,7 @@ def main():
             check(args.http)
         if args.tftp:
             check(args.tftp, tftp=True)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, BackupError) as exc:
         print(f'Contrôle refusé : {exc}', file=sys.stderr)
         return 1
     print('Arbres contrôlés ; vérifiez aussi leur contenu avant toute activation.')

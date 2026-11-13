@@ -50,14 +50,14 @@ et non modifiable par d'autres. La correspondance entre la base, sa clé et le
 fichier de configuration reste à confirmer par l'administrateur. Sans MOK
 restaurée, les clients Secure Boot déjà enrôlés peuvent nécessiter un nouvel
 enrôlement. Le lien natif prédéfini `http/static-bin` est exclu : le paquet le
-recrée au démarrage. Tous les autres liens symboliques, les fichiers spéciaux et les permissions
-spéciales sont refusés, à l’export comme à la restauration. Une ancienne archive
-contenant de tels liens ne peut pas être restaurée par cette version ; conservez
-la source et examinez ces liens avant une nouvelle sauvegarde. Les téléchargeurs
-peuvent créer des alias `netboot/<codename>/<arch>` : leur présence fait actuellement
-refuser la sélection HTTP. Ne supprimez pas ces alias pour contourner ce refus :
-ils peuvent être nécessaires au démarrage ; leur sauvegarde et leur recréation sûre
-restent à implémenter.
+recrée au démarrage. Les alias netboot générés par les téléchargeurs sont conservés uniquement sous
+la forme `netboot/<codename>/<arch> -> ../<distro>/<version>/<arch>` : la cible
+doit être un répertoire inclus contenant `linux` et `initrd.gz`. Leur archive
+utilise le format 4 ; les lecteurs plus anciens la refusent. Tous les autres
+liens symboliques, les fichiers spéciaux et les permissions spéciales sont
+refusés, à l’export comme à la restauration. Une ancienne archive contenant des
+liens non pris en charge ne peut pas être restaurée par cette version ;
+conservez la source et examinez ces liens avant une nouvelle sauvegarde.
 
 Les chemins HTTP, MOK et TFTP indiqués sont ceux des nouvelles installations natives
 protégées. Une installation antérieure peut encore utiliser respectivement
@@ -146,7 +146,8 @@ systemctl is-active pxe-tools-init.service pxe-tools-php.service pxe-tools-nginx
 curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/
 ```
 
-Le contrôle refuse les chemins ou fichiers non détenus par root, les liens et
+Le contrôle refuse les chemins ou fichiers non détenus par root, les liens autres
+que les alias netboot validés ci-dessus, et
 les permissions d'écriture accordées au groupe ou à d'autres utilisateurs, y
 compris sur les répertoires parents. Pour TFTP seulement, il accepte l'écriture
 de groupe sur `pxelinux.cfg` et `.pxe-menu.lock` : ces deux éléments sont repris
@@ -175,8 +176,8 @@ le module, sans réutiliser aveuglément des UID/GID numériques. Vérifiez en
 particulier les permissions et l'usage des clés SSH avant de reprendre des tâches.
 
 Utilisez sur la destination une version du paquet qui reconnaît les catégories
-sélectionnées. La bêta précédente peut refuser les archives contenant TLS ou
-Ansible ; conservez une copie du paquet compatible avec vos sauvegardes.
+sélectionnées. Les versions précédentes peuvent refuser les archives contenant TLS,
+Ansible ou les alias netboot ; conservez une copie du paquet compatible avec vos sauvegardes.
 
 Connectez-vous avec le compte restauré, revoyez les paramètres réseau et les
 fichiers de démarrage, puis confirmez explicitement toute activation PXE. Les

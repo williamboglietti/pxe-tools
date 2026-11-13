@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 from .openpgp import BackupError, MAX_ARCHIVE, MAX_PLAINTEXT, _decrypt_bounded, _gpg_home, _publish, encrypt_file
 from .assets import (MAX_ASSET_BYTES, MAX_ASSET_ENTRIES, TREE_CATEGORIES, add_tree,
-                     inspect_tree, safe_asset_name)
+                     inspect_tree, netboot_alias_target, safe_asset_name)
 
 MAX_DB = 512 * 1024 * 1024
 MANIFEST = {'format': 'pxe-tools-offline-recovery', 'version': 1,
@@ -193,11 +193,11 @@ def _read_options(db_config: Path | None, mok_dir: Path | None) -> dict[str, byt
     return files
 
 
-def _manifest(options: dict[str, bytes], trees: tuple[str, ...] = ()) -> dict:
+def _manifest(options: dict[str, bytes], trees: tuple[str, ...] = (), *, aliases: bool = False) -> dict:
     selected = [category for category, files in OPTIONAL_FILES.items() if all(name in options for name in files)]
     selected_trees = [name for name in TREE_CATEGORIES if name in trees]
     if selected_trees:
-        return {**MANIFEST, 'version': 3, 'includes': [*MANIFEST['includes'], *selected, *selected_trees]}
+        return {**MANIFEST, 'version': 4 if aliases else 3, 'includes': [*MANIFEST['includes'], *selected, *selected_trees]}
     return ({**MANIFEST, 'version': 2, 'includes': [*MANIFEST['includes'], *selected]} if selected else MANIFEST)
 
 
@@ -261,7 +261,7 @@ def export_recovery(database: Path, key: Path, destination: Path, passphrase: by
             with plain.open('xb') as stream:
                 os.chmod(plain, 0o600)
                 with tarfile.open(fileobj=stream, mode='w', format=tarfile.USTAR_FORMAT) as tar:
-                    info, data = _tar_member('manifest.json', json.dumps(_manifest(options, tuple(roots)), separators=(',', ':')).encode())
+                    info, data = _tar_member('manifest.json', json.dumps(_manifest(options, tuple(roots), aliases=any(value[0] == 'link' for tree in records.values() for value in tree.values())), separators=(',', ':')).encode())
                     tar.addfile(info, data)
                     info, data = _tar_member('master.key', master_key)
                     tar.addfile(info, data)
@@ -339,6 +339,10 @@ def _unpack_authenticated(plain: Path, root: Path) -> tuple[list[str], dict, dic
                     if target.stat().st_size != member.size:
                         raise BackupError('truncated asset file')
                     files[member.name] = member.mode
+                elif member.issym():
+                    if member.size != 0:
+                        raise BackupError('invalid asset link')
+                    links[member.name] = member.linkname
                 else:
                     raise BackupError('unsupported asset file type')
                 seen.add(member.name)
@@ -370,7 +374,10 @@ def _unpack_authenticated(plain: Path, root: Path) -> tuple[list[str], dict, dic
     optional_names = seen & (allowed - mandatory)
     optional = {name: (root/name).read_bytes() for name in optional_names}
     trees = tuple(name for name, prefix in TREE_CATEGORIES.items() if prefix in directories)
-    expected_manifest = _manifest(optional, trees)
+    kinds = {**{name: 'dir' for name in directories}, **{name: 'file' for name in files}}
+    for name, target in links.items():
+        netboot_alias_target(name, target, kinds)
+    expected_manifest = _manifest(optional, trees, aliases=bool(links))
     expected_files = mandatory | {name for category, files in OPTIONAL_FILES.items()
                                   if category in expected_manifest['includes'] for name in files}
     expected_files |= set(directories) | set(files) | set(links)

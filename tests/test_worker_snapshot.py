@@ -82,9 +82,8 @@ class RecoveryTests(unittest.TestCase):
             self.assertTrue(gh.call_args.args[-1].endswith('/150'))
 
     def test_503_does_not_authorize_bootstrap(self):
-        error = urllib.error.HTTPError('https://example.invalid', 503, 'unavailable', {}, None)
-        with patch.object(module.urllib.request, 'urlopen', side_effect=error):
-            with self.assertRaises(urllib.error.HTTPError): module.live_release()
+        with patch.object(module.public_http, 'fetch', return_value=(503, b'')):
+            with self.assertRaisesRegex(ValueError, 'HTTP 503'): module.live_release()
 
     def test_bootstrap_only_when_no_prior_assets(self):
         metadata = {'tag_name':'apt-snapshots', 'draft':False, 'id': 123, 'assets':[]}

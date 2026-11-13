@@ -17,9 +17,9 @@ class Reply:
 
 class PropagationTests(unittest.TestCase):
     def test_stale_200_then_expected(self):
-        with patch.object(module.urllib.request, 'urlopen', side_effect=[Reply(b'old'), Reply(b'new')]), patch.object(module.time, 'sleep') as sleep:
+        with patch.object(module.public_http, 'fetch', side_effect=[(200, b'old'), (200, b'new')]), patch.object(module.time, 'sleep') as sleep:
             module.wait(b'new', attempts=2, delay=1)
             sleep.assert_called_once_with(1)
     def test_stale_200_remains_failure(self):
-        with patch.object(module.urllib.request, 'urlopen', return_value=Reply(b'old')), patch.object(module.time, 'sleep'):
+        with patch.object(module.public_http, 'fetch', return_value=(200, b'old')), patch.object(module.time, 'sleep'):
             with self.assertRaises(ValueError): module.wait(b'new', attempts=2, delay=1)

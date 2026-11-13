@@ -89,6 +89,8 @@ def main():
         assert json.loads((alias_output/'manifest.json').read_text())['version']==4
         assert os.readlink(alias_output/'http/netboot/trixie/amd64')=='../debian/13/amd64'
         assert (alias_output/'http/netboot/trixie/amd64/initrd.gz').read_bytes()==b'fixture-initrd'
+        # The CI tmpfs is bounded: these v4 fixtures are no longer needed.
+        shutil.rmtree(alias_output); alias_archive.unlink()
         alias.unlink()
         for n, target in enumerate(('/etc', '../../outside', '../debian/13/arm64',
                                      '../trixie/amd64/amd64', '../debian/unknown/amd64')):

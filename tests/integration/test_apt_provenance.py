@@ -102,5 +102,55 @@ class SnapshotTest(unittest.TestCase):
                 '--output',str(old_signed),'--clearsign',str(old))
             proof.verify(old_signed,self.keyring,manifest,self.primary,self.signing,packages)
 
+    def test_optional_module_is_bound_to_release_build_and_signed_index(self):
+        version='0.1.0~beta1';source='a'*40;run_id='123';tag='vfixture'
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            def package(name, arch, depends=''):
+                folder=root/name;(folder/'DEBIAN').mkdir(parents=True)
+                (folder/'DEBIAN/control').write_text(
+                    f'Package: {name}\nVersion: {version}\nArchitecture: {arch}\n'
+                    f'Maintainer: Fixture <fixture@example.invalid>\n'
+                    + (f'Depends: {depends}\n' if depends else '') + 'Description: fixture\n')
+                filename=f'{name}_0.1.0-beta1_{arch}.deb';deb=root/filename
+                run('dpkg-deb','--build','--root-owner-group',str(folder),str(deb))
+                return deb
+            base=package('pxe-tools','amd64')
+            module=package('pxe-tools-ansible','all',
+                           'pxe-tools (>= 0.1.0~beta1), pxe-tools (<< 0.2~), ansible-core')
+            base_sha=mod.digest(base.read_bytes());module_sha=mod.digest(module.read_bytes())
+            manifest={'version':version,'release_tag':tag,'source_commit':source,'build_run_id':run_id,
+                      'package_asset':base.name,'package_sha256':base_sha,'ansible_version':version,
+                      'ansible_package_asset':module.name,'ansible_package_sha256':module_sha}
+            release={'tag_name':tag,'draft':False,'prerelease':True,'published_at':'fixture','assets':[
+                {'name':p.name,'state':'uploaded','size':p.stat().st_size,'digest':'sha256:'+sha}
+                for p,sha in ((base,base_sha),(module,module_sha))]}
+            build={'path':'.github/workflows/apt-package-candidate.yml','id':123,'head_sha':source,
+                   'head_branch':'main','event':'workflow_dispatch','conclusion':'success'}
+            jobs={'jobs':[{'name':'package','conclusion':'success'},
+                          {'name':'application-behavior / Application behavior (Debian 13)','conclusion':'success'}]}
+            vf=root/'version';vf.write_text(version+'\n')
+            approved.verify(manifest,release,build,jobs,base,vf,source,module)
+            with self.assertRaisesRegex(ValueError,'module'):
+                approved.verify(manifest,release,build,jobs,base,vf,source,None)
+            with self.assertRaisesRegex(ValueError,'module'):
+                approved.verify({**manifest,'ansible_package_sha256':'b'*64},release,build,jobs,base,vf,source,module)
+            repository=root/'repository'
+            common=['python3',str(ROOT/'packaging/native/build-apt-release-candidate.py'),str(base),str(repository),
+                    '--gnupg-home',str(self.home),'--fingerprint',self.signing,'--valid-days','2',
+                    '--source-commit',source,'--build-run-id',run_id,'--approved-package-sha256',base_sha,
+                    '--ansible-package',str(module),'--approved-ansible-sha256',module_sha,
+                    '--previous',str(self.repo)]
+            run(*common)
+            signed=repository/'dists/stable/InRelease';packages=repository/'dists/stable/main/binary-amd64/Packages'
+            proof.verify(signed,self.keyring,manifest,self.primary,self.signing,packages)
+            with self.assertRaisesRegex(ValueError,'module'):
+                proof.verify(signed,self.keyring,{**manifest,'ansible_package_sha256':'b'*64},self.primary,self.signing,packages)
+            without_module={k:v for k,v in manifest.items() if not k.startswith('ansible_')}
+            with self.assertRaisesRegex(ValueError,'module'):
+                proof.verify(signed,self.keyring,without_module,self.primary,self.signing,packages)
+            failed=subprocess.run(common[:3]+[str(root/'bad')]+common[4:-3]+['b'*64]+common[-2:],capture_output=True)
+            self.assertNotEqual(failed.returncode,0)
+
 
 if __name__ == '__main__': unittest.main()

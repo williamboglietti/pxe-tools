@@ -35,6 +35,8 @@ def main() -> None:
     parser.add_argument('--source-commit')
     parser.add_argument('--build-run-id')
     parser.add_argument('--approved-package-sha256')
+    parser.add_argument('--ansible-package', type=Path)
+    parser.add_argument('--approved-ansible-sha256')
     args = parser.parse_args()
     primary = args.primary_fingerprint.upper()
     signing = args.signing_fingerprint.upper()
@@ -88,6 +90,11 @@ def main() -> None:
                           '--valid-days', str(args.valid_days), '--passphrase-file', str(password_file)]
             if args.previous is not None:
                 build_args += ['--previous', str(args.previous)]
+            if (args.ansible_package is None) != (args.approved_ansible_sha256 is None):
+                raise ValueError('the module and its approved SHA256 must be supplied together')
+            if args.ansible_package is not None:
+                build_args += ['--ansible-package', str(args.ansible_package),
+                               '--approved-ansible-sha256', args.approved_ansible_sha256]
             provenance = (args.source_commit, args.build_run_id, args.approved_package_sha256)
             if any(value is not None for value in provenance):
                 if not all(value is not None for value in provenance):

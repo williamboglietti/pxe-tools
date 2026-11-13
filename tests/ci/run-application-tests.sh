@@ -57,3 +57,9 @@ echo '::endgroup::'
 echo '::group::Install-log HTTP request under SQLite contention'
 PXE_INSTALL_LOG_HTTP_ISOLATED=1 python3 tests/integration/test_install_log_http_contention.py
 echo '::endgroup::'
+
+echo '::group::Optional Ansible package and Vault execution'
+python3 tests/unit/test_ansible_runtime_observation.py
+python3 tests/integration/test_ansible_runtime.py
+python3 tests/integration/test_ansible_module_candidate.py
+echo '::endgroup::'

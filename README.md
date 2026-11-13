@@ -2,8 +2,9 @@
 
 PXE Tools fournit une interface web pour découvrir des machines et installer
 Debian par le réseau. Le socle comprend les services PXE, l'interface et son
-worker. Ansible n'est pas installé par le paquet ; son module complémentaire
-n'est pas encore publié.
+worker. Ansible reste facultatif et absent du socle. Le module complémentaire
+[en préparation](modules/ansible/NATIVE.md) s’utilise avec le worker existant ;
+son paquet APT n’est pas encore publié.
 
 La première cible native vérifiée est **Debian 13 amd64**. Les essais couvrent
 une installation APT, une installation Debian PXE et Secure Boot sur des VM

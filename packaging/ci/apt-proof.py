@@ -36,26 +36,40 @@ def validate_keyring(keyring: Path, primary: str, signing: str) -> None:
         raise ValueError('Keyring must contain only the expected public primary and signing subkey')
 
 
-def package_identity(snapshot: dict[str, bytes]) -> tuple[str, str]:
+def package_identity(snapshot: dict[str, bytes], module: tuple[str, str] | None = None) -> tuple[str, str]:
     path = 'dists/stable/main/binary-amd64/Packages'
     paragraphs = snapshot[path].decode('utf-8').strip().split('\n\n')
-    if len(paragraphs) != 1:
-        raise ValueError('A release must contain exactly one base package')
-    fields = {}
-    for line in paragraphs[0].splitlines():
-        if line and not line[0].isspace() and ': ' in line:
-            key, value = line.split(': ', 1)
-            if key in fields: raise ValueError('Duplicate package field')
-            fields[key] = value
+    expected = {'pxe-tools': 'amd64'}
+    if module is not None:
+        expected['pxe-tools-ansible'] = 'all'
+    packages = {}
+    for paragraph in paragraphs:
+        fields = {}
+        for line in paragraph.splitlines():
+            if line and not line[0].isspace() and ': ' in line:
+                key, value = line.split(': ', 1)
+                if key in fields: raise ValueError('Duplicate package field')
+                fields[key] = value
+        name = fields.get('Package', '')
+        if name not in expected or name in packages or fields.get('Architecture') != expected[name]:
+            raise ValueError('Unexpected or duplicate package identity')
+        packages[name] = fields
+    if set(packages) != set(expected):
+        raise ValueError('The approved package set is incomplete')
+    fields = packages['pxe-tools']
     version, sha = fields.get('Version', ''), fields.get('SHA256', '')
     if (fields.get('Package') != 'pxe-tools' or fields.get('Architecture') != 'amd64'
             or not re.fullmatch(r'[0-9][A-Za-z0-9.+~_-]{0,100}', version)
             or not re.fullmatch(r'[a-f0-9]{64}', sha)):
         raise ValueError('Unexpected package identity')
+    if module is not None and (packages['pxe-tools-ansible'].get('Version'),
+                               packages['pxe-tools-ansible'].get('SHA256')) != module:
+        raise ValueError('The approved module differs from the signed index')
     return version, sha
 
 
-def verify_provenance(release: bytes, version: str, sha: str, source: str, build_run: str) -> None:
+def verify_provenance(release: bytes, version: str, sha: str, source: str, build_run: str,
+                      module: tuple[str, str] | None = None) -> None:
     if (not re.fullmatch(r'[a-f0-9]{40}', source) or not re.fullmatch(r'[1-9][0-9]{0,19}', build_run)
             or not re.fullmatch(r'[a-f0-9]{64}', sha)):
         raise ValueError('Invalid approved build provenance')
@@ -65,3 +79,8 @@ def verify_provenance(release: bytes, version: str, sha: str, source: str, build
         matches = [line for line in text if line.startswith(field+':')]
         if matches != [field+': '+value]:
             raise ValueError('Signed APT provenance does not match the approved build')
+    for field, value in (('X-PXE-Ansible-Version', module[0] if module else None),
+                         ('X-PXE-Ansible-SHA256', module[1] if module else None)):
+        matches = [line for line in text if line.startswith(field+':')]
+        if matches != ([field+': '+value] if value is not None else []):
+            raise ValueError('Signed module provenance does not match the approved build')

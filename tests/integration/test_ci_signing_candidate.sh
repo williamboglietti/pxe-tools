@@ -49,6 +49,34 @@ grep -Fx "X-PXE-Source-Commit: $fixture_commit" "$fixture/good/dists/stable/Rele
 grep -Fx 'X-PXE-Build-Run: 123' "$fixture/good/dists/stable/Release" >/dev/null
 grep -Fx "X-PXE-Package-SHA256: $fixture_sha" "$fixture/good/dists/stable/Release" >/dev/null
 grep -Fx 'X-PXE-Package-Version: 1.0~fixture1' "$fixture/good/dists/stable/Release" >/dev/null
+# Verify the CI signing entry point handles both separately approved packages.
+mkdir -p "$fixture/module/DEBIAN" "$fixture/module-base/DEBIAN"
+sed 's/Version: 1.0~fixture1/Version: 0.1.0~beta1/' "$fixture/package/DEBIAN/control" > "$fixture/module-base/DEBIAN/control"
+cat > "$fixture/module/DEBIAN/control" <<'CONTROL'
+Package: pxe-tools-ansible
+Version: 0.1.0~beta1
+Architecture: all
+Maintainer: Fixture <fixture@example.invalid>
+Depends: pxe-tools (>= 0.1.0~beta1), pxe-tools (<< 0.2~), ansible-core
+Description: synthetic module
+CONTROL
+dpkg-deb --build --root-owner-group "$fixture/module-base" "$fixture/module-base.deb" >/dev/null
+dpkg-deb --build --root-owner-group "$fixture/module" "$fixture/module.deb" >/dev/null
+base_sha=$(sha256sum "$fixture/module-base.deb" | awk '{print $1}')
+module_sha=$(sha256sum "$fixture/module.deb" | awk '{print $1}')
+python3 "$helper" "$fixture/module-base.deb" "$fixture/with-module" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" --valid-days 1 \
+    --source-commit "$fixture_commit" --build-run-id 123 --approved-package-sha256 "$base_sha" \
+    --ansible-package "$fixture/module.deb" --approved-ansible-sha256 "$module_sha" > "$fixture/module.log" 2>&1
+grep -Fx "X-PXE-Ansible-SHA256: $module_sha" "$fixture/with-module/dists/stable/Release" >/dev/null
+grep -Fx 'Package: pxe-tools-ansible' "$fixture/with-module/dists/stable/main/binary-amd64/Packages" >/dev/null
+if python3 "$helper" "$fixture/module-base.deb" "$fixture/with-bad-module" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" \
+    --source-commit "$fixture_commit" --build-run-id 123 --approved-package-sha256 "$base_sha" \
+    --ansible-package "$fixture/module.deb" --approved-ansible-sha256 "$(printf '%064d' 0)" > "$fixture/bad-module.log" 2>&1; then
+    echo 'Mismatched module unexpectedly signed' >&2; exit 1
+fi
+test ! -e "$fixture/with-bad-module"
 if python3 "$helper" "$fixture/package.deb" "$fixture/wrong-provenance" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" \
     --source-commit "$fixture_commit" --build-run-id 123 --approved-package-sha256 "$(printf '%064d' 0)" > "$fixture/provenance-error.log" 2>&1; then
@@ -68,6 +96,23 @@ test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
 cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"
 gpgv --keyring "$fixture/exported-public.gpg" "$fixture/next/dists/stable/InRelease" > /dev/null 2>&1
+# Exercise a real APT client against the signed two-package snapshot, without
+# installing anything on the test host or changing its configured sources.
+mkdir -p "$fixture/module-lists/partial" "$fixture/module-download"
+touch "$fixture/module-status"
+printf 'deb [signed-by=%s/public.gpg] file:%s/with-module stable main\n' "$fixture" "$fixture" > "$fixture/module.list"
+apt_options=(-o "APT::Sandbox::User=$(id -un)" -o "Dir::Etc::sourcelist=$fixture/module.list"
+    -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$fixture/module-lists"
+    -o "Dir::State::status=$fixture/module-status" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=)
+apt-get "${apt_options[@]}" update > "$fixture/module-apt-update.log" 2>&1 || {
+    cat "$fixture/module-apt-update.log" >&2; exit 1;
+}
+(cd "$fixture/module-download" && apt-get "${apt_options[@]}" download pxe-tools-ansible > "$fixture/module-apt-download.log" 2>&1) || {
+    cat "$fixture/module-apt-download.log" >&2; exit 1;
+}
+downloaded=("$fixture"/module-download/*.deb)
+test "${#downloaded[@]}" = 1
+test "$(sha256sum "${downloaded[0]}" | awk '{print $1}')" = "$module_sha"
 prepare="$root/packaging/native/prepare-static-apt.py"
 python3 "$prepare" "$fixture/next" "$fixture/static" --keyring "$fixture/public.gpg" \
     --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static.log" 2>&1 || {

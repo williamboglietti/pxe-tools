@@ -86,11 +86,18 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/build-run.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" > "$RUNNER_TEMP/build-jobs.json"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/package"
+          module_args=()
+          if jq -e 'has("ansible_version") or has("ansible_package_asset") or has("ansible_package_sha256")' "$manifest" >/dev/null; then
+            module_asset=$(jq -er '.ansible_package_asset | select(type == "string")' "$manifest")
+            [[ "$module_asset" =~ ^pxe-tools-ansible_[A-Za-z0-9._-]+_all\.deb$ ]]
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$module_asset" --dir "$RUNNER_TEMP/package"
+            module_args+=(--ansible-package "$RUNNER_TEMP/package/$module_asset")
+          fi
           python3 packaging/ci/verify-approved-release.py --manifest "$manifest" \
             --release-json "$RUNNER_TEMP/release.json" --build-json "$RUNNER_TEMP/build-run.json" \
             --build-jobs-json "$RUNNER_TEMP/build-jobs.json" \
             --package "$RUNNER_TEMP/package/$asset" --version-file packaging/ci/release-version.txt \
-            --tag-commit "$tag_commit"
+            --tag-commit "$tag_commit" "${module_args[@]}"
           # First publication must compare exact bytes to the CI build. Once
           # GitHub's temporary artifact expires, renew only if the existing
           # public InRelease cryptographically proves this same build/package.
@@ -99,6 +106,10 @@ jobs:
             test "$(cat "$RUNNER_TEMP/build-artifact/source-commit.txt")" = "$source"
             cmp "$RUNNER_TEMP/package/$asset" "$RUNNER_TEMP/build-artifact/$asset"
             test "$(cat "$RUNNER_TEMP/build-artifact/package.sha256")" = "$(jq -er '.package_sha256' "$manifest")"
+            if [[ ${#module_args[@]} -gt 0 ]]; then
+              cmp "$RUNNER_TEMP/package/$module_asset" "$RUNNER_TEMP/build-artifact/$module_asset"
+              test "$(cat "$RUNNER_TEMP/build-artifact/ansible-package.sha256")" = "$(jq -er '.ansible_package_sha256' "$manifest")"
+            fi
           else
             curl --proto '=https' --silent --show-error --fail --max-time 60 --user-agent 'curl/8.14.1' \
               https://packages.pxetools.com/apt/dists/stable/InRelease --output "$RUNNER_TEMP/prior-InRelease"
@@ -133,6 +144,13 @@ jobs:
           source=$(jq -er '.source_commit' packaging/ci/release-manifest.json)
           run_id=$(jq -er '.build_run_id' packaging/ci/release-manifest.json)
           sha=$(jq -er '.package_sha256' packaging/ci/release-manifest.json)
+          module_args=()
+          if jq -e 'has("ansible_version") or has("ansible_package_asset") or has("ansible_package_sha256")' packaging/ci/release-manifest.json >/dev/null; then
+            module_asset=$(jq -er '.ansible_package_asset' packaging/ci/release-manifest.json)
+            module_sha=$(jq -er '.ansible_package_sha256' packaging/ci/release-manifest.json)
+            [[ "$module_asset" =~ ^pxe-tools-ansible_[A-Za-z0-9._-]+_all\.deb$ && "$module_sha" =~ ^[0-9a-f]{64}$ ]]
+            module_args+=(--ansible-package "$RUNNER_TEMP/package/$module_asset" --approved-ansible-sha256 "$module_sha")
+          fi
           previous=()
           if [[ -d "$RUNNER_TEMP/previous/snapshot" ]]; then previous+=(--previous "$RUNNER_TEMP/previous/snapshot"); fi
           python3 packaging/native/ci-sign-apt-candidate.py "${previous[@]}" \
@@ -140,7 +158,7 @@ jobs:
             --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
             --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB \
             --source-commit "$source" --build-run-id "$run_id" --approved-package-sha256 "$sha" \
-            --public-key-output "$RUNNER_TEMP/candidate/public.gpg"
+            --public-key-output "$RUNNER_TEMP/candidate/public.gpg" "${module_args[@]}"
       - name: Retain signed snapshot for publication
         if: steps.manifest.outputs.ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

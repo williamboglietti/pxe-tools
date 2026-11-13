@@ -24,6 +24,8 @@ jobs:
         run: npm ci --prefix packaging/cloudflare
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Verify version upload and deployment ordering
+        run: bash tests/integration/test_worker_version_deploy.sh
       - name: Verify bounded public HTTP helper
         run: python3 -m unittest discover -s tests -p 'test_public_http.py' -v
       - name: Verify inactive Worker upload guards

@@ -63,3 +63,11 @@ L'amorçage requiert une réponse HTTPS 404 explicite du domaine, une release de
 snapshots vide et l'option manuelle `bootstrap` ; DNS, TLS, HTTP 503 et panne
 réseau ne valent pas autorisation d'écraser un dépôt. L'intégralité des objets
 du snapshot est couverte par une empreinte intégrée à `Release` et sa signature.
+
+Le domaine `packages.pxetools.com` est attaché séparément dans Cloudflare. La CI
+charge une version identifiée par le run puis déploie cette version à 100 %
+avec `wrangler versions upload` et `wrangler versions deploy` ; elle ne lance
+pas `wrangler triggers deploy` et ne gère pas les routes ou domaines. Vérifier
+la liaison du domaine séparément. Un échec après déploiement peut laisser une
+version effective malgré un run rouge : inspecter la version active et le
+snapshot public avant toute nouvelle publication.

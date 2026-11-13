@@ -1,0 +1,22 @@
+name: Check inactive Worker version upload
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pxe-apt-publication
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.ref == 'refs/heads/main' && github.ref_protected
+    environment: production
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Upload inert version without deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PACKAGES_PXETOOLS_COM }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 packaging/ci/cloudflare-upload-preflight.py

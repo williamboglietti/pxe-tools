@@ -38,6 +38,7 @@ echo '::endgroup::'
 
 echo '::group::Debian preseed, signed bootloaders and disk guards'
 python3 tests/unit/test_preseed_install_invariants.py
+python3 tests/unit/test_grub_sbat_distribution.py
 echo '::endgroup::'
 
 echo '::group::Signed Debian netboot freshness and integrity'
@@ -48,6 +49,7 @@ echo '::endgroup::'
 
 echo '::group::Native PXE HTTP interface binding'
 python3 tests/unit/test_native_pxe_http_bind.py
+python3 tests/unit/test_native_worker_keyring.py
 echo '::endgroup::'
 
 echo '::group::Concurrent installation log append'

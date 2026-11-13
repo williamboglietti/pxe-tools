@@ -77,6 +77,15 @@ simulés ; ils ne constituent pas une validation d'un fournisseur SSO réel.
 
 ## Fraîcheur des métadonnées Debian netboot
 
+Sur Ubuntu 24.04 avec le paquet `debian-archive-keyring` version
+`2023.4ubuntu1`, le worker utilise une copie du trousseau Debian 2025.1 fournie
+par PXE Tools, car la version Ubuntu ne reconnaît pas toutes les signatures
+actuelles de Debian 13. Le [détail de sa provenance et de sa maintenance](../packaging/native/keyrings/README.md)
+est conservé avec le trousseau. Un trousseau configuré explicitement via
+`DEBIAN_ARCHIVE_KEYRING` reste prioritaire ; le système utilise sinon son propre
+trousseau pour les autres versions du paquet. Aucun échec de signature n'est
+contourné. La prise en charge complète d'Ubuntu reste à valider avant annonce.
+
 Avant de servir les fichiers de démarrage Debian, PXE Tools vérifie la
 signature de `InRelease`, la fraîcheur des champs authentifiés, puis les
 empreintes des fichiers. Si `Valid-Until` existe, une date expirée est

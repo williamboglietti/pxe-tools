@@ -34,6 +34,9 @@ copy_if_changed /usr/lib/shim/shimx64.efi.signed       "$TFTP_ROOT/grubnetx64.ef
 # MokManager (présent sur certaines versions seulement)
 if [ -f /usr/lib/shim/mmx64.efi.signed ]; then
     copy_if_changed /usr/lib/shim/mmx64.efi.signed     "$TFTP_ROOT/mmx64.efi"      "MokManager"
+elif [ -f /usr/lib/shim/mmx64.efi ]; then
+    # Ubuntu's shim-signed package uses this name for its signed MokManager.
+    copy_if_changed /usr/lib/shim/mmx64.efi            "$TFTP_ROOT/mmx64.efi"      "MokManager"
 fi
 
 # Spec H — iPXE binaires (chainload depuis pxelinux/grub).

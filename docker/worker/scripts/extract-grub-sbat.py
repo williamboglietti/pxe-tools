@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-only
-"""Extract SBAT from Debian's signed GRUB matching the installed GRUB modules."""
+"""Extract distribution SBAT matching the installed GRUB modules."""
 from __future__ import annotations
 
 import csv
 from pathlib import Path
+import platform
 import struct
 import subprocess
 import sys
 
 SIGNED_GRUB = Path('/usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed')
+
+
+def matching_sbat(rows, distro, module_version):
+    vendor = {'debian': 'grub.debian', 'ubuntu': 'grub.ubuntu'}.get(distro)
+    return vendor is not None and any(
+        len(row) >= 5 and row[0] == vendor and row[4] == module_version for row in rows)
 
 
 def main() -> None:
@@ -33,11 +40,12 @@ def main() -> None:
             raise ValueError('invalid SBAT section')
         matches.append(data[offset:offset + size].rstrip(b'\0').decode('utf-8'))
     if len(matches) != 1:
-        raise ValueError('Debian signed GRUB must contain one SBAT section')
+        raise ValueError('signed GRUB must contain one SBAT section')
     rows = list(csv.reader(matches[0].splitlines()))
     version = subprocess.check_output(
         ['dpkg-query', '-W', '-f=${Version}', 'grub-efi-amd64-bin'], text=True).strip()
-    if not any(len(row) >= 5 and row[0] == 'grub.debian' and row[4] == version for row in rows):
+    distro = platform.freedesktop_os_release().get('ID', '')
+    if not matching_sbat(rows, distro, version):
         raise ValueError('signed GRUB SBAT does not match the installed GRUB modules')
     sys.stdout.write(matches[0].rstrip('\n') + '\n')
 
@@ -46,4 +54,4 @@ if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, UnicodeError, struct.error, subprocess.CalledProcessError) as exc:
-        raise SystemExit(f'Cannot obtain matching Debian GRUB SBAT metadata: {exc}')
+        raise SystemExit(f'Cannot obtain matching distribution GRUB SBAT metadata: {exc}')

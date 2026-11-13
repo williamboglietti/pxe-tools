@@ -134,8 +134,9 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
             shutil.copy2(ROOT/name, docs/name)
         copy_tree(ROOT/'third_party/licenses', docs/'licenses')
         native=root/'usr/lib/pxe-tools/native'; native.mkdir(parents=True)
-        for name in ('default.env','init.sh','start-php-fpm.sh','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
+        for name in ('default.env','init.sh','start-php-fpm.sh','start-worker.py','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
             shutil.copy2(ROOT/'packaging/native'/name, native/name)
+        copy_tree(ROOT/'packaging/native/keyrings', native/'keyrings')
         units=root/'usr/lib/systemd/system'; units.mkdir(parents=True)
         for unit in (sorted((ROOT/'packaging/native').glob('pxe-tools.*'))
                      + sorted((ROOT/'packaging/native').glob('pxe-tools-*.service'))

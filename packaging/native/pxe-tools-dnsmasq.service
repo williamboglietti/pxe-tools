@@ -9,5 +9,5 @@ EnvironmentFile=/usr/lib/pxe-tools/native/default.env
 EnvironmentFile=-/var/lib/pxe-tools-native/network.env
 EnvironmentFile=-/var/lib/pxe-tools-native/runtime.env
 ExecStartPre=/bin/sh /opt/pxe-tools/init/render-dnsmasq-conf.sh
-ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/pxe-tools/dnsmasq.conf
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/var/lib/pxe-tools-native/rendered/dnsmasq.conf
 Restart=on-failure

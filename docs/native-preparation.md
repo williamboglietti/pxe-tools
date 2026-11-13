@@ -85,6 +85,10 @@ Sur une nouvelle installation, le TFTP se trouve dans
 `/var/lib/pxe-tools-tftp`, les fichiers HTTP dans `/var/lib/pxe-tools-http`,
 les rendus dans `/var/lib/pxe-tools-native/rendered` et la MOK dans
 `/var/lib/pxe-tools-native/mok`.
+La configuration dnsmasq générée reste dans ce répertoire root, hors de
+`/etc/pxe-tools` qui est accessible en écriture à l'assistant web.
+Un ancien `/etc/pxe-tools/dnsmasq.conf` est conservé lors d'une mise à niveau,
+mais le service natif ne le lit plus.
 Le fichier root `/var/lib/pxe-tools-native/runtime.env` transmet ces chemins
 aux unités systemd. Le programme de préparation refuse tout chemin existant :
 aucune donnée n'est remplacée, déplacée ou supprimée automatiquement.

@@ -61,6 +61,11 @@ def recover(destination: Path, bootstrap: bool) -> None:
     # A failed deploy after snapshot upload requires operator investigation.
     assets.sort(key=lambda item: tuple(map(int, re.fullmatch(
         r'snapshot-([0-9]+)-([0-9]+)\.tar\.gz', item['name']).groups())), reverse=True)
+    current_run = os.environ.get('GITHUB_RUN_ID')
+    if current_run and assets:
+        latest_run = int(re.fullmatch(r'snapshot-([0-9]+)-([0-9]+)\.tar\.gz', assets[0]['name']).group(1))
+        if not current_run.isdecimal() or latest_run >= int(current_run):
+            raise ValueError('publication run is older than the latest stored snapshot')
     for asset in assets[:1]:
         size = asset.get('size', 0)
         if not isinstance(size, int) or size <= 0 or size > MAX_SNAPSHOT:

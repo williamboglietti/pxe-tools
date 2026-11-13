@@ -121,7 +121,7 @@ final class OsImage
      */
     public static function localDir(array $image): string
     {
-        $root = rtrim((string)(getenv('PXE_HTTP_ROOT') ?: self::HTTP_ROOT), '/');
+        $root = rtrim((string)(getenv('PXE_HTTP_ROOT') ?: getenv('HTTP_ROOT') ?: self::HTTP_ROOT), '/');
         $version = (string)($image['version_full'] ?? '');
         $parts = $version !== '' ? [$image['distro'], $version, $image['arch']] : [$image['version'], $image['arch']];
         foreach ($parts as $part) {
@@ -254,6 +254,7 @@ final class OsImage
     /** Shared reasons keep the rendered actions aligned with server revalidation. */
     public static function activationBlock(array $image, array $dependencies, bool $on): ?string
     {
+        if (self::deletePending((int)$image['id'])) return 'Suppression de cette image en cours.';
         if (!$on && $dependencies['blocking'] !== []) return implode(' ', $dependencies['blocking']);
         if ($on && in_array($image['status'], [self::STATUS_PENDING, self::STATUS_FAILED], true) && !empty($dependencies['active'])) {
             return 'Image utilisée par une opération active : son activation relancerait le téléchargement.';
@@ -263,6 +264,7 @@ final class OsImage
 
     public static function downloadBlock(array $image, array $dependencies): ?string
     {
+        if (self::deletePending((int)$image['id'])) return 'Suppression de cette image en cours.';
         if (!empty($dependencies['active'])) return 'Image utilisée par une opération active : remplacement refusé.';
         if ($image['status'] === self::STATUS_DOWNLOADED && $dependencies['available'] && $dependencies['blocking'] !== []) {
             return implode(' ', $dependencies['blocking']);
@@ -339,6 +341,80 @@ final class OsImage
             self::lockImageGroup($pdo, $scope);
             if (self::findById($id) === null) throw new \RuntimeException('Image supprimée depuis la dernière lecture.');
             $mutation();
+            $pdo->commit();
+        } catch (\Throwable $error) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw $error;
+        }
+    }
+
+    /** A fixed numeric image ID is the only operation the worker accepts. */
+    public static function deletePending(int $id): bool
+    {
+        $stmt = Db::get()->prepare("SELECT 1 FROM init_jobs WHERE job_type=? AND status IN ('pending','running') LIMIT 1");
+        $stmt->execute(['image:delete:' . $id]);
+        return $stmt->fetchColumn() !== false;
+    }
+
+    /** Preserve the original unprivileged path for writable legacy volumes. */
+    public static function webCanDeleteDirect(array $image): bool
+    {
+        // Never use the legacy direct path when PHP itself is privileged or
+        // its effective identity cannot be established.
+        if (!function_exists('posix_geteuid') || posix_geteuid() === 0) return false;
+        $directory = self::localDir($image);
+        while (!file_exists($directory) && !is_link($directory)) {
+            $parent = dirname($directory);
+            if ($parent === $directory) return false;
+            $directory = $parent;
+        }
+        return !is_link($directory) && is_dir($directory) && is_writable($directory);
+    }
+
+    public static function queueDelete(int $id): int
+    {
+        $job = 0;
+        self::withImageLock($id, static function () use ($id, &$job): void {
+            $image = self::findById($id);
+            if (self::deletePending($id)) throw new \RuntimeException('Suppression déjà en cours.');
+            $dependencies = self::dependencies($id);
+            if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
+            self::localDir($image); // Reject malformed components before queuing.
+            $meta = json_encode(['id' => $id, 'distro' => $image['distro'], 'version' => $image['version'],
+                'version_full' => $image['version_full'], 'arch' => $image['arch']], JSON_THROW_ON_ERROR);
+            $stmt = Db::get()->prepare("INSERT INTO init_jobs(job_type,status,message,log) VALUES(?,'pending',?,?)");
+            $stmt->execute(['image:delete:' . $id, 'Suppression de l’image en attente', $meta]);
+            $job = (int)Db::get()->lastInsertId();
+        });
+        return $job;
+    }
+
+    /** Hold the image lock while the worker stages protected files. */
+    public static function finishQueuedDelete(int $id, int $jobId, callable $stage): void
+    {
+        $scope = self::findById($id);
+        if ($scope === null) throw new \RuntimeException('Image introuvable.');
+        $pdo = Db::get();
+        $pdo->beginTransaction();
+        try {
+            self::lockImageGroup($pdo, $scope);
+            $image = self::findById($id);
+            if ($image === null) throw new \RuntimeException('Image introuvable.');
+            $stmt = $pdo->prepare("SELECT log FROM init_jobs WHERE id=? AND job_type=? AND status='running'");
+            $stmt->execute([$jobId, 'image:delete:' . $id]);
+            $raw = $stmt->fetchColumn();
+            $meta = is_string($raw) ? json_decode($raw, true, 16, JSON_THROW_ON_ERROR) : null;
+            $expected = ['id' => $id, 'distro' => $image['distro'], 'version' => $image['version'],
+                'version_full' => $image['version_full'], 'arch' => $image['arch']];
+            if ($meta !== $expected) throw new \RuntimeException('Tâche modifiée ; image conservée.');
+            $dependencies = self::dependencies($id);
+            if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
+            $stage();
+            $delete = $pdo->prepare('DELETE FROM os_images WHERE id = ?');
+            $delete->execute([$id]);
+            if ($delete->rowCount() !== 1 || self::findById($id) !== null) {
+                throw new \RuntimeException('Suppression en base non confirmée ; fichiers conservés.');
+            }
             $pdo->commit();
         } catch (\Throwable $error) {
             if ($pdo->inTransaction()) $pdo->rollBack();
@@ -439,6 +515,7 @@ final class OsImage
             self::lockImageGroup($pdo, $scope);
             $img = self::findById($id);
             if ($img === null) { $pdo->rollBack(); return; }
+            if (self::deletePending($id)) throw new \RuntimeException('Suppression déjà en cours.');
             $dependencies = self::dependencies($id);
             if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
             $dir = self::localDir($img);

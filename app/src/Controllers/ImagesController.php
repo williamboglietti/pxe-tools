@@ -270,13 +270,19 @@ final class ImagesController
             return;
         }
         try {
-            OsImage::deleteWithFiles($id);
+            if (OsImage::webCanDeleteDirect($img)) {
+                OsImage::deleteWithFiles($id);
+                View::flash('success', "Image {$img['distro']} {$img['version']} supprimée (DB + fichiers locaux).");
+                View::redirect('/settings/images');
+                return;
+            }
+            $job = OsImage::queueDelete($id);
         } catch (\Throwable $error) {
             View::flash('error', $error->getMessage());
             View::redirect('/settings/images');
             return;
         }
-        View::flash('success', "Image {$img['distro']} {$img['version']} supprimée (DB + fichiers locaux).");
+        View::flash('info', "Suppression de {$img['distro']} {$img['version']} en attente.", '/jobs/' . $job, 'Suivre le traitement');
         View::redirect('/settings/images');
     }
 

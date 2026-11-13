@@ -32,6 +32,16 @@ final class Db
     private static ?PDO $instance = null;
     private static ?array $config = null;
 
+    /** Pin a worker child to the SQLite database already selected by its parent. */
+    public static function useWorkerSqlite(string $path): void
+    {
+        if (PHP_SAPI !== 'cli' || self::$instance !== null || self::$config !== null
+            || $path === '' || $path[0] !== '/' || str_contains($path, "\0")) {
+            throw new RuntimeException('Configuration de base worker invalide.');
+        }
+        self::$config = self::normalizeConfig(['driver' => 'sqlite', 'path' => $path]);
+    }
+
     /**
      * Lit la config DB selon la chaîne de priorité (cf. docblock de la classe).
      */

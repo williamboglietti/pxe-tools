@@ -25,6 +25,7 @@ import logging
 import os
 import pwd
 import re
+import selectors
 import shlex
 import socket
 import sqlite3
@@ -38,6 +39,8 @@ import urllib.request
 from contextlib import contextmanager
 from typing import Callable, Optional
 from database_selection import select_database
+from image_delete import (cleanup_committed, components as image_delete_components,
+                          open_image_dir, require_trusted_http_root, restore_staged, stage_files, validate_files)
 from pxe_menu_lock import menu_lock
 
 from ansible_vault import (
@@ -275,6 +278,10 @@ def reap_running_zombies() -> int:
     par un précédent crash/restart. Sans ça, les zombies persistent
     indéfiniment et bloquent la file (fetch_pending ne les voit pas)."""
     with db_connect() as db:
+        resumed = db.execute(
+            "UPDATE init_jobs SET status='pending', updated_at=? "
+            "WHERE status='running' AND job_type GLOB 'image:delete:[0-9]*'", (now(),)
+        ).rowcount
         cur = db.execute(
             "UPDATE init_jobs "
             "SET status='failed', ended_at=?, updated_at=?, "
@@ -282,7 +289,7 @@ def reap_running_zombies() -> int:
             "WHERE status='running'",
             (now(), now()),
         )
-        return cur.rowcount
+        return cur.rowcount + resumed
 
 
 # Batch log : flush en DB toutes les FLUSH_INTERVAL_S secondes OU
@@ -292,11 +299,111 @@ FLUSH_INTERVAL_S = 2.0
 FLUSH_MAX_LINES = 50
 
 
+def _read_image_delete_signal(process: subprocess.Popen, expected: bytes) -> None:
+    if process.stdout is None:
+        raise ValueError('missing deletion response')
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if not selector.select(timeout=15) or os.read(process.stdout.fileno(), 64) != expected:
+            raise ValueError('deletion reservation failed')
+    finally:
+        selector.close()
+
+
+def run_image_delete(job: dict) -> None:
+    """Stage fixed files as root while an unprivileged PHP child holds the lock."""
+    job_id = job.get('id')
+    match = re.fullmatch(r'image:delete:([1-9][0-9]{0,18})', str(job.get('job_type', '')))
+    if type(job_id) is not int or job_id <= 0 or match is None:
+        if isinstance(job_id, int) and job_id > 0:
+            update_init_job(job_id, status='failed', message='Demande de suppression invalide.', ended_at=now(), updated_at=now())
+        return
+    image_id = int(match.group(1))
+    with db_connect() as db:
+        claimed = db.execute("UPDATE init_jobs SET status='running', started_at=?, updated_at=? "
+                             "WHERE id=? AND job_type=? AND status='pending' AND log=?",
+                             (now(), now(), job_id, job['job_type'], job.get('log'))).rowcount
+    if claimed != 1:
+        return
+    fd = None
+    process = None
+    try:
+        if os.geteuid() != 0:
+            raise ValueError('root worker required for protected paths')
+        require_trusted_http_root(HTTP_ROOT)
+        parts = image_delete_components(job['log'], image_id)
+        fd = open_image_dir(HTTP_ROOT, parts)
+        validate_files(fd, job_id)
+        with db_connect() as db:
+            row = db.execute('SELECT id,distro,version,version_full,arch FROM os_images WHERE id=?', (image_id,)).fetchone()
+        if row is not None:
+            if dict(row) != json.loads(job['log']):
+                raise ValueError('image changed after request')
+            restore_staged(fd, job_id)
+            # Do not run PHP with root privileges or let it reread the mutable
+            # db.conf. The child gets only the parent's already-selected DB.
+            account = pwd.getpwnam('www-data')
+            if account.pw_uid == 0 or account.pw_gid == 0:
+                raise ValueError('invalid web account')
+            cli = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'cli', 'delete-image.php')
+            env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
+                   'PXE_HTTP_ROOT': HTTP_ROOT, 'HTTP_ROOT': HTTP_ROOT}
+            process = subprocess.Popen(['/usr/bin/php', cli, str(image_id), str(job_id), DB_PATH],
+                                       env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, user=account.pw_uid,
+                                       group=account.pw_gid, extra_groups=())
+            _read_image_delete_signal(process, b'READY\n')
+            stage_files(fd, job_id)
+            if process.stdin is None:
+                raise ValueError('missing deletion control pipe')
+            process.stdin.write(b'COMMIT\n'); process.stdin.flush(); process.stdin.close()
+            _read_image_delete_signal(process, b'COMMITTED\n')
+            if process.wait(timeout=10) != 0:
+                raise ValueError('deletion child failed')
+            with db_connect() as db:
+                if db.execute('SELECT 1 FROM os_images WHERE id=?', (image_id,)).fetchone() is not None:
+                    raise ValueError('image deletion was not committed')
+        # Once the SQL row is gone, remove only this job's staged files.
+        cleanup_committed(fd, job_id)
+        update_init_job(job_id, status='success', message='Image et fichiers locaux supprimés.',
+                        ended_at=now(), updated_at=now(), progress_percent=100)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, subprocess.SubprocessError):
+        if process is not None:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+        # Roll back staged names only when SQLite kept the image. If it
+        # committed, retain the staged files for a safe idempotent retry.
+        try:
+            with db_connect() as db:
+                still_exists = db.execute('SELECT id FROM os_images WHERE id=?', (image_id,)).fetchone() is not None
+            if still_exists:
+                restore_staged(fd, job_id)
+        except (OSError, ValueError, sqlite3.Error):
+            pass
+        update_init_job(job_id, status='failed', message='Suppression refusée ou interrompue ; fichiers conservés pour vérification.',
+                        ended_at=now(), updated_at=now())
+    finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+        if fd is not None:
+            os.close(fd)
+
+
 def run_bootstrap_job(job: dict) -> None:
     """Exécute le script shell associé au job_type. Batch les writes log
     pour ne pas saturer SQLite. Heartbeat updated_at à chaque flush."""
     job_id = job["id"]
     job_type = job["job_type"]
+
+    if job_type.startswith('image:delete:'):
+        run_image_delete(job)
+        return
 
     optional_repo_job = (job_type == "ansible_repo:pull"
                          or job_type.startswith(("machine:ansible_redeploy:", "action:ansible_retry:",

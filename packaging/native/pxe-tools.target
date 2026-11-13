@@ -1,6 +1,7 @@
 [Unit]
 Description=PXE Tools experimental native appliance
-Wants=pxe-tools-php.service pxe-tools-nginx.service pxe-tools-pxe-http.service pxe-tools-dnsmasq.service pxe-tools-dnsmasq-tail.service pxe-tools-worker.service
-After=network.target
+Wants=pxe-tools-php.service pxe-tools-nginx.service pxe-tools-dnsmasq-tail.service pxe-tools-worker.service
+BindsTo=pxe-tools-pxe-http.service pxe-tools-dnsmasq.service
+After=network.target pxe-tools-pxe-http.service pxe-tools-dnsmasq.service
 [Install]
 WantedBy=multi-user.target

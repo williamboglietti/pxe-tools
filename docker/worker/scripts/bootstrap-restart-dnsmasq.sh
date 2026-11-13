@@ -34,6 +34,12 @@ if [[ ! -x "$renderer" || ( "$manager" == s6 && ! -d "$service" ) ]]; then
     exit 1
 fi
 
+# Stop the old HTTP listener (and its bound dnsmasq dependent) before
+# applying changed settings. A failed render must not retain the old listener.
+if [[ "$manager" == systemd ]]; then
+    systemctl stop pxe-tools-pxe-http.service
+fi
+
 render_ok=1
 if ! PXE_DNSMASQ_STRICT=1 "$renderer"; then
     render_ok=0

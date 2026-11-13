@@ -39,3 +39,7 @@ python3 tests/unit/test_debian_release_freshness.py
 PXE_FRESHNESS_ISOLATED=1 python3 tests/integration/test_debian_netboot_freshness.py
 python3 tests/unit/test_prototype_debian_netboot_freshness.py
 echo '::endgroup::'
+
+echo '::group::Native PXE HTTP interface binding'
+python3 tests/unit/test_native_pxe_http_bind.py
+echo '::endgroup::'

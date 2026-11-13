@@ -46,6 +46,12 @@ tâches sensibles. Préparez séparément les clés SSH et les identités d’h�
 vérifiées. Le déverrouillage Vault dans l’interface est à usage unique et est
 requis pour chaque exécution dans le parcours actuel.
 
+Le paquet refuse un compte préexistant dont le groupe principal n’est pas le
+groupe dédié ou qui possède des groupes supplémentaires ; il ne modifie pas
+ce compte. Cette vérification ne détecte pas tous les droits accordés par des
+ACL, règles sudoers, polices d’accès ou services déjà présents :
+l’administrateur doit vérifier ces accès sur une machine existante.
+
 Les collections, les installations sur des cibles SSH réelles et les autres
 versions de distribution nécessitent leurs propres validations. Le module et
 le socle doivent être compatibles : ce paquet demande la branche 0.1 du socle.

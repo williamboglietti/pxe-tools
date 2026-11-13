@@ -110,6 +110,19 @@ def main():
                 return json.loads(value[0]).get('state') if value else None
             wait_for(lambda:state()=='not_configured','module absent observation')
             old_pid=docker('exec',name,'systemctl','show','--property=MainPID','--value','pxe-tools-worker.service').stdout.strip()
+            # A pre-existing account with extra groups must be rejected without mutation.
+            docker('exec',name,'groupadd','pxe-fixture-extra')
+            docker('exec',name,'useradd','--system','--user-group','--no-create-home',
+                   '--home-dir','/var/lib/pxe-tools-ansible/home','--shell','/usr/sbin/nologin',
+                   '--groups','pxe-fixture-extra','pxe-tools-ansible')
+            before=docker('exec',name,'id','pxe-tools-ansible').stdout
+            if docker('exec',name,'dpkg','-i','/fixture/module.deb',check=False).returncode==0:
+                raise RuntimeError('Account with supplementary group unexpectedly accepted')
+            if docker('exec',name,'id','pxe-tools-ansible').stdout!=before:
+                raise RuntimeError('Rejected pre-existing account was modified')
+            docker('exec',name,'test','!','-e','/usr/lib/systemd/system/pxe-tools-worker.service.d/50-ansible.conf')
+            docker('exec',name,'userdel','pxe-tools-ansible')
+            docker('exec',name,'groupdel','pxe-fixture-extra')
             docker('exec',name,'dpkg','-i','/fixture/module.deb')
             if docker('exec',name,'systemctl','show','--property=MainPID','--value','pxe-tools-worker.service').stdout.strip()!=old_pid:
                 raise RuntimeError('Module installation restarted the worker')

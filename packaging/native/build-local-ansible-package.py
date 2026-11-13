@@ -22,6 +22,12 @@ Description: optional Ansible integration for PXE Tools
 '''
 PREINST = '''#!/bin/sh
 set -eu
+if getent passwd pxe-tools-ansible >/dev/null; then
+    uid=$(id -u pxe-tools-ansible); gid=$(id -g pxe-tools-ansible)
+    dedicated=$(getent group pxe-tools-ansible | cut -d: -f3)
+    [ "$uid" != 0 ] && [ "$gid" != 0 ] && [ -n "$dedicated" ] && [ "$gid" = "$dedicated" ] && [ "$(id -G pxe-tools-ansible)" = "$gid" ] || {
+        echo 'Existing Ansible account has unexpected groups; it was preserved.' >&2; exit 1; }
+fi
 if [ "$1" = install ] && { [ -e /usr/lib/systemd/system/pxe-tools-worker.service.d/50-ansible.conf ] || [ -L /usr/lib/systemd/system/pxe-tools-worker.service.d/50-ansible.conf ]; }; then
     echo 'Existing worker configuration preserved; installation refused.' >&2; exit 1
 fi
@@ -42,7 +48,9 @@ if [ "$1" = configure ]; then
         useradd --system --user-group --no-create-home --home-dir "$home" --shell /usr/sbin/nologin "$account"
     fi
     uid=$(id -u "$account"); gid=$(id -g "$account")
-    [ "$uid" != 0 ] && [ "$gid" != 0 ] || { echo 'Ansible account must not be privileged.' >&2; exit 1; }
+    dedicated=$(getent group "$account" | cut -d: -f3)
+    [ "$uid" != 0 ] && [ "$gid" != 0 ] && [ -n "$dedicated" ] && [ "$gid" = "$dedicated" ] && [ "$(id -G "$account")" = "$gid" ] || {
+        echo 'Ansible account has unexpected groups; it was preserved.' >&2; exit 1; }
     for path in /var/lib/pxe-tools-ansible "$home" /var/lib/pxe-tools-ansible/workspace; do
         if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
             echo 'Existing Ansible path is not a regular directory; it was preserved.' >&2; exit 1

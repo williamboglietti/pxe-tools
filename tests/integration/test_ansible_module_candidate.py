@@ -30,6 +30,25 @@ def main():
                                    capture_output=True)
         assert duplicate.returncode != 0
 
+        # Exercise pre-install checks without creating or changing host accounts.
+        control = root / 'control'
+        run(['dpkg-deb', '-e', str(package), str(control)])
+        fakebin = root / 'fakebin'
+        fakebin.mkdir()
+        (fakebin / 'getent').write_text("""#!/bin/sh
+case "$1" in
+  passwd) echo 'pxe-tools-ansible:x:1234:1234::/var/lib/pxe-tools-ansible/home:/usr/sbin/nologin';;
+  group) echo "pxe-tools-ansible:x:${TEST_GROUP_GID}:";;
+esac
+""")
+        (fakebin / 'id').write_text('#!/bin/sh\ncase "$1" in -u|-g) echo 1234;; -G) echo "$TEST_GROUPS";; esac\n')
+        for item in fakebin.iterdir():
+            item.chmod(0o755)
+        for group_gid, groups in [('1234', '1234 27'), ('4567', '1234')]:
+            check_env = {'PATH': str(fakebin) + ':/usr/bin:/bin', 'TEST_GROUP_GID': group_gid, 'TEST_GROUPS': groups}
+            rejected = subprocess.run([str(control / 'preinst'), 'install'], env=check_env, capture_output=True, text=True)
+            assert rejected.returncode != 0 and 'unexpected groups' in rejected.stderr
+
         vault = root / 'vault.yml'
         password = root / 'password'
         playbook = root / 'playbook.yml'

@@ -29,6 +29,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 packaging/ci/diagnose-public-http.py
+      - name: Verify bounded public HTTP helper
+        run: python3 -m unittest discover -s tests -p 'test_public_http.py' -v
       - name: Verify inactive Worker upload guards
         run: python3 -m unittest discover -s tests -p 'test_cloudflare_upload_preflight.py' -v
       - name: Verify persistent Worker snapshot recovery

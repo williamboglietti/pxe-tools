@@ -39,6 +39,15 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --workdir /source pxe-tools-application-test:local \
             bash tests/integration/test_image_delete_web_legacy.sh
+      - name: Exercise native nginx temporary paths in isolation
+        run: |
+          docker run --rm --network none --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID --cap-add KILL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=64m \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --workdir /source pxe-tools-application-test:local \
+            python3 tests/integration/test_native_nginx_temp.py
       - name: Exercise PXE menu coordination in isolation
         run: |
           docker run --rm --network none --cap-drop ALL \

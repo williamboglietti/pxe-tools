@@ -22,6 +22,13 @@ sites qui en dépendent deviennent alors indisponibles. Sa configuration reste e
 place. Aucun autre service n'est arrêté automatiquement ; en présence d'un autre
 occupant, résolvez le conflit avant d'activer le réseau PXE.
 
+Les deux services nginx natifs stockent leurs fichiers temporaires dans leurs
+répertoires respectifs sous `/run`. Ce répertoire peut être en mémoire (tmpfs) :
+des transferts simultanés mis en tampon peuvent donc consommer de la mémoire et
+remplir l'espace disponible, avec des erreurs de requête à la clé. Vérifiez la
+taille et l'utilisation de `/run` selon la charge prévue ; la consommation sous
+charge concurrente n'a pas été mesurée.
+
 L'assistant prépare une clé MOK propre à l'instance pour signer GRUB. Pour un
 client Secure Boot, l'administrateur doit enrôler la clé publique de cette
 instance dans le client. Le test documenté utilise une MOK jetable et un client

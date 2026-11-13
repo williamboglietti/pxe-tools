@@ -11,6 +11,7 @@ fixture=$(mktemp -d /var/tmp/pxe-ci-signing-test-XXXXXXXX)
 gnupg="$fixture/gnupg"
 mkdir -m 0700 "$gnupg"
 cleanup() {
+    if [[ -n "${worker_pid:-}" ]]; then kill "$worker_pid" 2>/dev/null || true; wait "$worker_pid" 2>/dev/null || true; fi
     gpgconf --homedir "$gnupg" --kill gpg-agent >/dev/null 2>&1 || true
     rm -rf -- "$fixture"
 }
@@ -77,6 +78,26 @@ gpgv --keyring "$fixture/static/pxe-tools-archive-keyring.gpg" "$fixture/static/
 if [[ "${PXE_STATIC_WRANGLER:-}" == 1 ]]; then
     "$root/packaging/cloudflare/node_modules/.bin/wrangler" deploy \
         --config "$root/packaging/cloudflare/wrangler.jsonc" --assets "$fixture/static" --dry-run
+    "$root/packaging/cloudflare/node_modules/.bin/wrangler" dev --local \
+        --config "$root/packaging/cloudflare/wrangler.jsonc" --assets "$fixture/static" \
+        --ip 127.0.0.1 --port 18787 > "$fixture/worker.log" 2>&1 &
+    worker_pid=$!
+    ready=0
+    for attempt in {1..30}; do
+        if curl --silent --fail http://127.0.0.1:18787/pxe-tools-archive-keyring.gpg -o "$fixture/http-key.gpg"; then ready=1; break; fi
+        sleep 1
+    done
+    if [[ "$ready" != 1 ]]; then cat "$fixture/worker.log" >&2; exit 1; fi
+    cmp "$fixture/public.gpg" "$fixture/http-key.gpg"
+    mkdir -p "$fixture/httplists/partial"
+    touch "$fixture/httpstatus"
+    printf 'deb [signed-by=%s/public.gpg] http://127.0.0.1:18787/apt stable main\n' "$fixture" > "$fixture/http.list"
+    apt-get -o "APT::Sandbox::User=$(id -un)" -o "Dir::Etc::sourcelist=$fixture/http.list" \
+        -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$fixture/httplists" \
+        -o "Dir::State::status=$fixture/httpstatus" -o Dir::Cache::pkgcache= \
+        -o Dir::Cache::srcpkgcache= update > "$fixture/http-update.log" 2>&1 || {
+        cat "$fixture/http-update.log" >&2; exit 1;
+    }
 fi
 cp -a "$fixture/next" "$fixture/tampered-static"
 printf corrupt >> "$fixture/tampered-static/dists/stable/main/binary-amd64/Packages"

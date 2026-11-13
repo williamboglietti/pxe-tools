@@ -10,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('worker_snapshot', Path(__file__).resolve().parents[1] / 'packaging/ci/worker-snapshot.py')
@@ -58,6 +59,11 @@ class RecoveryTests(unittest.TestCase):
              patch.object(module, 'live_release', return_value=None):
             module.recover(Path(d) / 'previous', True)
             with self.assertRaises(ValueError): module.recover(Path(d) / 'previous', False)
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {'GITHUB_REPOSITORY':'example/project'}), \
+             patch.object(module.subprocess, 'run', return_value=result), \
+             patch.object(module, 'live_release', side_effect=urllib.error.URLError('DNS failure')):
+            with self.assertRaises(urllib.error.URLError): module.recover(Path(d) / 'previous', True)
 
 
 if __name__ == '__main__': unittest.main()

@@ -93,7 +93,8 @@ final class InitController
     }
 
     /** Retry ciblé d'un job (utilisé pour les jobs stale = running silencieux).
-     * Reset aussi log et progress_percent pour repartir propre. */
+     * Le log des suppressions d'image porte les métadonnées nécessaires à la
+     * reprise ; les journaux des autres jobs sont remis à zéro. */
     public function retryJob(array $params): void
     {
         $id = (int)($params['id'] ?? 0);
@@ -105,11 +106,17 @@ final class InitController
             $pdo = Db::get();
             $stmt = $pdo->prepare(
                 "UPDATE init_jobs SET status='pending', started_at=NULL, ended_at=NULL, "
-                . "updated_at=NULL, progress_percent=0, log='', message=NULL "
+                . "updated_at=NULL, progress_percent=0, "
+                . "log=CASE WHEN job_type LIKE 'image:delete:%' THEN log ELSE '' END, message=NULL "
                 . "WHERE id = ? AND (status = 'failed' OR (status = 'running' AND "
                 . Db::nowEpoch() . ' - ' . Db::unixEpoch('COALESCE(updated_at, started_at)') . ' > ?))'
             );
-            $stmt->execute([$id, InitGuard::STALE_THRESHOLD_S]);
+            // PDO execute(array) binds values as strings by default. Bind the
+            // threshold as an integer so SQLite compares elapsed seconds
+            // numerically when retrying a stale running job.
+            $stmt->bindValue(1, $id, \PDO::PARAM_INT);
+            $stmt->bindValue(2, InitGuard::STALE_THRESHOLD_S, \PDO::PARAM_INT);
+            $stmt->execute();
             if ($stmt->rowCount() === 0) {
                 View::flash('warning', 'Ce traitement ne peut pas être relancé : il est terminé ou son activité est encore récente.', '/jobs/' . $id, 'Consulter le traitement');
                 View::redirect('/jobs/' . $id);

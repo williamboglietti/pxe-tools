@@ -2,15 +2,20 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 """Exercise bounded deletion, interrupted jobs and protected-path refusals."""
 import importlib.util
+from http.cookiejar import CookieJar
 import json
 import os
 import pwd
 from pathlib import Path
 import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 if (os.environ.get('PXE_IMAGE_DELETE_TEST') != '1' or os.geteuid() != 0
@@ -186,4 +191,78 @@ w.run_bootstrap_job(job)
     run(number)
     assert state(number)=='failed' and sql('SELECT id FROM os_images WHERE id=10') and (path/'linux').exists()
     sql('DROP TRIGGER fixture_ignore_delete')
+
+    # Exercise the actual authenticated retry route, not just the SQL update.
+    # An image job's log contains its immutable deletion metadata; a normal
+    # job's log is still cleared when retried.
+    path=image(12); number=queue(12); metadata=job(number)['log']
+    path.chmod(0o777); run(number); path.chmod(0o755)
+    assert state(number)=='failed' and (path/'linux').exists()
+    stale_path=image(13); stale=queue(13); stale_metadata=job(stale)['log']
+    sql("UPDATE init_jobs SET status='running',started_at='2000-01-01 00:00:00',updated_at='2000-01-01 00:00:00' WHERE id=?",(stale,))
+    bulk_path=image(14); bulk=queue(14); bulk_metadata=job(bulk)['log']
+    bulk_path.chmod(0o777); run(bulk); bulk_path.chmod(0o755)
+    assert state(bulk)=='failed'
+    with sqlite3.connect(database) as db:
+        db.executemany('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', [
+            ('wizard_completed','1'), ('db_init_done','1'),
+            ('admin_created','1'), ('init_completed','1')])
+        cursor=db.execute("INSERT INTO init_jobs(job_type,status,log) VALUES('bootstrap:fixture','failed','ordinary-log')")
+        ordinary=cursor.lastrowid
+        cursor=db.execute("INSERT INTO init_jobs(job_type,status,log,started_at,updated_at) VALUES('bootstrap:recent','running','recent-log',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+        recent=cursor.lastrowid
+    sessions=root/'sessions'; sessions.mkdir(mode=0o700)
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
+    server_env=dict(os.environ,AUTH_MODE='authentik',AUTHENTIK_TRUSTED_PROXY_CIDRS='127.0.0.1/32',
+                    PXE_SESSION_DIR=str(sessions))
+    server=subprocess.Popen(['php','-S',f'127.0.0.1:{port}',str(ROOT/'app/public/index.php')],
+                            cwd=ROOT/'app/public',env=server_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+        client=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()),NoRedirect)
+        base=f'http://127.0.0.1:{port}'; identity={'X-Forwarded-User':'fixture-admin'}
+        for attempt in range(80):
+            try:
+                with client.open(urllib.request.Request(base+'/settings',headers=identity),timeout=1) as response:
+                    html=response.read().decode()
+                break
+            except urllib.error.URLError:
+                time.sleep(.05)
+        else: raise AssertionError('fixture web server unavailable')
+        import re
+        match=re.search(r'name="csrf_token" value="([^"]+)"',html)
+        assert match, 'CSRF token missing from authenticated settings'
+        for ident in (number,ordinary,stale,recent):
+            request=urllib.request.Request(base+f'/api/init-retry-job/{ident}',
+                data=urllib.parse.urlencode({'csrf_token':match.group(1)}).encode(),
+                headers={**identity,'Origin':base})
+            try: response=client.open(request,timeout=5)
+            except urllib.error.HTTPError as error: response=error
+            assert response.code==302, f'unexpected retry HTTP status: {response.code}'
+            response.close()
+        assert state(number)=='pending' and job(number)['log']==metadata, 'image retry discarded deletion metadata'
+        assert state(ordinary)=='pending' and job(ordinary)['log']=='', 'ordinary retry did not clear its log'
+        assert state(stale)=='pending' and job(stale)['log']==stale_metadata, 'stale image retry discarded metadata'
+        assert state(recent)=='running' and job(recent)['log']=='recent-log', 'recent job was incorrectly retried'
+        request=urllib.request.Request(base+'/api/init-retry',
+            data=urllib.parse.urlencode({'csrf_token':match.group(1),'jobs':str(bulk)}).encode(),
+            headers={**identity,'Origin':base})
+        try: response=client.open(request,timeout=5)
+        except urllib.error.HTTPError as error: response=error
+        assert response.code==302, f'unexpected bulk retry HTTP status: {response.code}'
+        response.close()
+        assert state(bulk)=='pending' and job(bulk)['log']==bulk_metadata, 'bulk retry discarded deletion metadata'
+        run(number)
+        assert state(number)=='success' and not sql('SELECT id FROM os_images WHERE id=12')
+        assert not any((path/name).exists() for name in ('linux','initrd.gz','firmware.cpio.gz'))
+        run(stale)
+        assert state(stale)=='success' and not sql('SELECT id FROM os_images WHERE id=13')
+        assert not any((stale_path/name).exists() for name in ('linux','initrd.gz','firmware.cpio.gz'))
+        run(bulk)
+        assert state(bulk)=='success' and not sql('SELECT id FROM os_images WHERE id=14')
+        assert not any((bulk_path/name).exists() for name in ('linux','initrd.gz','firmware.cpio.gz'))
+    finally:
+        server.terminate(); server.wait(timeout=5)
     print('Image deletion queue, guarded paths, restart recovery and dependency revalidation verified.')

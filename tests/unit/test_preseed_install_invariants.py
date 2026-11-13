@@ -428,7 +428,8 @@ if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
     def test_secondary_nic_without_mac_does_not_comment_out_rest_of_late_command(self):
         # d-i joint les lignes du late_command : un `#` neutraliserait tout ce qui suit.
         nics = [{'match_by':'mac','match':{'mac':'02:88:77:66:55:05'},'mode':'dhcp'}, {'match_by':'primary','mode':'dhcp'}]
-        output = self.render({'distro':'debian','network':{'interfaces':nics,'primary':0}})
+        output = self.render({'distro':'debian','network':{'interfaces':nics,'primary':0}},
+                             running_action_token='a' * 64)
         self.assertNotIn('# DEBUG', output)
         self.assertIn("in-target /bin/echo 'NIC secondaire #2 ignoree (match.mac absent)' ; \\\n", output)
         self.assertIn('/api/install-end', output)

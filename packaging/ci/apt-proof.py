@@ -65,5 +65,3 @@ def verify_provenance(release: bytes, version: str, sha: str, source: str, build
         matches = [line for line in text if line.startswith(field+':')]
         if matches != [field+': '+value]:
             raise ValueError('Signed APT provenance does not match the approved build')
-
-

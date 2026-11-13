@@ -9,6 +9,7 @@ use Admin\Db;
 final class BootSession
 {
     public const MENUS = ['discovery', 'wipe', 'install', 'disktest', 'rescue', 'local', 'other'];
+    private const AGENT_MARKER = 'agent_callback';
 
     public static function label(string $menu): string
     {
@@ -85,14 +86,49 @@ final class BootSession
         return $stmt->fetchColumn() === $menu;
     }
 
+    /** Mint a callback-only token at the script/job fetch for one active action. */
+    public static function issueAgentToken(int $machineId, int $actionId, string $mac, string $menu, ?string $observedIp): string
+    {
+        if ($machineId <= 0 || $actionId <= 0 || $mac === ''
+            || !in_array($menu, ['wipe', 'disktest'], true)) {
+            throw new \InvalidArgumentException('Invalid PXE agent session');
+        }
+        $token = bin2hex(random_bytes(32));
+        Db::get()->prepare('INSERT INTO boot_sessions '
+            . '(machine_id, action_id, mac, default_menu, selected_menu, token, client_ip) '
+            . 'VALUES (?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$machineId, $actionId, $mac, $menu, self::AGENT_MARKER, $token, $observedIp]);
+        return $token;
+    }
+
+    public static function agentTokenValid(
+        string $token,
+        int $machineId,
+        int $actionId,
+        string $mac,
+        string $menu,
+        string $clientIp
+    ): bool {
+        if (strlen($token) !== 64 || !ctype_xdigit($token) || $machineId <= 0 || $actionId <= 0
+            || $mac === '' || $clientIp === '' || !in_array($menu, ['wipe', 'disktest'], true)) return false;
+        $stmt = Db::get()->prepare('SELECT token, client_ip FROM boot_sessions '
+            . 'WHERE token = ? AND machine_id = ? AND action_id = ? AND mac = ? '
+            . 'AND default_menu = ? AND selected_menu = ? '
+            . "AND served_at >= datetime('now', '-35 days') LIMIT 1");
+        $stmt->execute([$token, $machineId, $actionId, $mac, $menu, self::AGENT_MARKER]);
+        $row = $stmt->fetch();
+        return is_array($row) && hash_equals((string)$row['token'], $token)
+            && ($row['client_ip'] === null || hash_equals((string)$row['client_ip'], $clientIp));
+    }
+
     /** @return array<int,array<string,mixed>> */
     public static function recentForMachine(int $machineId, int $limit = 8): array
     {
         if ($machineId <= 0) return [];
         $stmt = Db::get()->prepare('SELECT id, action_id, mac, default_menu, selected_menu, '
             . 'served_at, selected_at FROM boot_sessions WHERE machine_id = ? '
-            . 'ORDER BY id DESC LIMIT ?');
-        $stmt->execute([$machineId, max(1, min($limit, 30))]);
+            . 'AND (selected_menu IS NULL OR selected_menu != ?) ORDER BY id DESC LIMIT ?');
+        $stmt->execute([$machineId, self::AGENT_MARKER, max(1, min($limit, 30))]);
         return $stmt->fetchAll() ?: [];
     }
 }

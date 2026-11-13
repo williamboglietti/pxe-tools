@@ -26,7 +26,8 @@ mkdir -p "$WORK_DIR"
 ping_phase() {
     line="$1"
     if [ "$TEST_ID" -gt 0 ] 2>/dev/null; then
-        wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=$TEST_ID&line=$line" 2>/dev/null || true
+        wget -q -O /dev/null --header="Authorization: Bearer $BOOT_TOKEN" \
+            "$API_BASE/disktest-progress?test_id=$TEST_ID&mac=$MAC&line=$line" 2>/dev/null || true
     fi
 }
 
@@ -35,7 +36,8 @@ log_line() {
     echo "$msg"
     if [ "$TEST_ID" -gt 0 ] 2>/dev/null; then
         enc=$(echo "$msg" | sed 's/%/%25/g; s/ /%20/g; s|/|%2F|g; s/:/%3A/g; s/=/%3D/g; s/&/%26/g; s/+/%2B/g')
-        wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=$TEST_ID&line=$enc" 2>/dev/null || true
+        wget -q -O /dev/null --header="Authorization: Bearer $BOOT_TOKEN" \
+            "$API_BASE/disktest-progress?test_id=$TEST_ID&mac=$MAC&line=$enc" 2>/dev/null || true
     fi
 }
 
@@ -55,9 +57,11 @@ post_result() {
         "$rdisk" "$rmode" "$rverdict" "${rbad:-null}" "${rdur:-null}" "$rdev" "$rextra")
     # busybox wget ne supporte pas --post-data systématiquement ; on tente puis fallback
     wget -q -O /dev/null --post-data="$body" --header="Content-Type: application/json" \
-        "$API_BASE/disktest-result?test_id=$TEST_ID" 2>/dev/null || \
+        --header="Authorization: Bearer $BOOT_TOKEN" \
+        "$API_BASE/disktest-result?test_id=$TEST_ID&mac=$MAC" 2>/dev/null || \
     wget -q -O /dev/null --header="Content-Type: application/json" --post-data="$body" \
-        "$API_BASE/disktest-result?test_id=$TEST_ID" 2>/dev/null || true
+        --header="Authorization: Bearer $BOOT_TOKEN" \
+        "$API_BASE/disktest-result?test_id=$TEST_ID&mac=$MAC" 2>/dev/null || true
 }
 
 # URL-encode minimal pour un chemin /dev/xxx (jamais d'espaces).
@@ -95,12 +99,14 @@ capture_smart() {
         return 0
     fi
     if wget -q -O /dev/null --header="Content-Type: application/json" --post-file="$cs_file" \
-        "$API_BASE/disktest-smart?test_id=$TEST_ID&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
+        --header="Authorization: Bearer $BOOT_TOKEN" \
+        "$API_BASE/disktest-smart?test_id=$TEST_ID&mac=$MAC&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
         return 0
     fi
     if [ "$cs_size" -lt 100000 ] 2>/dev/null; then
         if wget -q -O /dev/null --header="Content-Type: application/json" --post-data="$(cat "$cs_file")" \
-            "$API_BASE/disktest-smart?test_id=$TEST_ID&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
+            --header="Authorization: Bearer $BOOT_TOKEN" \
+            "$API_BASE/disktest-smart?test_id=$TEST_ID&mac=$MAC&disk=$(enc_disk "$cs_disk")&phase=$cs_phase" 2>/dev/null; then
             return 0
         fi
     fi
@@ -116,7 +122,8 @@ capture_smart() {
 post_progress() {
     # $1=disk $2=phase $3=pct $4=pass $5=bad $6=elapsed_s $7=eta_s
     [ "$TEST_ID" -gt 0 ] 2>/dev/null || return 0
-    pp_resp=$(wget -qO- "$API_BASE/disktest-disk-progress?test_id=$TEST_ID&disk=$(enc_disk "$1")&phase=$2&pct=$3&pass=$4&bad=$5&elapsed=$6&eta=$7" 2>/dev/null) || pp_resp=""
+    pp_resp=$(wget -qO- --header="Authorization: Bearer $BOOT_TOKEN" \
+        "$API_BASE/disktest-disk-progress?test_id=$TEST_ID&mac=$MAC&disk=$(enc_disk "$1")&phase=$2&pct=$3&pass=$4&bad=$5&elapsed=$6&eta=$7" 2>/dev/null) || pp_resp=""
     case "$pp_resp" in
         *ignored*) touch "$WORK_DIR/abort" ;;
     esac
@@ -148,10 +155,10 @@ if ! wget -q -O "$JOB_FILE" "$API_BASE/disktest-job?mac=$MAC"; then
 fi
 # BEGIN disktest-job-parse
 JOB_BODY=$(tr -d '\n' < "$JOB_FILE" | tr -s ' ')
-echo "Job reçu : $JOB_BODY"
 
 TEST_ID=$(echo "$JOB_BODY" | sed -n 's/.*"test_id"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')
 ACTION_ID=$(echo "$JOB_BODY" | sed -n 's/.*"action_id"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')
+BOOT_TOKEN=$(echo "$JOB_BODY" | sed -n 's/.*"boot_token"[[:space:]]*:[[:space:]]*"\([a-f0-9]\{64\}\)".*/\1/p')
 PARALLEL=$(echo "$JOB_BODY" | sed -n 's/.*"parallel"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
 POST_ACTION=$(echo "$JOB_BODY" | sed -n 's/.*"post_action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
@@ -163,8 +170,8 @@ JOBS_RAW=$(echo "$JOB_BODY" | sed -n 's/.*"jobs"[[:space:]]*:[[:space:]]*\[\(.*\
 [ -z "$POST_ACTION" ] && POST_ACTION="poweroff"
 [ -z "$PARALLEL" ] && PARALLEL="false"
 
-if [ -z "$TEST_ID" ] || [ "$TEST_ID" -le 0 ] 2>/dev/null || [ -z "$JOBS_RAW" ]; then
-    echo "[FATAL] Job mal formé : test_id='$TEST_ID' jobs_raw='$JOBS_RAW'"
+if [ -z "$TEST_ID" ] || [ "$TEST_ID" -le 0 ] 2>/dev/null || [ -z "$JOBS_RAW" ] || [ -z "$BOOT_TOKEN" ]; then
+    echo "[FATAL] Job mal formé ou jeton de démarrage absent"
     wget -q -O /dev/null "$API_BASE/disktest-progress?test_id=0&line=fatal_parse_failed" 2>/dev/null || true
     exit 0
 fi
@@ -852,7 +859,8 @@ else
     log_line "Test job #$TEST_ID terminé (status global=$overall_status)"
     # ---- POST end : la réponse porte le post_action FRAIS (modifiable par
     # l'admin pendant le test) — il prime sur celui du fetch initial.
-    ENDRESP=$(wget -qO- "$API_BASE/disktest-end?test_id=$TEST_ID&status=$overall_status" 2>/dev/null) || ENDRESP=""
+    ENDRESP=$(wget -qO- --header="Authorization: Bearer $BOOT_TOKEN" \
+        "$API_BASE/disktest-end?test_id=$TEST_ID&mac=$MAC&status=$overall_status" 2>/dev/null) || ENDRESP=""
     PA_FRESH=$(echo "$ENDRESP" | tr -d ' \n' | sed -n 's/.*"post_action":"\([^"]*\)".*/\1/p')
     [ -n "$PA_FRESH" ] && POST_ACTION="$PA_FRESH"
 fi

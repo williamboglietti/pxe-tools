@@ -23,8 +23,8 @@ class MenuRows(unittest.TestCase):
                 path.write_text(json.dumps(data), encoding='utf-8')
                 return rows.validate(path)
             self.assertEqual(read([machine]), ['02:00:00:00:00:01|Zml4dHVyZS1ob3N0|configured|0||debian|13.7.0'])
-            self.assertEqual(read([{**machine, 'hostname':'PC HP | Étage'}]),
-                             ['02:00:00:00:00:01|UEMgSFAgfCDDiXRhZ2U=|configured|0||debian|13.7.0'])
+            self.assertEqual(read([{**machine, 'hostname':'Bureau | Étage'}]),
+                             ['02:00:00:00:00:01|QnVyZWF1IHwgw4l0YWdl|configured|0||debian|13.7.0'])
             self.assertEqual(read([]), [])
             for modified in ({**machine, 'hostname':'other\nLABEL injected'},
                              {**machine, 'm_distro':"debian' OR 1=1"},

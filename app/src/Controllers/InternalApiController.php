@@ -527,6 +527,10 @@ final class InternalApiController
             $stmt = Db::get()->prepare('SELECT id, action_id FROM installations WHERE id = ?');
             $stmt->execute([$installId]);
             $inst = $stmt->fetch();
+            // Release SQLite's read snapshot before appendInstallLog acquires
+            // BEGIN IMMEDIATE; otherwise a competing writer can make the
+            // transaction upgrade fail immediately despite busy_timeout.
+            $stmt->closeCursor();
             if (!$inst || (int)$inst['action_id'] !== (int)$action['id']) {
                 $this->logRejection('install-log', 'install_action_mismatch', $remoteIp, $token, (string)$installId);
                 $this->respondJson(401, ['error' => 'invalid token']);

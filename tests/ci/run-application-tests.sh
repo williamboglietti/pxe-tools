@@ -47,3 +47,7 @@ echo '::endgroup::'
 echo '::group::Concurrent installation log append'
 PXE_INSTALL_LOG_ISOLATED=1 python3 tests/integration/test_install_log_concurrency.py
 echo '::endgroup::'
+
+echo '::group::Install-log HTTP request under SQLite contention'
+PXE_INSTALL_LOG_HTTP_ISOLATED=1 python3 tests/integration/test_install_log_http_contention.py
+echo '::endgroup::'

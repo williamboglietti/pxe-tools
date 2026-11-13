@@ -99,9 +99,9 @@ final class Installation
      *     append + marker, return ['status'=>'truncated'].
      *   - Sinon : append complet, return ['status'=>'ok'].
      *
-     * Transaction PDO : SELECT + UPDATE wrap (cohérent avec setAnsibleStatus
-     * et autres opérations multi-statement du modèle, évite la race sur reads
-     * concurrents qui surévalueraient l'espace dispo).
+     * SQLite acquiert le verrou d'écriture avant le SELECT pour éviter le
+     * passage deferred SELECT→UPDATE qui peut échouer sous concurrence WAL.
+     * MySQL verrouille la ligne avec FOR UPDATE avant le calcul de capacité.
      *
      * Logs : `error_log` 1 ligne info au moment du truncate (1ère fois où le
      * cap est atteint). Pas de log par chunk OK (spam).
@@ -115,13 +115,34 @@ final class Installation
         $chunkLen   = strlen($chunk);
 
         $pdo = Db::get();
-        $pdo->beginTransaction();
+        $sqlite = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite';
+        // PDO::beginTransaction() uses a deferred SQLite transaction, whose
+        // read snapshot cannot always be upgraded after a competing write.
+        // Acquire the writer slot before reading; SQLite's busy timeout then
+        // handles a short competing transaction without a stale snapshot.
+        if ($sqlite) {
+            $pdo->exec('BEGIN IMMEDIATE');
+        } else {
+            $pdo->beginTransaction();
+        }
+        $transactionActive = true;
+        $commit = static function () use ($pdo, $sqlite, &$transactionActive): void {
+            if ($sqlite) $pdo->exec('COMMIT');
+            else $pdo->commit();
+            $transactionActive = false;
+        };
+        $rollback = static function () use ($pdo, $sqlite, &$transactionActive): void {
+            if ($sqlite) $pdo->exec('ROLLBACK');
+            else $pdo->rollBack();
+            $transactionActive = false;
+        };
         try {
-            $stmt = $pdo->prepare('SELECT install_log FROM installations WHERE id = ?');
+            $sql = 'SELECT install_log FROM installations WHERE id = ?';
+            $stmt = $pdo->prepare($sqlite ? $sql : $sql . ' FOR UPDATE');
             $stmt->execute([$installId]);
             $row = $stmt->fetch();
             if (!$row) {
-                $pdo->rollBack();
+                $rollback();
                 return ['status' => 'not_found', 'bytes' => 0, 'appended' => 0];
             }
             $existing    = (string)($row['install_log'] ?? '');
@@ -130,7 +151,7 @@ final class Installation
             // Cas A : déjà à la limite → skip total (marker éventuellement déjà
             // posé par le précédent append qui a fait basculer en truncated).
             if ($existingLen >= $maxBytes) {
-                $pdo->commit();
+                $commit();
                 return ['status' => 'truncated', 'bytes' => $existingLen, 'appended' => 0];
             }
 
@@ -148,7 +169,7 @@ final class Installation
                     "UPDATE installations SET install_log = $concat WHERE id = ?"
                 );
                 $upd->execute([$payload, $installId]);
-                $pdo->commit();
+                $commit();
                 error_log("[install-log] truncated install_id=$installId at maxBytes=$maxBytes (appended=$writeLen bytes + marker)");
                 return [
                     'status'   => 'truncated',
@@ -163,14 +184,16 @@ final class Installation
                 "UPDATE installations SET install_log = $concat WHERE id = ?"
             );
             $upd->execute([$chunk, $installId]);
-            $pdo->commit();
+            $commit();
             return [
                 'status'   => 'ok',
                 'bytes'    => $existingLen + $chunkLen,
                 'appended' => $chunkLen,
             ];
         } catch (\Throwable $e) {
-            if ($pdo->inTransaction()) $pdo->rollBack();
+            if ($transactionActive) {
+                try { $rollback(); } catch (\Throwable $ignored) { /* Preserve the original error. */ }
+            }
             throw $e;
         }
     }

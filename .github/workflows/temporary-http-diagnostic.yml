@@ -1,0 +1,26 @@
+name: Temporary public HTTP diagnostic
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  public-response:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Read selected public response headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          headers=$(mktemp)
+          trap 'rm -- "$headers"' EXIT
+          status=$(curl --silent --show-error --max-time 20 --user-agent 'curl/8.14.1' --output /dev/null --dump-header "$headers" --write-out '%{http_code}' https://packages.pxetools.com/apt/dists/stable/InRelease)
+          printf 'HTTP status %s\n' "$status"
+          python3 - "$headers" <<'PY'
+          import re, sys
+          from pathlib import Path
+          allowed = {'cf-ray', 'cf-mitigated', 'server'}
+          for line in Path(sys.argv[1]).read_text(errors='replace').splitlines():
+              name, sep, value = line.partition(':')
+              if sep and name.lower() in allowed and re.fullmatch(r'[A-Za-z0-9 ._:/-]{1,200}', value.strip()):
+                  print(name.lower() + ': ' + value.strip())
+          PY

@@ -33,7 +33,9 @@ use Admin\View;
   </hgroup>
 </header>
 
-<p class="muted">Le socle ne contient pas Ansible. Préparez séparément le runtime adapté à votre installation ; l’activation ci-dessous ne l’installe pas.</p>
+<p class="muted">Le socle ne contient pas Ansible. Préparez séparément le runtime adapté à votre installation ; l’activation ci-dessous ne l’installe pas.
+  Consultez les instructions du module : <a href="https://github.com/williamboglietti/pxe-tools/blob/main/modules/ansible/NATIVE.md">paquet natif</a> ou <a href="https://github.com/williamboglietti/pxe-tools/blob/main/modules/ansible/README.md">volume Docker</a>.
+  Le worker existant exécute les playbooks ; un second conteneur permanent n’est pas nécessaire.</p>
 <?php if ($runtime_status === 'ready'): ?>
   <p>Le worker a détecté un environnement Ansible compatible. Il le vérifie à nouveau avant chaque exécution.</p>
 <?php elseif ($runtime_status === 'not_configured'): ?>
@@ -85,7 +87,7 @@ use Admin\View;
         Ansible est disponible. Le suivi reste disponible dans Activité.
       <?php else: ?>
         Désactivé (par défaut). Les machines installées reçoivent juste l'OS de base.
-        Aucun utilisateur <code>ansible</code> n'est créé. Le suivi reste disponible dans Activité.
+        Aucun compte Ansible n'est ajouté aux machines installées. Le suivi reste disponible dans Activité.
       <?php endif; ?>
     </small>
   </fieldset>
@@ -117,7 +119,7 @@ use Admin\View;
 
     <details class="mb-4"><summary>Accès du worker — clé privée et diagnostic</summary>
       <?php if ($privkey_status === 'fs'): ?>
-        <p>Clé privée détectée au chemin <code><?= View::e($privkey_fs_path) ?></code> dans le conteneur. Le montage doit être configuré par l’administrateur.</p>
+        <p>Clé privée détectée au chemin <code><?= View::e($privkey_fs_path) ?></code> ; cet emplacement doit être préparé par l’administrateur.</p>
       <?php else: ?>
         <p>Aucun fichier de clé privée détecté au chemin <code><?= View::e($privkey_fs_path) ?></code>. Le worker utilise un fichier ; la saisie de clé privée dans cette interface n’est pas disponible.</p>
       <?php endif; ?>
@@ -125,18 +127,17 @@ use Admin\View;
         <p class="flash flash-warning">Une ancienne clé privée est stockée en clair dans la base, mais le worker ne l’utilise pas. Elle reste conservée tant que vous ne demandez pas sa suppression.</p>
         <label><input type="checkbox" name="ssh_privkey_clear" value="1"> Effacer explicitement l’ancienne clé privée enregistrée en base</label>
       <?php endif; ?>
-      <small class="muted">Vérifiez les clés d’hôtes SSH avant toute connexion. La préparation et le montage du volume restent des opérations distinctes de l’activation.</small>
+      <small class="muted">Vérifiez les clés d’hôtes SSH avant toute connexion. La préparation des clés reste distincte de l’activation.</small>
     </details>
     <label>
-      Répertoire des playbooks (dans le container)
+      Répertoire des playbooks
       <input type="text" name="playbooks_dir"
-             placeholder="/home/ansible/ansible"
+             placeholder="<?= View::e($playbooks_dir) ?>"
              value="<?= View::e($playbooks_dir) ?>">
       <small class="muted">
         Ce chemin sert au diagnostic du profil. Le worker utilise son propre
-        paramètre <code>ANSIBLE_WORKDIR</code> ; par défaut, le volume Docker
-        est monté dans <code>/home/ansible/ansible</code>. Configurez les deux
-        de manière cohérente si vous personnalisez ce chemin.
+        paramètre <code>ANSIBLE_WORKDIR</code>. Configurez les deux de manière
+        cohérente si vous personnalisez ce chemin.
       </small>
     </label>
 
@@ -146,7 +147,7 @@ use Admin\View;
              placeholder="https://example.test/playbooks.git"
              value="<?= View::e($repo_url) ?>">
       <small class="muted">
-        Laissez vide pour utiliser les playbooks déjà présents dans le volume
+        Laissez vide pour utiliser les playbooks déjà présents dans le répertoire
         local, sans synchronisation Git. Effacer une URL ne supprime pas les
         fichiers du volume. Si une URL est indiquée, le worker tente de
         synchroniser le clone présent avant chaque playbook. Il refuse le clone

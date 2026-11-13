@@ -166,6 +166,8 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
             data=data.replace('/run/php/php8.4-fpm.sock','/run/pxe-tools-php/fpm.sock')
             data=data.replace('/var/log/nginx/','/var/log/pxe-tools/')
             data=data.replace('include fastcgi_params;', 'include /etc/nginx/fastcgi_params;')
+            if name == 'admin-https.conf.tmpl':
+                data = replace_exact(data, '/var/lib/pxe-tools/tls/', '/var/lib/pxe-tools-native/tls/')
             (templates/name).write_text(data)
         pxe=checked(ROOT/'docker/pxe-tools/nginx/pxe.conf').read_text()
         pxe=replace_exact(pxe,'listen 80 default_server;', 'listen @@PXE_IPV4@@:80 default_server;\n    listen 127.0.0.1:80;')

@@ -50,6 +50,11 @@ def main():
                 if name == 'base':
                     extracted = work/f'extracted-{mask:03o}'
                     subprocess.run(['dpkg-deb', '-x', str(package), str(extracted)], check=True)
+                    tls_path = '/var/lib/pxe-tools-native/tls'
+                    assert f'TLS_DIR={tls_path}' in (extracted/'usr/lib/pxe-tools/native/default.env').read_text()
+                    https = (extracted/'opt/pxe-tools/nginx/admin-https.conf.tmpl').read_text()
+                    assert f'{tls_path}/cert.pem' in https and f'{tls_path}/key.pem' in https
+                    assert '/var/lib/pxe-tools/tls/' not in https
                     version_file = extracted/'usr/lib/pxe-tools/app/src/Version.php'
                     actual = subprocess.check_output(
                         ['php', '-r', 'require $argv[1]; echo \\Admin\\Version::displayNumber();', str(version_file)],

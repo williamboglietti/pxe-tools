@@ -24,6 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 022
+          bash packaging/ci/verify-clean-checkout.sh "$GITHUB_SHA"
           version=$(cat packaging/ci/release-version.txt)
           [[ "$version" =~ ^[0-9][A-Za-z0-9.+~_-]{0,100}$ ]]
           dpkg --validate-version "$version"

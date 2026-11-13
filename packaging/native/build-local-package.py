@@ -6,14 +6,21 @@ administration but keeps PXE inactive until the network is confirmed; removal
 and purge preserve instance data.
 """
 import argparse
+import importlib.util
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+_inventory_spec = importlib.util.spec_from_file_location('pxe_source_inventory', ROOT/'packaging/native/source_inventory.py')
+if _inventory_spec is None or _inventory_spec.loader is None:
+    raise RuntimeError('Package source inventory unavailable')
+source_inventory = importlib.util.module_from_spec(_inventory_spec)
+_inventory_spec.loader.exec_module(source_inventory)
 CONTROL = '''Package: {package_name}
 Version: {version}
 Architecture: amd64
@@ -83,10 +90,14 @@ if [ "$1" = purge ]; then echo 'PXE Tools: instance data and configuration were 
 '''
 
 
-def copy_tree(source: Path, destination: Path) -> None:
+def copy_tree(source: Path, destination: Path, tracked: set[str]) -> None:
     for item in [source, *source.rglob('*')]:
+        if any(part == '__pycache__' for part in item.relative_to(source).parts) or item.name == '.DS_Store' or item.suffix == '.pyc':
+            continue
         if item.is_symlink() or not (item.is_file() or item.is_dir()):
             raise ValueError('Unsupported source item: ' + str(item.relative_to(ROOT)))
+        if item.is_file():
+            source_inventory.checked_file(ROOT, item, tracked)
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns('.DS_Store', '__pycache__', '*.pyc'))
 
 
@@ -108,6 +119,8 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
         raise FileExistsError('Refusing to overwrite an existing package')
     if not re.fullmatch(r'[0-9][A-Za-z0-9.+~\-]{0,40}', version):
         raise ValueError('Invalid package version')
+    tracked = source_inventory.tracked_files(ROOT)
+    checked = lambda path: source_inventory.checked_file(ROOT, path, tracked)
     with tempfile.TemporaryDirectory(prefix='pxe-native-package-') as temporary:
         root = Path(temporary)/'root'; control = root/'DEBIAN'; control.mkdir(parents=True)
         description, details = (('PXE network installation management',
@@ -117,39 +130,39 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
                                  'This package is intended for isolated test environments.'))
         (control/'control').write_text(CONTROL.format(version=version, package_name=package_name,
                                                        maintainer=maintainer, description=description, details=details))
-        cleanup = (ROOT/'packaging/native/prune-package-cache.py').read_text()
+        cleanup = checked(ROOT/'packaging/native/prune-package-cache.py').read_text()
         preinst = PREINST.replace('@@PXE_CACHE_CLEANUP@@', cleanup)
         for name, text in [('preinst',preinst),('postinst',POSTINST),('prerm',PRERM),('postrm',POSTRM)]:
             p=control/name; p.write_text(text.replace('pxe-tools-local-test', package_name)); p.chmod(0o755)
-        copy_tree(ROOT/'app', root/'usr/lib/pxe-tools/app')
-        copy_tree(ROOT/'docker/worker/scripts', root/'opt/pxe-tools/scripts')
-        copy_tree(ROOT/'docker/worker/templates', root/'opt/pxe-tools/templates')
-        copy_tree(ROOT/'docker/pxe-tools/init', root/'opt/pxe-tools/init')
-        copy_tree(ROOT/'docker/pxe-tools/static-bin', root/'usr/lib/pxe-tools/static-bin')
-        copy_tree(ROOT/'docker/pxe-tools/keyrings', root/'usr/lib/pxe-tools/keyrings')
+        copy_tree(ROOT/'app', root/'usr/lib/pxe-tools/app', tracked)
+        copy_tree(ROOT/'docker/worker/scripts', root/'opt/pxe-tools/scripts', tracked)
+        copy_tree(ROOT/'docker/worker/templates', root/'opt/pxe-tools/templates', tracked)
+        copy_tree(ROOT/'docker/pxe-tools/init', root/'opt/pxe-tools/init', tracked)
+        copy_tree(ROOT/'docker/pxe-tools/static-bin', root/'usr/lib/pxe-tools/static-bin', tracked)
+        copy_tree(ROOT/'docker/pxe-tools/keyrings', root/'usr/lib/pxe-tools/keyrings', tracked)
         # Carry the selected core licence and the currently verified upstream
         # notices. Other components still require provenance and legal review.
         docs=root/'usr/share/doc'/package_name; docs.mkdir(parents=True)
         for name in ('COPYING', 'COPYING.LESSER', 'THIRD-PARTY.md'):
-            shutil.copy2(ROOT/name, docs/name)
-        copy_tree(ROOT/'third_party/licenses', docs/'licenses')
+            shutil.copy2(checked(ROOT/name), docs/name)
+        copy_tree(ROOT/'third_party/licenses', docs/'licenses', tracked)
         native=root/'usr/lib/pxe-tools/native'; native.mkdir(parents=True)
         for name in ('default.env','init.sh','start-php-fpm.sh','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
-            shutil.copy2(ROOT/'packaging/native'/name, native/name)
+            shutil.copy2(checked(ROOT/'packaging/native'/name), native/name)
         units=root/'usr/lib/systemd/system'; units.mkdir(parents=True)
         for unit in (sorted((ROOT/'packaging/native').glob('pxe-tools.*'))
                      + sorted((ROOT/'packaging/native').glob('pxe-tools-*.service'))
                      + sorted((ROOT/'packaging/native').glob('pxe-tools-*.target'))):
-            shutil.copy2(unit, units/unit.name)
+            shutil.copy2(checked(unit), units/unit.name)
         templates=root/'opt/pxe-tools/nginx'; templates.mkdir(parents=True)
         for name in ('admin-http-serve.conf.tmpl','admin-http-redirect.conf.tmpl','admin-https.conf.tmpl'):
-            data=(ROOT/'docker/pxe-tools/nginx'/name).read_text()
+            data=checked(ROOT/'docker/pxe-tools/nginx'/name).read_text()
             data=data.replace('/app/public','/usr/lib/pxe-tools/app/public')
             data=data.replace('/run/php/php8.4-fpm.sock','/run/pxe-tools-php/fpm.sock')
             data=data.replace('/var/log/nginx/','/var/log/pxe-tools/')
             data=data.replace('include fastcgi_params;', 'include /etc/nginx/fastcgi_params;')
             (templates/name).write_text(data)
-        pxe=(ROOT/'docker/pxe-tools/nginx/pxe.conf').read_text()
+        pxe=checked(ROOT/'docker/pxe-tools/nginx/pxe.conf').read_text()
         pxe=replace_exact(pxe,'listen 80 default_server;', 'listen @@PXE_IPV4@@:80 default_server;\n    listen 127.0.0.1:80;')
         pxe=replace_exact(pxe,'    listen [::]:80 default_server;\n', '')
         pxe=replace_exact(pxe,'/app/public','/usr/lib/pxe-tools/app/public')
@@ -159,16 +172,23 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
         pxe=replace_exact(pxe,'include fastcgi_params;','include /etc/nginx/fastcgi_params;')
         (native/'pxe.conf').write_text(pxe)
         dns=root/'opt/pxe-tools/dnsmasq'; dns.mkdir(parents=True)
-        text=(ROOT/'docker/dnsmasq/pxe.conf.tmpl').read_text()
+        text=checked(ROOT/'docker/dnsmasq/pxe.conf.tmpl').read_text()
         text=replace_exact(text,'dhcp-script=/usr/local/bin/dhcp-hook.sh','dhcp-script=/opt/pxe-tools/native/dhcp-hook.sh')
         (dns/'pxe.conf.tmpl').write_text(text)
         helpers=root/'opt/pxe-tools/native'; helpers.mkdir(parents=True)
         for name in ('dhcp-hook.sh','dnsmasq-tail.sh'):
-            shutil.copy2(ROOT/'docker/dnsmasq'/name, helpers/name)
+            shutil.copy2(checked(ROOT/'docker/dnsmasq'/name), helpers/name)
         for folder in (root/'opt/pxe-tools/scripts',root/'opt/pxe-tools/init',helpers):
             for path in folder.glob('*.sh'): path.chmod(0o755)
         for path in (root/'usr/lib/pxe-tools/static-bin').iterdir():
             if path.is_file() and path.suffix != '.md': path.chmod(0o755)
+        # Normalize only the staging tree, not the checkout. copytree and
+        # copy2 preserve source modes regardless of the builder's umask.
+        for path in (root, *root.rglob('*')):
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                raise ValueError('Unsupported staged package item')
+            mode = stat.S_IMODE(path.stat().st_mode)
+            path.chmod(0o755 if path.is_dir() or mode & 0o111 else 0o644)
         archive=Path(temporary)/'package.deb'
         subprocess.run(['dpkg-deb','--build','--root-owner-group',str(root),str(archive)],check=True,stdout=subprocess.DEVNULL)
         # Exclusive open prevents destroying a previously produced artifact.

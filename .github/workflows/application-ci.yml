@@ -29,7 +29,7 @@ jobs:
             --workdir /tmp pxe-tools-application-test:local bash -c '
               set -euo pipefail
               mkdir workspace
-              tar -C /source --exclude=./.git -cf - . | tar -C workspace --no-same-owner -xf -
+              tar -C /source -cf - . | tar -C workspace --no-same-owner -xf -
               cd workspace
               exec bash tests/ci/run-application-tests.sh
             '

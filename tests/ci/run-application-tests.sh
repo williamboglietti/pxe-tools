@@ -48,6 +48,8 @@ echo '::endgroup::'
 
 echo '::group::Native PXE HTTP interface binding'
 python3 tests/unit/test_native_pxe_http_bind.py
+python3 tests/integration/test_native_package_permissions.py
+bash tests/integration/test_clean_release_checkout.sh
 echo '::endgroup::'
 
 echo '::group::Concurrent installation log append'

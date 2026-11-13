@@ -105,8 +105,10 @@ try:
         gid = grp.getgrnam('ansible').gr_gid
     except KeyError:
         gid = grp.getgrnam('www-data').gr_gid
-    os.fchmod(fd, 0o440)
-    os.fchown(fd, uid, gid)
+    if stat.S_IMODE(info.st_mode) != 0o440:
+        os.fchmod(fd, 0o440)
+    if info.st_uid != uid or info.st_gid != gid:
+        os.fchown(fd, uid, gid)
 finally:
     os.close(fd)
 PYTHON
@@ -124,6 +126,7 @@ import os
 import pwd
 
 account = pwd.getpwnam('www-data')
+os.makedirs('/var/lib/pxe-tools', mode=0o755, exist_ok=True)
 root = os.open('/var/lib/pxe-tools', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
     try:

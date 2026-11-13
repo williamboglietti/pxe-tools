@@ -29,7 +29,9 @@ def request(database, directory, operation, address, token=''):
     (new Admin\Controllers\PxeController())->{$OPERATION}([]);'''.replace('{$OPERATION}', operation)
     env = dict(os.environ, PXE_APP_DIR=str(ROOT / 'app'), PXE_DB_DRIVER='sqlite', PXE_DB_PATH=str(database))
     result = subprocess.run(['php', '-r', bootstrap, address, token, MAC, str(status)],
-                            env=env, capture_output=True, text=True, check=True)
+                            env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[:500])
     return int(status.read_text()), json.loads(result.stdout)
 
 

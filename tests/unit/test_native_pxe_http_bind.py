@@ -5,6 +5,7 @@ from contextlib import closing
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -45,12 +46,19 @@ class RendererTests(unittest.TestCase):
         builder = importlib.util.module_from_spec(builder_spec)
         builder_spec.loader.exec_module(builder)
         package = Path(self.work.name) / 'fixture.deb'
-        builder.build(package, '0.1.0~bindingtest')
+        previous_umask = os.umask(0o002)
+        try:
+            builder.build(package, '0.1.0~bindingtest')
+        finally:
+            os.umask(previous_umask)
         pre_depends = subprocess.check_output(['dpkg-deb', '--field', str(package), 'Pre-Depends'], text=True).strip()
         self.assertIn('python3 (>= 3.11)', pre_depends)
         payload = subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(package)])
         with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
             template = archive.extractfile('./usr/lib/pxe-tools/native/pxe.conf').read().decode()
+            for member in archive.getmembers():
+                if member.isdir() or member.isfile():
+                    self.assertEqual(member.mode & 0o7022, 0, member.name)
         self.assertIn('listen @@PXE_IPV4@@:80 default_server;', template)
         self.assertIn('listen 127.0.0.1:80;', template)
         self.assertIn('root @@HTTP_ROOT@@;', template)

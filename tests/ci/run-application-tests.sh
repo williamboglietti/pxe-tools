@@ -53,6 +53,8 @@ python3 tests/unit/test_native_pxe_http_bind.py
 python3 tests/unit/test_native_worker_keyring.py
 python3 tests/unit/test_configure_secure_runtime.py
 python3 tests/unit/test_publish_public_mok.py
+python3 tests/integration/test_native_package_permissions.py
+bash tests/integration/test_clean_release_checkout.sh
 echo '::endgroup::'
 
 echo '::group::Concurrent installation log append'

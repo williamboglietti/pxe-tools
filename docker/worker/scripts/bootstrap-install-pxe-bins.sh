@@ -8,6 +8,9 @@ set -euo pipefail
 
 : "${TFTP_ROOT:=/srv/tftp}"
 
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" tftp "$TFTP_ROOT"
+fi
 mkdir -p "$TFTP_ROOT" "$TFTP_ROOT/pxelinux.cfg"
 
 copy_if_changed() {
@@ -28,12 +31,21 @@ for mod in ldlinux.c32 libcom32.c32 libutil.c32 menu.c32 vesamenu.c32 chain.c32;
     copy_if_changed "/usr/lib/syslinux/modules/bios/$mod" "$TFTP_ROOT/$mod" "syslinux module $mod"
 done
 
-# UEFI : shim signé Microsoft = entrypoint annoncé en DHCP option 67 (filename)
-# Le shim charge ensuite grubx64.efi (signé MOK) via TFTP.
-copy_if_changed /usr/lib/shim/shimx64.efi.signed       "$TFTP_ROOT/grubnetx64.efi" "shim (grubnetx64.efi)"
-# MokManager (présent sur certaines versions seulement)
-if [ -f /usr/lib/shim/mmx64.efi.signed ]; then
-    copy_if_changed /usr/lib/shim/mmx64.efi.signed     "$TFTP_ROOT/mmx64.efi"      "MokManager"
+# Ubuntu's shim trusts Canonical kernels, not Debian's signed netboot kernel.
+# Use an authenticated, version-matched Debian pair for the Debian PXE target.
+# The native worker selects a current Debian archive keyring before this runs.
+host_id=''
+if [ -r /etc/os-release ]; then host_id=$(. /etc/os-release; printf '%s' "${ID:-}"); fi
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ] && [ "$host_id" = ubuntu ]; then
+    : "${DEBIAN_ARCHIVE_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg}"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/prepare-debian-shim.py" "$TFTP_ROOT" "$DEBIAN_ARCHIVE_KEYRING"
+else
+    copy_if_changed /usr/lib/shim/shimx64.efi.signed "$TFTP_ROOT/grubnetx64.efi" "shim (grubnetx64.efi)"
+    if [ -f /usr/lib/shim/mmx64.efi.signed ]; then
+        copy_if_changed /usr/lib/shim/mmx64.efi.signed "$TFTP_ROOT/mmx64.efi" "MokManager"
+    elif [ -f /usr/lib/shim/mmx64.efi ]; then
+        copy_if_changed /usr/lib/shim/mmx64.efi "$TFTP_ROOT/mmx64.efi" "MokManager"
+    fi
 fi
 
 # Spec H — iPXE binaires (chainload depuis pxelinux/grub).

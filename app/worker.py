@@ -38,6 +38,7 @@ import urllib.request
 from contextlib import contextmanager
 from typing import Callable, Optional
 from database_selection import select_database
+from pxe_menu_lock import menu_lock
 
 from ansible_vault import (
     VaultLocked,
@@ -1036,6 +1037,11 @@ def enqueue_auto_preset_pull() -> None:
 
 
 def run_cleanup_per_mac_files(job: dict) -> None:
+    with menu_lock(os.environ.get('TFTP_ROOT', '/srv/tftp')):
+        _run_cleanup_per_mac_files_locked(job)
+
+
+def _run_cleanup_per_mac_files_locked(job: dict) -> None:
     """Supprime les fichiers pxelinux.cfg/01-* du tftp root après un reset
     machines. Sans ça, le booting d'une nouvelle machine avec une MAC qui a
     déjà été enregistrée trouverait l'ancien menu localboot."""
@@ -1047,6 +1053,7 @@ def run_cleanup_per_mac_files(job: dict) -> None:
                     progress_percent=10)
     log_lines = [f"[worker] cleanup_per_mac_files in {cfg_dir}\n"]
     removed = 0
+    failures = 0
     try:
         if not os.path.isdir(cfg_dir):
             log_lines.append(f"[worker] {cfg_dir} introuvable, rien à nettoyer\n")
@@ -1060,8 +1067,11 @@ def run_cleanup_per_mac_files(job: dict) -> None:
                     removed += 1
                     log_lines.append(f"[worker] rm {path}\n")
                 except Exception as e:
+                    failures += 1
                     log_lines.append(f"[worker] rm {path} échec : {e}\n")
             log_lines.append(f"[worker] {removed} fichier(s) per-MAC supprimé(s)\n")
+        if failures:
+            raise RuntimeError(f'{failures} menu(s) non supprimé(s)')
         append_init_log(job_id, "".join(log_lines))
         update_init_job(job_id, status="success", ended_at=now(), updated_at=now(),
                         progress_percent=100,
@@ -1076,6 +1086,11 @@ def run_cleanup_per_mac_files(job: dict) -> None:
 
 
 def run_factory_reset_wipe_job(job: dict) -> None:
+    with menu_lock(TFTP_ROOT):
+        _run_factory_reset_wipe_job_locked(job)
+
+
+def _run_factory_reset_wipe_job_locked(job: dict) -> None:
     """Factory reset (artefacts root). La DB a déjà été vidée côté PHP
     (settings/users/machines/... → retour wizard /init). Ici on efface les
     artefacts disque que PHP (www-data) ne peut pas supprimer car root-owned :
@@ -1092,6 +1107,8 @@ def run_factory_reset_wipe_job(job: dict) -> None:
             if not os.path.isdir(base):
                 continue
             for name in os.listdir(base):
+                if base == TFTP_ROOT and name == '.pxe-menu.lock':
+                    continue
                 path = os.path.join(base, name)
                 subprocess.run(["rm", "-rf", path], check=False)
                 log_lines.append(f"[worker] rm {path}\n")

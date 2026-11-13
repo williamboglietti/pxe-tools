@@ -4,5 +4,6 @@ After=network.target
 [Service]
 Type=oneshot
 EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+EnvironmentFile=-/var/lib/pxe-tools-native/runtime.env
 ExecStart=/bin/sh /usr/lib/pxe-tools/native/init.sh
 RemainAfterExit=yes

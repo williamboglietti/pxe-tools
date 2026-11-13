@@ -38,6 +38,8 @@ echo '::endgroup::'
 
 echo '::group::Debian preseed, signed bootloaders and disk guards'
 python3 tests/unit/test_preseed_install_invariants.py
+python3 tests/unit/test_grub_sbat_distribution.py
+python3 tests/unit/test_debian_shim_acquisition.py
 echo '::endgroup::'
 
 echo '::group::Signed Debian netboot freshness and integrity'
@@ -47,7 +49,14 @@ python3 tests/unit/test_prototype_debian_netboot_freshness.py
 echo '::endgroup::'
 
 echo '::group::Native PXE HTTP interface binding'
+python3 tests/unit/test_atomic_publish.py
+python3 tests/unit/test_pxe_menu_rows.py
 python3 tests/unit/test_native_pxe_http_bind.py
+python3 tests/unit/test_native_worker_keyring.py
+python3 tests/unit/test_configure_secure_runtime.py
+python3 tests/unit/test_publish_public_mok.py
+python3 tests/unit/test_native_runtime_paths.py
+python3 tests/unit/test_native_image_path_guard.py
 python3 tests/integration/test_native_package_permissions.py
 bash tests/integration/test_clean_release_checkout.sh
 echo '::endgroup::'

@@ -6,6 +6,7 @@ namespace Admin\Controllers;
 use Admin\Db;
 use Admin\InitGuard;
 use Admin\Models\Setting;
+use Admin\Models\Machine;
 use Admin\View;
 
 /**
@@ -144,20 +145,24 @@ final class SettingsController
         }
 
         $pdo = Db::get();
-        $count = (int)$pdo->query('SELECT COUNT(*) FROM machines')->fetchColumn();
-
-        if (Db::driver() === 'sqlite') $pdo->exec('PRAGMA foreign_keys = ON');
-        $pdo->beginTransaction();
+        $count = 0;
+        $menuLock = null;
         try {
+            [$menuLock] = Machine::lockPxeMenus();
+            $count = (int)$pdo->query('SELECT COUNT(*) FROM machines')->fetchColumn();
+            if (Db::driver() === 'sqlite') $pdo->exec('PRAGMA foreign_keys = ON');
+            $pdo->beginTransaction();
             $pdo->exec('DELETE FROM machines');
             $pdo->prepare("INSERT INTO init_jobs (job_type, status, message) VALUES (?, 'pending', ?)")->execute(['bootstrap:cleanup_per_mac_files', 'Nettoyage des fichiers PXE après réinitialisation du parc']);
             $jobId = (int)$pdo->lastInsertId();
             $pdo->commit();
         } catch (\Throwable $e) {
-            $pdo->rollBack();
+            if ($pdo->inTransaction()) $pdo->rollBack();
             View::flash('error', 'Erreur durant le reset : ' . $e->getMessage());
             View::redirect('/settings');
             return;
+        } finally {
+            if (is_resource($menuLock)) { flock($menuLock, LOCK_UN); fclose($menuLock); }
         }
 
         InitGuard::resetCache();
@@ -203,7 +208,9 @@ final class SettingsController
             'settings', 'users',
         ];
 
+        $menuLock = null;
         try {
+            [$menuLock] = Machine::lockPxeMenus();
             $pdo->exec(Db::driver() === 'sqlite' ? 'PRAGMA foreign_keys = OFF' : 'SET FOREIGN_KEY_CHECKS = 0');
             $pdo->beginTransaction();
             foreach ($tables as $t) {
@@ -211,13 +218,10 @@ final class SettingsController
             }
             // Purge les jobs init passés puis enqueue le wipe artefacts (worker root).
             $pdo->exec('DELETE FROM init_jobs');
-            // Remet les compteurs AUTOINCREMENT à zéro : un factory reset doit rendre
-            // l'appliance identique à une install neuve (1er preset = id 1, 1re machine
-            // = id 1, …). En SQLite, DELETE ne touche pas sqlite_sequence → sans ça les
-            // id reprenaient là où on s'était arrêté (ex. board recréé en id 18). Toutes
-            // les tables référençantes étant vidées dans la même transaction, aucune
-            // réutilisation d'id dangereuse. Avant l'INSERT du job → il repart aussi à 1.
-            if (Db::driver() === 'sqlite') $pdo->exec('DELETE FROM sqlite_sequence');
+            // A worker may still be completing an older job while reset runs.
+            // Keep the job sequence so its late update cannot target the newly
+            // queued reset job through a reused identifier.
+            if (Db::driver() === 'sqlite') $pdo->exec("DELETE FROM sqlite_sequence WHERE name <> 'init_jobs'");
             $pdo->prepare("INSERT INTO init_jobs (job_type, status, message) VALUES (?, 'pending', ?)")
                 ->execute(['system:factory_reset_wipe', 'Effacement des artefacts PXE + re-bootstrap']);
             $pdo->commit();
@@ -229,6 +233,8 @@ final class SettingsController
             View::flash('error', 'Erreur durant la réinitialisation : ' . $e->getMessage());
             View::redirect('/settings');
             return;
+        } finally {
+            if (is_resource($menuLock)) { flock($menuLock, LOCK_UN); fclose($menuLock); }
         }
         $pdo->exec(Db::driver() === 'sqlite' ? 'PRAGMA foreign_keys = ON' : 'SET FOREIGN_KEY_CHECKS = 1');
 

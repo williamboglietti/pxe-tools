@@ -62,9 +62,14 @@ def render(database, template, output, ip_command='ip', *, environ=None, allow_m
         time.sleep(min(poll_interval, remaining))
     text = Path(template).read_text(encoding='utf-8')
     marker = '@@PXE_IPV4@@'
-    if text.count(marker) != 1:
+    root_marker = '@@HTTP_ROOT@@'
+    http_root = environ.get('HTTP_ROOT', '/var/lib/pxe-tools/http')
+    if (not isinstance(http_root, str) or not re.fullmatch(r'/[A-Za-z0-9_./-]+', http_root)
+            or any(part in ('.', '..') for part in http_root.split('/'))):
+        raise ValueError('invalid HTTP root')
+    if text.count(marker) != 1 or text.count(root_marker) != 1:
         raise ValueError('invalid PXE HTTP template')
-    rendered = text.replace(marker, str(parsed))
+    rendered = text.replace(marker, str(parsed)).replace(root_marker, http_root)
     target = Path(output)
     temporary = None
     try:

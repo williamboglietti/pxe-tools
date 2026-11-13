@@ -471,38 +471,112 @@ final class Machine
         return $deadline !== false && $deadline <= time();
     }
 
+    /** Hold the root-owned shared menu lock before a DB deletion or unlink. */
+    public static function lockPxeMenus(): array
+    {
+        $root = rtrim((string)(getenv('TFTP_ROOT') ?: '/srv/tftp'), '/');
+        if ($root === '' || $root[0] !== '/' || str_contains($root, "\0")) {
+            throw new \RuntimeException('Racine TFTP invalide ; suppression refusée.');
+        }
+        $current = '';
+        $parts = explode('/', trim($root, '/'));
+        foreach ($parts as $index => $part) {
+            if ($part === '' || $part === '.' || $part === '..') {
+                throw new \RuntimeException('Racine TFTP invalide ; suppression refusée.');
+            }
+            $current .= '/' . $part;
+            $info = @lstat($current);
+            $stickyAncestor = $info !== false && $index < count($parts) - 1 && ($info['mode'] & 01000) !== 0;
+            if ($info === false || ($info['mode'] & 0170000) !== 0040000
+                || $info['uid'] !== 0 || (($info['mode'] & 0022) !== 0 && !$stickyAncestor)) {
+                throw new \RuntimeException('Racine TFTP non protégée ; suppression refusée.');
+            }
+        }
+        $menu = @lstat($root . '/pxelinux.cfg');
+        if ($menu === false || ($menu['mode'] & 0170000) !== 0040000
+            || $menu['uid'] !== 0 || ($menu['mode'] & 0002) !== 0) {
+            throw new \RuntimeException('Répertoire des menus non protégé ; suppression refusée.');
+        }
+        $path = $root . '/.pxe-menu.lock';
+        $before = @lstat($path);
+        if ($before === false || ($before['mode'] & 0170000) !== 0100000
+            || $before['uid'] !== 0 || ($before['mode'] & 0002) !== 0 || $before['nlink'] !== 1) {
+            throw new \RuntimeException('Verrou des menus indisponible ; suppression refusée.');
+        }
+        $lock = @fopen($path, 'r+');
+        if ($lock === false) throw new \RuntimeException('Verrou des menus inaccessible ; suppression refusée.');
+        $opened = fstat($lock);
+        if ($opened === false || $opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino']) {
+            fclose($lock);
+            throw new \RuntimeException('Verrou des menus modifié ; suppression refusée.');
+        }
+        $deadline = microtime(true) + 10;
+        do {
+            if (flock($lock, LOCK_EX | LOCK_NB)) return [$lock, $root];
+            usleep(50000);
+        } while (microtime(true) < $deadline);
+        fclose($lock);
+        throw new \RuntimeException('Rendu PXE occupé ; réessayez la suppression.');
+    }
+
     public static function delete(int $id): void
     {
-        // Récupère la MAC avant DELETE pour nettoyer le fichier PXE per-MAC.
-        // Sans ce cleanup, une machine supprimée qui reboot retrouverait son
-        // ancien menu pxelinux (ex: wipe) au lieu du menu discovery default
-        // → boucle infinie sur l'ancien flow + impossibilité de re-créer
-        // la fiche machine via discovery. Cf. discoveryAction qui force
-        // reboot en complément si la machine pollait encore au moment du DELETE.
-        $stmt = Db::get()->prepare('SELECT mac FROM machines WHERE id = ?');
-        $stmt->execute([$id]);
-        $mac = (string)($stmt->fetchColumn() ?: '');
-
-        Db::get()->prepare('DELETE FROM machines WHERE id = ?')->execute([$id]);
-
-        if ($mac !== '') {
-            $macSlug = strtolower(str_replace(':', '-', $mac));
-            $tftpRoot = getenv('TFTP_ROOT') ?: '/srv/tftp';
-            $cfgFile = $tftpRoot . '/pxelinux.cfg/01-' . $macSlug;
-            if (is_file($cfgFile)) {
-                // Pas de @ : si unlink échoue (permission denied — cas vu
-                // quand le dossier pxelinux.cfg n'a pas le bit g+w pour
-                // www-data), on doit le logguer pour pouvoir diagnostiquer.
-                // Sinon la machine continuera à booter sur l'ancien menu
-                // (boucle infinie wipe → 404 → reboot). Fix permissions :
-                // render-per-mac-pxelinux.sh fait chgrp www-data + chmod g+w
-                // sur le dossier au boot. error_get_last() capture l'erreur
-                // PHP même sans @ grâce à set_error_handler dans index.php.
-                if (!unlink($cfgFile)) {
-                    $err = error_get_last();
-                    error_log('Machine::delete failed to unlink ' . $cfgFile . ': ' . ($err['message'] ?? 'unknown'));
-                }
+        [$lock, $tftpRoot] = self::lockPxeMenus();
+        try {
+            $stmt = Db::get()->prepare('SELECT mac FROM machines WHERE id = ?');
+            $stmt->execute([$id]);
+            $value = $stmt->fetchColumn();
+            $stmt->closeCursor();
+            if ($value === false) return;
+            $rawMac = strtolower(trim((string)$value));
+            if (!preg_match('/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/D', $rawMac)
+                && !preg_match('/^(?:[0-9a-f]{2}-){5}[0-9a-f]{2}$/D', $rawMac)
+                && !preg_match('/^[0-9a-f]{12}$/D', $rawMac)) {
+                throw new \RuntimeException('Adresse MAC invalide ; suppression refusée.');
             }
+            $mac = implode(':', str_split(str_replace([':', '-'], '', $rawMac), 2));
+            $name = '01-' . str_replace(':', '-', $mac);
+            $cfgFile = $tftpRoot . '/pxelinux.cfg/' . $name;
+            $pdo = Db::get();
+            if ($pdo->inTransaction()) {
+                throw new \RuntimeException('Transaction déjà ouverte ; suppression refusée.');
+            }
+            $saved = null;
+            $pdo->beginTransaction();
+            try {
+                $info = @lstat($cfgFile);
+                if ($info !== false) {
+                    $kind = $info['mode'] & 0170000;
+                    if ($kind !== 0100000 && $kind !== 0120000) {
+                        throw new \RuntimeException('Menu PXE invalide ; suppression refusée.');
+                    }
+                    $saved = $cfgFile . '.pending-delete-' . bin2hex(random_bytes(16));
+                    if (file_exists($saved) || is_link($saved) || !rename($cfgFile, $saved)) {
+                        $saved = null;
+                        throw new \RuntimeException('Menu PXE inaccessible ; suppression refusée.');
+                    }
+                }
+                $delete = $pdo->prepare('DELETE FROM machines WHERE id = ? AND mac = ?');
+                $delete->execute([$id, (string)$value]);
+                if ($delete->rowCount() !== 1) {
+                    throw new \RuntimeException('Machine modifiée ; suppression refusée.');
+                }
+                $pdo->commit();
+            } catch (\Throwable $error) {
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($saved !== null && (file_exists($saved) || is_link($saved))) {
+                    if (file_exists($cfgFile) || is_link($cfgFile) || !rename($saved, $cfgFile)) {
+                        throw new \RuntimeException('Suppression refusée ; restauration manuelle du menu nécessaire.', 0, $error);
+                    }
+                }
+                throw $error;
+            }
+            if ($saved !== null && (file_exists($saved) || is_link($saved)) && !unlink($saved)) {
+                error_log('Machine::delete: fichier temporaire de menu conservé : ' . $saved);
+            }
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
         }
     }
 

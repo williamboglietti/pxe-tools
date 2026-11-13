@@ -22,6 +22,7 @@ migration), ou si la table os_images n'existe pas encore.
 Usage : render_template.py <template_path> <output_path>
 """
 import json
+from atomic_publish import publish
 import os
 import sqlite3
 import sys
@@ -257,9 +258,7 @@ def main() -> int:
         "pxe_default_arch": os.environ.get("DEBIAN_ARCH", "amd64"),
     }
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(template.render(**ctx))
+    publish(output_path, template.render(**ctx).encode('utf-8'))
 
     print(f"[render] {template_path} → {output_path}")
     return 0

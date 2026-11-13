@@ -22,7 +22,7 @@ export PXE_DB_PATH
 # shellcheck source=lib-image-verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib-image-verify.sh"
 
-if [ -z "$IMAGE_ID" ]; then
+if ! [[ "$IMAGE_ID" =~ ^[1-9][0-9]*$ ]]; then
     echo "[download-image] ERREUR : IMAGE_ID non défini" >&2
     exit 2
 fi
@@ -43,6 +43,12 @@ if [ -z "$row" ]; then
 fi
 IFS='|' read -r distro version version_full arch kernel_url initrd_url codename firmware_url <<< "$row"
 
+safe_component() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$ && "$1" != *..* ]]; }
+if ! safe_component "$distro" || ! safe_component "${version_full:-$version}" || ! safe_component "$arch" \
+   || { [ -n "$codename" ] && ! safe_component "$codename"; }; then
+    echo '[download-image] ERREUR : identité de catalogue invalide.' >&2; exit 1
+fi
+
 # Layout v2 : /netboot/<distro>/<version_full>/<arch>/ — aligné avec les templates
 # de boot (grub.cfg.j2/pxelinux-default.j2) et pxe_default_netboot_path. Fallback
 # legacy v1 /netboot/<version>/<arch>/ si version_full vide (rows v1 non backfillées).
@@ -52,7 +58,11 @@ if [ -n "$version_full" ]; then
 else
     dest_dir="$HTTP_ROOT/netboot/$version/$arch"
 fi
-mkdir -p "$dest_dir"
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$distro/${version_full:-$version}/$arch"
+else
+    mkdir -p "$dest_dir"
+fi
 
 echo "[download-image] ▶ id=$IMAGE_ID $label"
 
@@ -291,7 +301,11 @@ fi
 # menus rescue/discovery (pxe_default_netboot_path) et certains chemins legacy
 # résolvent par codename. Uniquement en layout v2 (version_full + codename).
 if [ -n "$version_full" ] && [ -n "$codename" ]; then
-    mkdir -p "$HTTP_ROOT/netboot/$codename"
+    if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+        python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$codename"
+    else
+        mkdir -p "$HTTP_ROOT/netboot/$codename"
+    fi
     ln -sfn "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
     echo "[download-image]   symlink netboot/$codename/$arch → ../$distro/$version_full/$arch"
 fi

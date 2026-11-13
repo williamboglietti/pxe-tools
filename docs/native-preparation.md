@@ -62,6 +62,14 @@ Le fichier root `/var/lib/pxe-tools-native/runtime.env` transmet ces chemins
 aux unités systemd. Le programme de préparation refuse tout chemin existant :
 aucune donnée n'est remplacée, déplacée ou supprimée automatiquement.
 
+Le répertoire `pxelinux.cfg` reste accessible en écriture au groupe du service
+web pour supprimer immédiatement le menu d'une machine effacée ou fusionnée.
+Le rendu du worker et ces suppressions sont coordonnés par un verrou protégé ;
+les fichiers générés sont remplacés sans suivre de lien de destination. Un
+compte web compromis peut néanmoins modifier les menus BIOS présents dans ce
+répertoire : limitez l'accès à l'interface et protégez le réseau PXE. Les
+chargeurs et les autres répertoires de la racine TFTP restent protégés.
+
 Une instance héritée sans ce marqueur conserve ses anciens chemins. Si ses
 répertoires TFTP, HTTP, de rendus ou MOK, ou leurs parents, sont modifiables par
 le service web, l'initialisation et les tâches natives refusent les écritures

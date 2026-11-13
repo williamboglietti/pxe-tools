@@ -49,6 +49,8 @@ python3 tests/unit/test_prototype_debian_netboot_freshness.py
 echo '::endgroup::'
 
 echo '::group::Native PXE HTTP interface binding'
+python3 tests/unit/test_atomic_publish.py
+python3 tests/unit/test_pxe_menu_rows.py
 python3 tests/unit/test_native_pxe_http_bind.py
 python3 tests/unit/test_native_worker_keyring.py
 python3 tests/unit/test_configure_secure_runtime.py

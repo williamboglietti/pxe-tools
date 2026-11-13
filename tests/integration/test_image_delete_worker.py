@@ -155,8 +155,8 @@ w.run_bootstrap_job(job)
     os.killpg(process.pid, 9); process.wait(timeout=10)
     assert sql('SELECT id FROM os_images WHERE id=8') and staged.exists()
     sql('DROP TRIGGER fixture_slow_delete')
-    worker.reap_running_zombies(); assert state(number)=='pending'
-    run(number); assert state(number)=='success' and not list(path.glob('*.pxe-delete-*'))
+    precommit_path=path; precommit=number; precommit_metadata=job(number)['log']
+    sql("UPDATE init_jobs SET updated_at='2000-01-01 00:00:00' WHERE id=?",(precommit,))
 
     # Stop the actual worker after SQLite has committed but before cleanup.
     # The test-only barrier makes the otherwise very short interval observable.
@@ -173,8 +173,8 @@ w.run_bootstrap_job(job)
     os.killpg(process.pid, 9); process.wait(timeout=10)
     assert not sql('SELECT id FROM os_images WHERE id=11')
     assert len(list(path.glob(f'*.pxe-delete-{number}'))) == 3
-    worker.reap_running_zombies(); assert state(number)=='pending'
-    run(number); assert state(number)=='success' and not list(path.glob('*.pxe-delete-*'))
+    postcommit_path=path; postcommit=number; postcommit_metadata=job(number)['log']
+    sql("UPDATE init_jobs SET updated_at='2000-01-01 00:00:00' WHERE id=?",(postcommit,))
 
     # The unprivileged child uses the parent's selected SQLite path even if
     # the historical web-writable configuration changes before it starts.
@@ -234,7 +234,7 @@ w.run_bootstrap_job(job)
         import re
         match=re.search(r'name="csrf_token" value="([^"]+)"',html)
         assert match, 'CSRF token missing from authenticated settings'
-        for ident in (number,ordinary,stale,recent):
+        for ident in (number,ordinary,stale,recent,precommit,postcommit):
             request=urllib.request.Request(base+f'/api/init-retry-job/{ident}',
                 data=urllib.parse.urlencode({'csrf_token':match.group(1)}).encode(),
                 headers={**identity,'Origin':base})
@@ -246,6 +246,8 @@ w.run_bootstrap_job(job)
         assert state(ordinary)=='pending' and job(ordinary)['log']=='', 'ordinary retry did not clear its log'
         assert state(stale)=='pending' and job(stale)['log']==stale_metadata, 'stale image retry discarded metadata'
         assert state(recent)=='running' and job(recent)['log']=='recent-log', 'recent job was incorrectly retried'
+        assert state(precommit)=='pending' and job(precommit)['log']==precommit_metadata, 'pre-commit retry discarded metadata'
+        assert state(postcommit)=='pending' and job(postcommit)['log']==postcommit_metadata, 'post-commit retry discarded metadata'
         request=urllib.request.Request(base+'/api/init-retry',
             data=urllib.parse.urlencode({'csrf_token':match.group(1),'jobs':str(bulk)}).encode(),
             headers={**identity,'Origin':base})
@@ -263,6 +265,12 @@ w.run_bootstrap_job(job)
         run(bulk)
         assert state(bulk)=='success' and not sql('SELECT id FROM os_images WHERE id=14')
         assert not any((bulk_path/name).exists() for name in ('linux','initrd.gz','firmware.cpio.gz'))
+        run(precommit)
+        assert state(precommit)=='success' and not sql('SELECT id FROM os_images WHERE id=8')
+        assert not list(precommit_path.glob('*.pxe-delete-*'))
+        assert not any((precommit_path/name).exists() for name in ('linux','initrd.gz','firmware.cpio.gz'))
+        run(postcommit)
+        assert state(postcommit)=='success' and not list(postcommit_path.glob('*.pxe-delete-*'))
     finally:
         server.terminate(); server.wait(timeout=5)
     print('Image deletion queue, guarded paths, restart recovery and dependency revalidation verified.')

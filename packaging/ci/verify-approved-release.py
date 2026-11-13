@@ -10,10 +10,14 @@ import subprocess
 
 
 def verify(manifest: dict, release: dict, build: dict, jobs: dict, package: Path, version_file: Path,
-           tag_commit: str) -> None:
+           tag_commit: str, ansible_package: Path | None = None) -> None:
     required = {'version', 'release_tag', 'source_commit', 'build_run_id', 'package_asset', 'package_sha256'}
-    if not isinstance(manifest, dict) or set(manifest) != required:
+    module_fields = {'ansible_version', 'ansible_package_asset', 'ansible_package_sha256'}
+    if not isinstance(manifest, dict) or set(manifest) not in (required, required | module_fields):
         raise ValueError('Release manifest fields are incomplete or unexpected')
+    has_module = module_fields <= set(manifest)
+    if has_module != (ansible_package is not None):
+        raise ValueError('Approved module and its package must be supplied together')
     version, tag, source, run_id, asset, checksum = (manifest[k] for k in
         ('version', 'release_tag', 'source_commit', 'build_run_id', 'package_asset', 'package_sha256'))
     if (not isinstance(version, str) or not re.fullmatch(r'[0-9][A-Za-z0-9.+~_-]{0,100}', version)
@@ -61,6 +65,30 @@ def verify(manifest: dict, release: dict, build: dict, jobs: dict, package: Path
         return result.stdout.strip()
     if field('Package') != 'pxe-tools' or field('Version') != version or field('Architecture') != 'amd64':
         raise ValueError('Package metadata differs from the approved release')
+    if has_module:
+        module_version, module_asset, module_sha = (manifest[k] for k in
+            ('ansible_version', 'ansible_package_asset', 'ansible_package_sha256'))
+        if (module_version != version or not isinstance(module_asset, str)
+                or not re.fullmatch(r'pxe-tools-ansible_[A-Za-z0-9._-]+_all\.deb', module_asset)
+                or not isinstance(module_sha, str) or not re.fullmatch(r'[a-f0-9]{64}', module_sha)
+                or module_sha == '0'*64):
+            raise ValueError('Invalid approved module identity')
+        matches = [item for item in release.get('assets', []) if item.get('name') == module_asset]
+        if (len(matches) != 1 or matches[0].get('state') != 'uploaded' or ansible_package.is_symlink()
+                or not ansible_package.is_file() or ansible_package.name != module_asset
+                or matches[0].get('size') != ansible_package.stat().st_size
+                or matches[0].get('digest') != 'sha256:'+module_sha):
+            raise ValueError('Published module does not match the approved asset')
+        with ansible_package.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != module_sha:
+                raise ValueError('Downloaded module differs from the approved build')
+        def module_field(name):
+            result = subprocess.run(['dpkg-deb', '--field', str(ansible_package), name],
+                                    capture_output=True, text=True, check=True)
+            return result.stdout.strip()
+        if (module_field('Package') != 'pxe-tools-ansible' or module_field('Version') != module_version
+                or module_field('Architecture') != 'all'):
+            raise ValueError('Module metadata differs from the approved release')
 
 
 def main():
@@ -72,10 +100,11 @@ def main():
     parser.add_argument('--package',type=Path,required=True)
     parser.add_argument('--version-file',type=Path,required=True)
     parser.add_argument('--tag-commit',required=True)
+    parser.add_argument('--ansible-package',type=Path)
     args=parser.parse_args()
     verify(json.loads(args.manifest.read_text()), json.loads(args.release_json.read_text()),
            json.loads(args.build_json.read_text()), json.loads(args.build_jobs_json.read_text()),
-           args.package, args.version_file, args.tag_commit)
+           args.package, args.version_file, args.tag_commit, args.ansible_package)
     print('Approved product commit, successful build, release tag, package version and SHA-256 verified.')
 
 

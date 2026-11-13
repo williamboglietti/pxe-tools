@@ -11,6 +11,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = 'a' * 64
 OTHER_TOKEN = 'b' * 64
+FOREIGN_TOKEN = 'c' * 64
+STALE_TOKEN = 'd' * 64
 MAC = '02:00:00:00:00:01'
 
 
@@ -46,6 +48,9 @@ with tempfile.TemporaryDirectory(prefix='pxe-callback-auth-') as tmp:
         db.execute("INSERT INTO machines(mac,status) VALUES (?, 'configured')", (MAC,))
         db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'install_only','running',?,'fixture')", (TOKEN,))
         db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'reboot','running',?,'fixture')", (OTHER_TOKEN,))
+        db.execute("INSERT INTO machines(mac,status) VALUES ('02:00:00:00:00:02', 'configured')")
+        db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (2,'install_only','running',?,'fixture')", (FOREIGN_TOKEN,))
+        db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'install_only','running',?,'fixture')", (STALE_TOKEN,))
         db.commit()
 
     assert request(database, tmp, 'installStart', '192.0.2.2')[0] == 404
@@ -59,8 +64,10 @@ with tempfile.TemporaryDirectory(prefix='pxe-callback-auth-') as tmp:
         db.execute('UPDATE installations SET action_id=1 WHERE id=?', (start['installation_id'],))
         db.commit()
 
-    for address, token in [('192.0.2.2', ''), ('192.0.2.2', OTHER_TOKEN), ('198.51.100.2', TOKEN)]:
+    for address, token in [('192.0.2.2', ''), ('192.0.2.2', OTHER_TOKEN),
+                           ('192.0.2.2', FOREIGN_TOKEN), ('198.51.100.2', TOKEN)]:
         assert request(database, tmp, 'installEnd', address, token)[0] == 404
+    assert request(database, tmp, 'installEnd', '192.0.2.2', STALE_TOKEN)[0] == 409
     with sqlite3.connect(database) as db:
         assert db.execute('SELECT install_status FROM installations WHERE id=?', (start['installation_id'],)).fetchone()[0] == 'in_progress'
         assert db.execute('SELECT local_boot_source FROM machines WHERE id=1').fetchone()[0] == 'none'

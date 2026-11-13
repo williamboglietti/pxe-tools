@@ -283,7 +283,8 @@ else
     echo "[download-image]   ⚠ $distro : intégrité non vérifiée (best-effort)" >&2
 fi
 
-# Nothing in the HTTP tree is replaced until the complete download is verified.
+# Debian files pass GPG/SHA before publication. Other direct distros keep the
+# documented best-effort mode; staging still isolates their root writes.
 # The publisher copies from root-private staging through no-follow dirfds.
 python3 "$publisher" "$stage_dir/linux" "$dest_dir/linux"
 python3 "$publisher" "$stage_dir/initrd.gz" "$dest_dir/initrd.gz"

@@ -69,6 +69,11 @@ les fichiers générés sont remplacés sans suivre de lien de destination. Un
 compte web compromis peut néanmoins modifier les menus BIOS présents dans ce
 répertoire : limitez l'accès à l'interface et protégez le réseau PXE. Les
 chargeurs et les autres répertoires de la racine TFTP restent protégés.
+Le fichier de verrou `.pxe-menu.lock`, placé à la racine TFTP et détenu par
+root, coordonne les opérations concurrentes. Ne le supprimez pas pendant le
+fonctionnement : son remplacement créerait un verrou différent de celui déjà
+utilisé par les traitements en cours. En cas d'erreur de verrouillage,
+contrôlez son propriétaire et les journaux des services avant toute intervention.
 
 Une instance héritée sans ce marqueur conserve ses anciens chemins. Si ses
 répertoires TFTP, HTTP, de rendus ou MOK, ou leurs parents, sont modifiables par

@@ -47,6 +47,31 @@ def main():
                 subprocess.run(['python3', str(source/'packaging/native'/script), str(package),
                                 '--version', '0.1.0~modefixture', *options], check=True,
                                stdout=subprocess.DEVNULL, umask=mask)
+                if name == 'base':
+                    extracted = work/f'extracted-{mask:03o}'
+                    subprocess.run(['dpkg-deb', '-x', str(package), str(extracted)], check=True)
+                    version_file = extracted/'usr/lib/pxe-tools/app/src/Version.php'
+                    actual = subprocess.check_output(
+                        ['php', '-r', 'require $argv[1]; echo \\Admin\\Version::displayNumber();', str(version_file)],
+                        text=True)
+                    assert actual == '0.1.0~modefixture', actual
+                    native_version = version_file.with_name('native-build-version.txt')
+                    docker_version = version_file.with_name('build-version.txt')
+                    docker_version.write_text('1.2.3-beta2\n')
+                    for invalid in ('invalid\n', None):
+                        if invalid is None:
+                            native_version.unlink()
+                        else:
+                            native_version.write_text(invalid)
+                        actual = subprocess.check_output(
+                            ['php', '-r', 'require $argv[1]; echo \\Admin\\Version::displayNumber();', str(version_file)],
+                            text=True)
+                        assert actual == '1.2.3-beta2', actual
+                    docker_version.unlink()
+                    actual = subprocess.check_output(
+                        ['php', '-r', 'require $argv[1]; echo \\Admin\\Version::displayNumber();', str(version_file)],
+                        text=True)
+                    assert actual == '0.1.0-dev', actual
                 for command in ('--fsys-tarfile', '--ctrl-tarfile'):
                     data = subprocess.check_output(['dpkg-deb', command, str(package)])
                     with tarfile.open(fileobj=io.BytesIO(data)) as archive:

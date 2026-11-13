@@ -18,6 +18,7 @@ client tant que le serveur PXE n'est pas bootstrappé).
 """
 
 import hashlib
+import grp
 import json
 import ipaddress
 import logging
@@ -1826,12 +1827,16 @@ def ansible_home() -> str:
 
 def ansible_execution_identity() -> tuple[int, int, dict]:
     """The optional runtime and playbooks run as the non-root appliance account."""
+    name = 'pxe-tools-ansible' if os.environ.get('PXE_ANSIBLE_MODE') == 'system' else 'ansible'
     try:
-        account = pwd.getpwnam('pxe-tools-ansible' if os.environ.get('PXE_ANSIBLE_MODE') == 'system' else 'ansible')
-    except KeyError as error:
+        account = pwd.getpwnam(name)
+        dedicated_group = grp.getgrnam(name).gr_gid
+        groups = set(os.getgrouplist(name, account.pw_gid))
+    except (KeyError, OSError) as error:
         raise RuntimeError('Compte Ansible local indisponible') from error
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise RuntimeError('Le compte Ansible ne doit pas être privilégié')
+    if (account.pw_uid == 0 or account.pw_gid == 0 or account.pw_gid != dedicated_group
+            or groups != {account.pw_gid}):
+        raise RuntimeError('Le compte Ansible possède des groupes inattendus ou privilégiés')
     if os.geteuid() == 0:
         options = {'user': account.pw_uid, 'group': account.pw_gid, 'extra_groups': [], 'umask': 0o077}
     elif os.geteuid() == account.pw_uid and os.getegid() == account.pw_gid:

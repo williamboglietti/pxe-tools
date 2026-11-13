@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,17 @@ class RuntimeObservation(unittest.TestCase):
                 worker.publish_ansible_runtime_status()
             resolve.assert_called_once()
             self.assertEqual(json.loads(save.call_args.args[1]),{'state':'unavailable','checked_at':1000})
+
+    def test_execution_rejects_group_changes_since_installation(self):
+        account = SimpleNamespace(pw_uid=1234, pw_gid=1234)
+        for dedicated, groups in ((1234, [1234, 27]), (4567, [1234])):
+            with self.subTest(dedicated=dedicated, groups=groups), \
+                 patch.dict(os.environ, {'PXE_ANSIBLE_MODE':'system'}, clear=True), \
+                 patch.object(worker.pwd, 'getpwnam', return_value=account), \
+                 patch.object(worker.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=dedicated)), \
+                 patch.object(worker.os, 'getgrouplist', return_value=groups):
+                with self.assertRaisesRegex(RuntimeError, 'groupes inattendus'):
+                    worker.ansible_execution_identity()
 
     def test_system_and_volume_configuration_cannot_be_combined(self):
         with patch.dict(os.environ, {'PXE_ANSIBLE_MODE':'system','PXE_ANSIBLE_RUNTIME':'/var/lib/pxe-ansible'}, clear=True), \

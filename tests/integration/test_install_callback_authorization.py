@@ -25,7 +25,10 @@ def request(database, directory, operation, address, token=''):
     if ($argv[2] !== '') $_SERVER['HTTP_AUTHORIZATION'] = 'Bearer ' . $argv[2];
     $_GET['mac'] = $argv[3];
     $_GET['status'] = 'success';
-    register_shutdown_function(function() { file_put_contents($argv[4], (string)http_response_code()); });
+    $status_path = $argv[4];
+    register_shutdown_function(static function() use ($status_path) {
+        file_put_contents($status_path, (string)http_response_code());
+    });
     (new Admin\Controllers\PxeController())->{$OPERATION}([]);'''.replace('{$OPERATION}', operation)
     env = dict(os.environ, PXE_APP_DIR=str(ROOT / 'app'), PXE_DB_DRIVER='sqlite', PXE_DB_PATH=str(database))
     result = subprocess.run(['php', '-r', bootstrap, address, token, MAC, str(status)],

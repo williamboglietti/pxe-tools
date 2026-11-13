@@ -49,7 +49,9 @@ def main():
             db.execute("INSERT INTO boot_sessions(machine_id,mac,default_menu,token) VALUES(1,'02:00:00:00:00:01','install','fixture-boot-token')")
             db.execute("UPDATE machines SET next_action='reboot', rescue_mode=1 WHERE id=1")
             db.execute("INSERT INTO init_jobs(job_type,status) VALUES('fixture','pending')")
-            db.execute("INSERT INTO settings(key,value) VALUES('wizard_completed','1'),('dhcp_proxy_enabled','on')")
+            db.execute("INSERT INTO init_jobs(job_type,status,log,ended_at) VALUES('preset:push_github:1','failed','fixture-log','2020-01-01 00:00:00')")
+            db.execute("INSERT INTO os_images(distro,version,arch,enabled,status) VALUES('debian','fixture','amd64',1,'downloaded')")
+            db.execute("INSERT INTO settings(key,value) VALUES('wizard_completed','1'),('dhcp_proxy_enabled','on'),('ansible_enabled','on'),('ansible_repo_webhook_enabled','on'),('ansible_repo_url','https://example.invalid/fixture.git')")
         database.chmod(0o600)
         original_db, original_key = database.read_bytes(), key.read_bytes()
         password = b'fixture-password-long-enough'
@@ -201,9 +203,15 @@ def main():
             assert db.execute('SELECT status FROM actions').fetchone() == ('aborted',)
             assert db.execute('SELECT token FROM boot_sessions').fetchone()[0] != 'fixture-boot-token'
             assert db.execute('SELECT next_action,rescue_mode FROM machines').fetchone() == (None,0)
-            assert db.execute('SELECT status FROM init_jobs').fetchone() == ('failed',)
+            assert db.execute("SELECT status FROM init_jobs WHERE job_type='fixture'").fetchone() == ('failed',)
+            assert db.execute("SELECT status FROM init_jobs WHERE job_type='preset:push_github:1' ORDER BY id DESC LIMIT 1").fetchone() == ('cancelled',)
+            assert db.execute("SELECT log FROM init_jobs WHERE job_type='preset:push_github:1' ORDER BY id LIMIT 1").fetchone() == ('fixture-log',)
+            assert db.execute("SELECT status,enabled FROM os_images WHERE version='fixture'").fetchone() == ('failed',0)
             assert db.execute("SELECT value FROM settings WHERE key='wizard_completed'").fetchone() == ('0',)
             assert db.execute("SELECT value FROM settings WHERE key='dhcp_proxy_enabled'").fetchone() == ('off',)
+            assert db.execute("SELECT value FROM settings WHERE key='ansible_enabled'").fetchone() == ('off',)
+            assert db.execute("SELECT value FROM settings WHERE key='ansible_repo_webhook_enabled'").fetchone() == ('off',)
+            assert db.execute("SELECT value FROM settings WHERE key='ansible_repo_url'").fetchone() == ('https://example.invalid/fixture.git',)
         php = '''require $argv[1]; $db = new PDO('sqlite:' . $argv[2], null, null, [PDO::SQLITE_ATTR_OPEN_FLAGS=>PDO::SQLITE_OPEN_READONLY]);
 $v = $db->query('SELECT root_password_cipher FROM machines WHERE id=1')->fetchColumn();
 if (\\Admin\\Util\\Crypto::decrypt($v) !== 'fixture-secret-not-for-logs') exit(2);'''

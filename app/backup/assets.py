@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import posixpath
 import stat
 import tarfile
 
@@ -35,15 +34,6 @@ def safe_asset_name(name: str) -> tuple[str, ...]:
     if parts[0] not in TREE_CATEGORIES.values():
         raise BackupError('unknown asset category')
     return parts
-
-
-def safe_link_target(name: str, target: str) -> None:
-    parts = safe_asset_name(name)
-    if (not _safe_text(target, MAX_LINK_BYTES) or target.startswith('/') or '\\' in target):
-        raise BackupError('unsafe symbolic link in assets')
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname('/'.join(parts[1:])), target))
-    if resolved == '..' or resolved.startswith('../') or resolved.startswith('/'):
-        raise BackupError('symbolic link escapes its selected asset tree')
 
 
 def _info(info: os.stat_result) -> tuple:
@@ -120,8 +110,7 @@ def inspect_tree(path: Path, prefix: str) -> dict[str, tuple]:
                     # followed or restored as a potentially unsafe link.
                     if prefix == 'http' and not relative and name == 'static-bin' and target == '/usr/lib/pxe-tools/static-bin':
                         continue
-                    safe_link_target(asset_name, target)
-                    records[asset_name] = ('link', _info(info), target)
+                    raise BackupError('symbolic links are not supported in asset trees')
                 else:
                     raise BackupError('special files are not supported in asset trees')
                 if len(records) > MAX_ASSET_ENTRIES:
@@ -158,12 +147,6 @@ def add_tree(tar: tarfile.TarFile, path: Path, prefix: str, records: dict[str, t
                     raise BackupError('asset changed during capture')
                 if kind == 'dir':
                     info.type = tarfile.DIRTYPE
-                    tar.addfile(info)
-                elif kind == 'link':
-                    if os.readlink(parts[-1], dir_fd=parent_fd) != target:
-                        raise BackupError('asset link changed during capture')
-                    info.type = tarfile.SYMTYPE
-                    info.linkname = target
                     tar.addfile(info)
                 elif kind == 'file':
                     fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)

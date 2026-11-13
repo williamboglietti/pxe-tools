@@ -40,7 +40,9 @@ class PreseedInvariants(unittest.TestCase):
             (data / 'renderer.php').write_text(renderer)
             (data / 'run.php').write_text("<?php register_shutdown_function(function () { file_put_contents(__DIR__.'/http.status', (string)(http_response_code() ?: 200)); }); $_GET['mac']='02:00:00:00:00:01'; $_SERVER['REMOTE_ADDR']='192.0.2.2'; require __DIR__.'/renderer.php';")
             env = dict(os.environ, PXE_DB_DRIVER='sqlite', PXE_DB_PATH=str(data / 'pxe-tools.sqlite'))
-            result = subprocess.run([os.environ.get('PHP_BINARY','php'), '-d', 'allow_url_fopen=0', str(data / 'run.php')], env=env, capture_output=True, text=True, check=True)
+            result = subprocess.run([os.environ.get('PHP_BINARY','php'), '-d', 'allow_url_fopen=0', str(data / 'run.php')], env=env, capture_output=True, text=True)
+            if result.returncode:
+                self.fail('preseed renderer failed: ' + result.stderr[:500])
             self.assertEqual(result.stderr, '')
             self.assertEqual(int((data / 'http.status').read_text()), expected_status)
             return result.stdout
@@ -80,6 +82,14 @@ if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
                     result = subprocess.run(['/bin/bash', str(runnable)], env=env, capture_output=True)
                     self.assertEqual(result.returncode, expected_status)
                     self.assertEqual(int(count.read_text()), expected_calls)
+
+    def test_install_completion_carries_current_action_token(self):
+        token = 'a' * 64
+        output = self.render({'distro': 'debian'}, running_action_token=token)
+        self.assertIn("-H 'Authorization: Bearer " + token + "'", output)
+        self.assertIn('/api/install-end?mac=', output)
+        without_action = self.render({'distro': 'debian'})
+        self.assertNotIn('/api/install-end?mac=', without_action)
 
     def test_signed_boot_packages_are_added_only_for_debian_uefi_amd64(self):
         config = {'distro': 'debian', 'codename': 'trixie',
@@ -420,7 +430,8 @@ if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
     def test_secondary_nic_without_mac_does_not_comment_out_rest_of_late_command(self):
         # d-i joint les lignes du late_command : un `#` neutraliserait tout ce qui suit.
         nics = [{'match_by':'mac','match':{'mac':'02:88:77:66:55:05'},'mode':'dhcp'}, {'match_by':'primary','mode':'dhcp'}]
-        output = self.render({'distro':'debian','network':{'interfaces':nics,'primary':0}})
+        output = self.render({'distro':'debian','network':{'interfaces':nics,'primary':0}},
+                             running_action_token='a' * 64)
         self.assertNotIn('# DEBUG', output)
         self.assertIn("in-target /bin/echo 'NIC secondaire #2 ignoree (match.mac absent)' ; \\\n", output)
         self.assertIn('/api/install-end', output)

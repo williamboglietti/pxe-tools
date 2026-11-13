@@ -1529,7 +1529,11 @@ if ($dilog_enabled) {
 // physique pouvait encore échouer après).
 // worker.py attend désormais install_reboot_done (poll DB) avant wait_for_ssh.
 
-$late_command .= "    in-target /usr/bin/curl -fsS -X POST 'http://" . ($data['pxe_ip'] ?? '{{ pxe_ip }}') . "/api/install-end?mac=$mac&status=success' || true";
+// The completion callback changes installation state and local boot policy.
+// It must carry the token of this installation action, not only a MAC.
+if ($action_token !== null && $action_id !== null) {
+    $late_command .= "    in-target /usr/bin/curl -fsS -X POST -H 'Authorization: Bearer " . $action_token . "' 'http://" . ($data['pxe_ip'] ?? '{{ pxe_ip }}') . "/api/install-end?mac=$mac&status=success' || true";
+}
 
 $admin_user_block = "d-i preseed/late_command string \\\n    $late_command";
 

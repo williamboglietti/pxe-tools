@@ -336,6 +336,11 @@ final class PxeController
     /** GET/POST /api/install-start?mac=... */
     public function installStart(array $params): void
     {
+        // The preseed renderer calls this endpoint from the server itself.
+        // A network client must not be able to start an installation by MAC.
+        if (!in_array((string)($_SERVER['REMOTE_ADDR'] ?? ''), ['127.0.0.1', '::1'], true)) {
+            View::json(['error' => 'not found'], 404);
+        }
         $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
         if ($mac === '') View::json(['error' => 'mac required'], 400);
         // findByAnyMac : si l'install démarre via une NIC ≠ MAC primaire DB
@@ -367,12 +372,34 @@ final class PxeController
     {
         $mac = Machine::normalizeMac($_GET['mac'] ?? $_POST['mac'] ?? '');
         if ($mac === '') View::json(['error' => 'mac required'], 400);
+        $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+        $subnet = Setting::get(Setting::KEY_PXE_SUBNET, '') ?? '';
+        if (!self::ipInPxeSubnet($remoteIp, $subnet)) View::json(['error' => 'not found'], 404);
         $statusParam = $_GET['status'] ?? $_POST['status'] ?? 'success';
         $statusParam = in_array($statusParam, ['success', 'failed', 'aborted'], true) ? $statusParam : 'success';
         $m = Machine::findByAnyMac($mac);
         if (!$m) View::json(['error' => 'machine not found'], 404);
 
+        $raw = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? '');
+        if ($raw === '' && function_exists('apache_request_headers')) {
+            foreach ((array)apache_request_headers() as $name => $value) {
+                if (strcasecmp((string)$name, 'Authorization') === 0) {
+                    $raw = (string)$value;
+                    break;
+                }
+            }
+        }
+        $token = stripos($raw, 'Bearer ') === 0 ? trim(substr($raw, 7)) : '';
+        $action = Action::findByToken($token);
+        if (!$action || (int)$action['machine_id'] !== (int)$m['id']
+            || !in_array((string)$action['type'], ['install_only', 'reinstall'], true)) {
+            View::json(['error' => 'not found'], 404);
+        }
+
         $latestInstall = Installation::latestForMachine((int)$m['id']);
+        if (!$latestInstall || (int)($latestInstall['action_id'] ?? 0) !== (int)$action['id']) {
+            View::json(['error' => 'no matching installation'], 409);
+        }
         if (!$latestInstall || $latestInstall['install_status'] !== 'in_progress') {
             // Un ancien callback d'installation ne doit pas réactiver le boot
             // local après un wipe ou un changement de politique.

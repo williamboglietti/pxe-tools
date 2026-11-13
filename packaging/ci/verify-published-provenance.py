@@ -11,8 +11,8 @@ import subprocess
 import tempfile
 
 here=Path(__file__).resolve().parent
-spec=importlib.util.spec_from_file_location('pxe_r2',here/'publish-r2-snapshot.py')
-if spec is None or spec.loader is None:raise RuntimeError('Publisher unavailable')
+spec=importlib.util.spec_from_file_location('pxe_apt_proof',here/'apt-proof.py')
+if spec is None or spec.loader is None:raise RuntimeError('APT proof verifier unavailable')
 publisher=importlib.util.module_from_spec(spec);spec.loader.exec_module(publisher)
 
 

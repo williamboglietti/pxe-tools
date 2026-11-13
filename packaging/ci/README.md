@@ -13,6 +13,14 @@ run, puis signe un index APT valable sept jours avec la sous-clé de production.
 Quand l'artefact de construction a expiré, le renouvellement exige une preuve
 signée correspondante dans le dépôt précédemment publié.
 
+Le manifeste peut aussi approuver le module facultatif `pxe-tools-ansible` en
+ajoutant ensemble `ansible_version`, `ansible_package_asset` et
+`ansible_package_sha256`. Il doit être issu du même commit et du même run que
+le socle, avec la même version ; la CI vérifie ses octets séparément avant
+signature. Le premier passage exige l'artefact de construction, et les
+renouvellements après expiration exigent sa provenance et son empreinte dans
+l'index précédemment signé. Sans ces trois champs, seul le socle est publié.
+
 L'offre des sources des utilitaires doit rester accessible sous les cinq assets
 de la release publique `sources-2026-11-12` ; la CI télécharge et vérifie leurs
 empreintes avant publication. Les deux grosses archives dépassent la limite de
@@ -23,7 +31,7 @@ Avant la première publication, créer une release GitHub publique persistante
 `apt-snapshots` et configurer dans l'environnement GitHub `production` les
 secrets `APT_SIGNING_KEY`, `APT_SIGNING_PASSPHRASE`, `PACKAGES_PXETOOLS_COM` et
 la variable `CLOUDFLARE_ACCOUNT_ID`. Le jeton Cloudflare doit être limité au
-Worker de distribution et à la zone du domaine. La première exécution manuelle
+Worker de distribution ; l'association du domaine est gérée séparément. La première exécution manuelle
 utilise l'option `bootstrap` seulement après vérification de l'absence de dépôt
 antérieur. Le cron renouvelle ensuite les mêmes octets tous les deux jours.
 

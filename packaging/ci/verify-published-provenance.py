@@ -25,8 +25,10 @@ def verify(inrelease: Path, keyring: Path, manifest: dict, primary: str, signing
         clear=Path(tmp)/'Release'
         publisher.verify_signature(keyring,inrelease,signing,primary,output=clear)
         release=clear.read_bytes()
+        module = ((manifest['ansible_version'], manifest['ansible_package_sha256'])
+                  if 'ansible_version' in manifest else None)
         publisher.verify_provenance(release,manifest['version'],manifest['package_sha256'],
-                                    manifest['source_commit'],manifest['build_run_id'])
+                                    manifest['source_commit'],manifest['build_run_id'],module)
         lines=release.decode('utf-8').splitlines()
         try: offset=lines.index('SHA512:')+1
         except ValueError as exc:raise ValueError('Previous signed index has no SHA512') from exc
@@ -51,7 +53,7 @@ def verify(inrelease: Path, keyring: Path, manifest: dict, primary: str, signing
         data=packages.read_bytes()
         if len(data)!=size or hashlib.sha512(data).hexdigest()!=expected:
             raise ValueError('Prior package index differs from signed hash')
-        version,sha=publisher.package_identity({'dists/stable/main/binary-amd64/Packages':data})
+        version,sha=publisher.package_identity({'dists/stable/main/binary-amd64/Packages':data}, module)
         if (version,sha)!=(manifest['version'],manifest['package_sha256']):
             raise ValueError('Prior signed index does not contain the approved package')
 

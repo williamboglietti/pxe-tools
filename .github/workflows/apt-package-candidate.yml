@@ -42,6 +42,12 @@ jobs:
           awk '$NF == "./usr/lib/pxe-tools/app/public/" && $1 == "drwxr-xr-x" {found=1} END {exit !found}' "$RUNNER_TEMP/package-content.txt"
           awk '$NF == "./usr/lib/pxe-tools/app/public/index.php" && $1 == "-rw-r--r--" {found=1} END {exit !found}' "$RUNNER_TEMP/package-content.txt"
           sha256sum "$package" | awk '{print $1}' > "$RUNNER_TEMP/package/package.sha256"
+          module="$RUNNER_TEMP/package/pxe-tools-ansible_${asset_version}_all.deb"
+          python3 packaging/native/build-local-ansible-package.py "$module" --release --version "$version"
+          [[ "$(dpkg-deb --field "$module" Package)" == pxe-tools-ansible ]]
+          [[ "$(dpkg-deb --field "$module" Version)" == "$version" ]]
+          [[ "$(dpkg-deb --field "$module" Architecture)" == all ]]
+          sha256sum "$module" | awk '{print $1}' > "$RUNNER_TEMP/package/ansible-package.sha256"
           printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/package/source-commit.txt"
       - name: Retain package for human review and release promotion
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

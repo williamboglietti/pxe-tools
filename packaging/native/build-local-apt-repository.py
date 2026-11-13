@@ -30,10 +30,15 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
           valid_days: int = 7, ansible_package: Path | None = None, *,
           release_candidate: bool = False, passphrase_file: Path | None = None,
           previous: Path | None = None, source_commit: str | None = None,
-          build_run_id: str | None = None, approved_package_sha256: str | None = None) -> None:
-    if release_candidate and ansible_package is not None:
-        raise ValueError('the optional production module is not prepared')
+          build_run_id: str | None = None, approved_package_sha256: str | None = None,
+          approved_ansible_sha256: str | None = None) -> None:
+    if release_candidate and ((ansible_package is None) != (approved_ansible_sha256 is None)):
+        raise ValueError('the production module and its approved SHA256 must be supplied together')
+    if approved_ansible_sha256 is not None and (not release_candidate or not re.fullmatch(r'[a-f0-9]{64}', approved_ansible_sha256)):
+        raise ValueError('invalid approved module SHA256')
     provenance = (source_commit, build_run_id, approved_package_sha256)
+    if release_candidate and ansible_package is not None and not all(provenance):
+        raise ValueError('the production module requires complete build provenance')
     if any(value is not None for value in provenance):
         if (not release_candidate or not all(value is not None for value in provenance)
                 or not re.fullmatch(r'[a-f0-9]{40}', source_commit or '')
@@ -73,7 +78,7 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
         versions = {}
         for candidate, expected, architectures in (
                 (package, 'pxe-tools' if release_candidate else 'pxe-tools-local-test', ('all', 'amd64')),
-                (ansible_package, 'pxe-tools-ansible-local-test', ('all',))):
+                (ansible_package, 'pxe-tools-ansible' if release_candidate else 'pxe-tools-ansible-local-test', ('all',))):
             if candidate is None:
                 continue
             partial = pool / '.package-copy'
@@ -88,6 +93,8 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             copied = pool / f'pxe-tools-{digest.hexdigest()}.deb'
             if expected == 'pxe-tools' and approved_package_sha256 is not None and digest.hexdigest() != approved_package_sha256:
                 raise ValueError('package differs from approved build provenance')
+            if expected == 'pxe-tools-ansible' and digest.hexdigest() != approved_ansible_sha256:
+                raise ValueError('module differs from approved build provenance')
             if copied.exists():
                 raise ValueError('the same package was supplied twice')
             os.rename(partial, copied)
@@ -107,7 +114,14 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                 depends = [item.strip() for item in field('Depends').split(',')]
                 if 'pxe-tools-local-test (>= 0.0.1~local2)' not in depends or 'ansible-core' not in depends:
                     raise ValueError('the optional package must depend on the compatible base and Ansible Core')
-        if ansible_package is not None and subprocess.run(
+            if expected == 'pxe-tools-ansible':
+                depends = [item.strip() for item in field('Depends').split(',')]
+                if ('ansible-core' not in depends or 'pxe-tools (>= 0.1.0~beta1)' not in depends
+                        or 'pxe-tools (<< 0.2~)' not in depends
+                        or subprocess.run(['dpkg', '--compare-versions', versions['pxe-tools'], 'ge', '0.1.0~beta1']).returncode
+                        or subprocess.run(['dpkg', '--compare-versions', versions['pxe-tools'], 'lt', '0.2~']).returncode):
+                    raise ValueError('the optional module must depend on the approved base and Ansible Core')
+        if ansible_package is not None and not release_candidate and subprocess.run(
                 ['dpkg', '--compare-versions', versions['pxe-tools-local-test'], 'ge', '0.0.1~local2'],
                 check=False).returncode:
             raise ValueError('the optional module requires base version 0.0.1~local2 or later')
@@ -149,6 +163,9 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                                  f'X-PXE-Build-Run: {build_run_id}\n'
                                  f'X-PXE-Package-SHA256: {approved_package_sha256}\n'
                                  f'X-PXE-Package-Version: {versions["pxe-tools"]}\n')
+            if ansible_package is not None:
+                provenance_fields += (f'X-PXE-Ansible-SHA256: {approved_ansible_sha256}\n'
+                                      f'X-PXE-Ansible-Version: {versions["pxe-tools-ansible"]}\n')
         release = (f'Valid-Until: {expires}\n' + provenance_fields).encode('ascii') + release
         (release_dir / 'Release').write_bytes(release)
         common = ['gpg', '--homedir', str(gnupg_home), '--batch', '--no-tty',
@@ -248,10 +265,11 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                     if relative == 'pool/main/p/pxe-tools' and release_candidate:
                         old_name = command('dpkg-deb', '--field', str(item), 'Package').decode().strip()
                         old_version = command('dpkg-deb', '--field', str(item), 'Version').decode().strip()
-                        if old_name != 'pxe-tools':
+                        if old_name not in ('pxe-tools', 'pxe-tools-ansible'):
                             raise ValueError('unexpected package in previous release pool')
-                        if (old_version == versions['pxe-tools']
-                                and digest != hashlib.sha256(package.read_bytes()).hexdigest()):
+                        current = package if old_name == 'pxe-tools' else ansible_package
+                        if (current is not None and old_version == versions[old_name]
+                                and digest != hashlib.sha256(current.read_bytes()).hexdigest()):
                             raise ValueError('Debian version already has different package bytes')
                     dest = target / item.name
                     if dest.exists():

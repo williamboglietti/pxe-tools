@@ -45,7 +45,8 @@ with tempfile.TemporaryDirectory(prefix='pxe-callback-auth-') as tmp:
     with sqlite3.connect(database) as db:
         db.executescript((ROOT / 'app/db/schema.sqlite.sql').read_text())
         db.execute("INSERT INTO settings(key,value) VALUES ('pxe_subnet','192.0.2.0/24')")
-        db.execute("INSERT INTO machines(mac,status) VALUES (?, 'configured')", (MAC,))
+        db.execute("INSERT INTO machines(mac,status,install_config_json) VALUES (?, 'configured', ?)",
+                   (MAC, json.dumps({'_pending_action_id': 1})))
         db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'install_only','running',?,'fixture')", (TOKEN,))
         db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'reboot','running',?,'fixture')", (OTHER_TOKEN,))
         db.execute("INSERT INTO machines(mac,status) VALUES ('02:00:00:00:00:02', 'configured')")
@@ -78,4 +79,18 @@ with tempfile.TemporaryDirectory(prefix='pxe-callback-auth-') as tmp:
     with sqlite3.connect(database) as db:
         assert db.execute('SELECT install_status FROM installations WHERE id=?', (start['installation_id'],)).fetchone()[0] == 'success'
         assert db.execute('SELECT local_boot_source FROM machines WHERE id=1').fetchone()[0] == 'pxe'
+    assert request(database, tmp, 'installStart', '127.0.0.1')[0] == 409
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT count(*) FROM installations WHERE machine_id=1').fetchone()[0] == 1
+        assert db.execute('SELECT status FROM machines WHERE id=1').fetchone()[0] == 'installed'
+        db.execute("INSERT INTO actions(machine_id,type,status,token,created_by) VALUES (1,'reinstall','running',?,'fixture')", ('e' * 64,))
+        new_action = db.execute('SELECT max(id) FROM actions').fetchone()[0]
+        db.execute("UPDATE machines SET status='configured',install_config_json=? WHERE id=1",
+                   (json.dumps({'_pending_action_id': new_action}),))
+        db.commit()
+    restart_status, restart = request(database, tmp, 'installStart', '127.0.0.1')
+    assert restart_status == 200 and restart['installation_id'] != start['installation_id']
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT action_id FROM installations WHERE id=?',
+                          (restart['installation_id'],)).fetchone()[0] == new_action
 print('install callbacks require server-local start and action-bound completion')

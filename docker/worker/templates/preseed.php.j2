@@ -4,6 +4,7 @@
 
 declare(strict_types=1);
 header('Content-Type: text/plain; charset=utf-8');
+header('Cache-Control: no-store');
 
 require_once rtrim(getenv('PXE_APP_DIR') ?: '/app', '/') . '/src/Db.php';
 try {
@@ -117,16 +118,16 @@ $row = array_merge($machine, $config);
 //      install postboot.sh + pxe-postboot.service via
 //      /pxe/postboot/{action_id}/...).
 //
-// Skip silencieux si pas d'action active (cas legacy : machine en 'configured'
-// sans Action parent — created avant Worker_CTRL ou flow manuel). Les wgets
-// sont omis du late_command ; le preseed reste fonctionnel.
+// Legacy : une machine configurée qui n'a jamais eu d'action d'installation
+// peut encore recevoir un preseed sans checkpoints ni script postboot.
 $action_id    = null;
 $action_token = null;
 $action_type  = null;
 try {
     $stmt = $pdo->prepare(
         "SELECT id, token, type FROM actions "
-      . "WHERE machine_id = ? AND status IN ('pending','running') "
+      . "WHERE machine_id = ? AND type IN ('reinstall','install_only') "
+      . "AND status IN ('pending','running') "
       . "ORDER BY id DESC LIMIT 1"
     );
     $stmt->execute([(int)$machine['id']]);
@@ -135,28 +136,65 @@ try {
         $action_id    = (int)$act['id'];
         $action_token = (string)$act['token'];
         $action_type  = (string)$act['type'];
-        // Checkpoint preseed_loaded_install — valide pour reinstall + install_only.
-        $valid_for_load = ['reinstall', 'install_only'];
-        if (in_array($action_type, $valid_for_load, true)) {
-            try {
-                $ins = $pdo->prepare(
-                    'INSERT INTO machine_events (machine_id, level, message, checkpoint, action_id) '
-                  . 'VALUES (?, ?, ?, ?, ?)'
-                );
-                $ins->execute([
-                    (int)$machine['id'],
-                    'info',
-                    'checkpoint:preseed_loaded_install',
-                    'preseed_loaded_install',
-                    $action_id,
-                ]);
-            } catch (\Throwable $e) {
-                error_log('preseed.php: insert preseed_loaded_install failed: ' . $e->getMessage());
-            }
-        }
     }
 } catch (\Throwable $e) {
     error_log('preseed.php: action lookup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit;
+}
+
+// Une action encore "running" peut attendre Ansible après install-end. La
+// phase d-i est pourtant finie : ne plus servir son preseed ni ses secrets.
+// Une nouvelle action de réinstallation possède un nouvel id et reste admise.
+if (!in_array((string)$machine['status'], ['configured', 'installing'], true)) {
+    http_response_code(404);
+    exit;
+}
+try {
+    if ($action_id !== null) {
+        $stmt = $pdo->prepare(
+            'SELECT install_status FROM installations WHERE machine_id = ? AND action_id = ? ORDER BY id DESC LIMIT 1'
+        );
+        $stmt->execute([(int)$machine['id'], $action_id]);
+    } else {
+        // Legacy sans action : une ancienne action close ne doit pas rendre
+        // un ancien snapshot à nouveau accessible après un changement d'état.
+        $stmt = $pdo->prepare(
+            "SELECT id FROM actions WHERE machine_id = ? AND type IN ('reinstall','install_only') LIMIT 1"
+        );
+        $stmt->execute([(int)$machine['id']]);
+        if ($stmt->fetch()) {
+            http_response_code(404);
+            exit;
+        }
+        $stmt = $pdo->prepare(
+            'SELECT install_status FROM installations WHERE machine_id = ? ORDER BY id DESC LIMIT 1'
+        );
+        $stmt->execute([(int)$machine['id']]);
+    }
+    $installation = $stmt->fetch();
+    if ($installation && (string)$installation['install_status'] !== 'in_progress') {
+        http_response_code(404);
+        exit;
+    }
+} catch (\Throwable $e) {
+    error_log('preseed.php: installation phase lookup failed: ' . $e->getMessage());
+    http_response_code(503);
+    exit;
+}
+if ($action_id !== null) {
+    try {
+        $ins = $pdo->prepare(
+            'INSERT INTO machine_events (machine_id, level, message, checkpoint, action_id) '
+          . 'VALUES (?, ?, ?, ?, ?)'
+        );
+        $ins->execute([
+            (int)$machine['id'], 'info', 'checkpoint:preseed_loaded_install',
+            'preseed_loaded_install', $action_id,
+        ]);
+    } catch (\Throwable $e) {
+        error_log('preseed.php: insert preseed_loaded_install failed: ' . $e->getMessage());
+    }
 }
 
 // --- Construction des blocks dynamiques ----------------------------------

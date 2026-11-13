@@ -349,7 +349,6 @@ final class PxeController
         // ses interfaces secondaires stockées dans inventory_json.
         $m = Machine::findByAnyMac($mac);
         if (!$m) View::json(['error' => 'machine not found'], 404);
-        Machine::setStatus((int)$m['id'], 'installing');
         // Récupère l'action_id pré-créé par MachineController::installSubmit (install_only)
         // ou depuis la chaîne wipe→install (action_id dans chain_install_config_json / wipes.action_id).
         // Stocké sous _pending_action_id dans install_config_json pour éviter une colonne supplémentaire.
@@ -364,7 +363,39 @@ final class PxeController
                 $pendingActionId = (int)$activeWipe['action_id'];
             }
         }
+        // Le rendu preseed appelle cette route en loopback, mais un nouveau
+        // fetch ne doit pas rouvrir une installation d-i déjà terminée.
+        if (!in_array((string)$m['status'], ['configured', 'installing'], true)) {
+            View::json(['error' => 'installation not available'], 409);
+        }
+        if ($pendingActionId !== null) {
+            $action = Action::findById($pendingActionId);
+            if (!$action || (int)$action['machine_id'] !== (int)$m['id']
+                || !in_array((string)$action['type'], ['install_only', 'reinstall'], true)
+                || !in_array((string)$action['status'], ['pending', 'running'], true)) {
+                View::json(['error' => 'installation not available'], 409);
+            }
+            $stmt = Db::get()->prepare(
+                'SELECT install_status FROM installations WHERE machine_id = ? AND action_id = ? ORDER BY id DESC LIMIT 1'
+            );
+            $stmt->execute([(int)$m['id'], $pendingActionId]);
+        } else {
+            $stmt = Db::get()->prepare(
+                "SELECT id FROM actions WHERE machine_id = ? AND type IN ('install_only','reinstall') LIMIT 1"
+            );
+            $stmt->execute([(int)$m['id']]);
+            if ($stmt->fetch()) View::json(['error' => 'installation not available'], 409);
+            $stmt = Db::get()->prepare(
+                'SELECT install_status FROM installations WHERE machine_id = ? ORDER BY id DESC LIMIT 1'
+            );
+            $stmt->execute([(int)$m['id']]);
+        }
+        $installation = $stmt->fetch();
+        if ($installation && (string)$installation['install_status'] !== 'in_progress') {
+            View::json(['error' => 'installation already finished'], 409);
+        }
         $installId = Installation::startForMachine((int)$m['id'], $pendingActionId);
+        Machine::setStatus((int)$m['id'], 'installing');
         View::json(['status' => 'ok', 'installation_id' => $installId]);
     }
 
@@ -732,6 +763,21 @@ final class PxeController
             header('Content-Type: text/plain');
             echo "Not found\n";
             return;
+        }
+        if (in_array((string)$action['type'], ['install_only', 'reinstall'], true)) {
+            $stmt = Db::get()->prepare(
+                'SELECT install_status FROM installations WHERE action_id = ? ORDER BY id DESC LIMIT 1'
+            );
+            $stmt->execute([$actionId]);
+            $installation = $stmt->fetch();
+            // Ces fichiers sont téléchargés par le late_command avant
+            // install-end, jamais par l'OS une fois la phase d-i close.
+            if (!$installation || (string)$installation['install_status'] !== 'in_progress') {
+                http_response_code(404);
+                header('Content-Type: text/plain');
+                echo "Not found\n";
+                return;
+            }
         }
 
         // Le worker rend dans POSTBOOT_OUTPUT_DIR/{action_id}/ (cf. worker.py

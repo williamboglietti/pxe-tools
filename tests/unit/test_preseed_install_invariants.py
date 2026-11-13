@@ -40,7 +40,9 @@ class PreseedInvariants(unittest.TestCase):
             (data / 'renderer.php').write_text(renderer)
             (data / 'run.php').write_text("<?php register_shutdown_function(function () { file_put_contents(__DIR__.'/http.status', (string)(http_response_code() ?: 200)); }); $_GET['mac']='02:00:00:00:00:01'; $_SERVER['REMOTE_ADDR']='192.0.2.2'; require __DIR__.'/renderer.php';")
             env = dict(os.environ, PXE_DB_DRIVER='sqlite', PXE_DB_PATH=str(data / 'pxe-tools.sqlite'))
-            result = subprocess.run([os.environ.get('PHP_BINARY','php'), '-d', 'allow_url_fopen=0', str(data / 'run.php')], env=env, capture_output=True, text=True, check=True)
+            result = subprocess.run([os.environ.get('PHP_BINARY','php'), '-d', 'allow_url_fopen=0', str(data / 'run.php')], env=env, capture_output=True, text=True)
+            if result.returncode:
+                self.fail('preseed renderer failed: ' + result.stderr[:500])
             self.assertEqual(result.stderr, '')
             self.assertEqual(int((data / 'http.status').read_text()), expected_status)
             return result.stdout

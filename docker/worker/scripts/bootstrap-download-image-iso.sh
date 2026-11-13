@@ -23,7 +23,7 @@ export PXE_DB_PATH
 # shellcheck source=lib-image-verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib-image-verify.sh"
 
-if [ -z "$IMAGE_ID" ]; then
+if ! [[ "$IMAGE_ID" =~ ^[1-9][0-9]*$ ]]; then
     echo "[download-image-iso] ERREUR : IMAGE_ID non défini" >&2
     exit 2
 fi
@@ -45,6 +45,12 @@ if [ -z "$row" ]; then
 fi
 IFS='|' read -r distro version_full arch iso_url codename firmware_url extract_method <<< "$row"
 
+safe_component() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$ && "$1" != *..* ]]; }
+if ! safe_component "$distro" || ! safe_component "$version_full" || ! safe_component "$arch" \
+   || { [ -n "$codename" ] && ! safe_component "$codename"; }; then
+    echo '[download-image-iso] ERREUR : identité de catalogue invalide.' >&2; exit 1
+fi
+
 if [ -z "$iso_url" ]; then
     echo "[download-image-iso] ERREUR : iso_url vide pour id=$IMAGE_ID ($distro/$version_full/$arch)" >&2
     sqlite3 "$PXE_DB_PATH" \
@@ -55,7 +61,11 @@ fi
 label="$distro $version_full $arch"
 dest_dir="$HTTP_ROOT/netboot/$distro/$version_full/$arch"
 iso_path="$dest_dir/.tmp.iso"
-mkdir -p "$dest_dir"
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$distro/$version_full/$arch"
+else
+    mkdir -p "$dest_dir"
+fi
 
 echo "[download-image-iso] ▶ id=$IMAGE_ID $label"
 echo "[download-image-iso]   iso_url=$iso_url"
@@ -278,7 +288,11 @@ fi
 #     réserve donc à extract_method='direct'.
 # ------------------------------------------------------------------------
 if [ -n "${codename:-}" ] && [ "$extract_method" = "direct" ]; then
-    mkdir -p "$HTTP_ROOT/netboot/$codename"
+    if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+        python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$codename"
+    else
+        mkdir -p "$HTTP_ROOT/netboot/$codename"
+    fi
     ln -sfn "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
     echo "[download-image-iso]   symlink netboot/$codename/$arch → ../$distro/$version_full/$arch"
 fi

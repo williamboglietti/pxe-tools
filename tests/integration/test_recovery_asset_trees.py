@@ -43,6 +43,7 @@ def main():
         root=Path(temporary); db=root/'database.sqlite'; key=root/'key'; key.write_bytes(os.urandom(32))
         with closing(sqlite3.connect(db)) as conn, conn:
             conn.executescript((ROOT/'app/db/schema.sqlite.sql').read_text())
+            conn.execute("INSERT INTO os_images(distro,version,arch,enabled,status) VALUES('debian','fixture','amd64',1,'downloaded')")
         password=b'fixture-asset-passphrase'; flags=dict(confirm_stopped=True,include_accounts=True,
             include_inventory=True,include_secrets=True,include_master_key=True)
         http=root/'http-source'; tftp=root/'tftp-source'
@@ -51,7 +52,6 @@ def main():
         (ansible/'home/.ssh/fixture-key').write_bytes(b'fixture-ansible-key')
         (http/'netboot/debian/13/amd64').mkdir(parents=True)
         (http/'netboot/trixie').mkdir(parents=True)
-        (http/'netboot/trixie/amd64').symlink_to('../debian/13/amd64')
         (http/'static-bin').symlink_to('/usr/lib/pxe-tools/static-bin')
         (http/'empty').mkdir(); (http/'preseed example.php').write_text('fixture-generated-secret')
         large=http/'netboot/debian/13/amd64/linux'
@@ -72,10 +72,10 @@ def main():
         assert manifest['version']==3 and manifest['includes'][-4:]==['http_files','tftp_files','tls_files','ansible_files']
         assert (restored/'tls/fixture.key').read_bytes()==b'fixture-tls-key'
         assert (restored/'ansible/home/.ssh/fixture-key').read_bytes()==b'fixture-ansible-key'
+        with closing(sqlite3.connect(restored/'database.sqlite')) as restored_db:
+            assert restored_db.execute("SELECT status,enabled FROM os_images WHERE version='fixture'").fetchone() == ('downloaded',1)
         assert not os.path.lexists(restored/'http/static-bin')
         assert digest(restored/'http/netboot/debian/13/amd64/linux') == digest(large)
-        link=restored/'http/netboot/trixie/amd64'
-        assert link.is_symlink() and os.readlink(link)=='../debian/13/amd64' and digest(link/'linux')==digest(large)
         assert (restored/'http/empty').is_dir()
         assert (restored/'http/preseed example.php').read_text()=='fixture-generated-secret'
         assert (restored/'tftp/pxelinux.cfg/default').stat().st_mode & 0o777 == 0o640
@@ -107,10 +107,22 @@ def main():
         assert result.returncode==0 and (cli_output/'tftp/pxelinux.cfg/default').read_text()=='fixture-boot-menu'
         rejected(lambda:export_recovery(db,key,http/'inside.gpg',password,**flags,**options))
         assert not (http/'inside.gpg').exists()
-        for label,target in (('outside','../../../outside'),('absolute','/etc/passwd')):
+        for label,target in (('outside','../../../outside'),('absolute','/etc/passwd'),('inside','netboot/debian')):
             bad=http/label; bad.symlink_to(target)
             rejected(lambda:export_recovery(db,key,root/(label+'.gpg'),password,**flags,**options))
             bad.unlink()
+        # Each link is lexically inside the tree, but the first link changes
+        # the meaning of '..' in the second one.
+        (http/'chain-a').symlink_to('.')
+        (http/'chain-z').symlink_to('chain-a/../outside')
+        rejected(lambda:export_recovery(db,key,root/'chain-escape.gpg',password,**flags,**options))
+        (http/'chain-a').unlink(); (http/'chain-z').unlink()
+        (http/'cycle-a').symlink_to('cycle-b'); (http/'cycle-b').symlink_to('cycle-a')
+        rejected(lambda:export_recovery(db,key,root/'cycle.gpg',password,**flags,**options))
+        (http/'cycle-a').unlink(); (http/'cycle-b').unlink()
+        (http/'reserved-link').symlink_to('static-bin/../app')
+        rejected(lambda:export_recovery(db,key,root/'reserved.gpg',password,**flags,**options))
+        (http/'reserved-link').unlink()
         fifo=http/'fixture-fifo'; os.mkfifo(fifo)
         rejected(lambda:export_recovery(db,key,root/'fifo.gpg',password,**flags,**options)); fifo.unlink()
         with patch('backup.assets.MAX_ASSET_BYTES',1024):
@@ -131,7 +143,7 @@ def main():
         assert not (root/'changing.gpg').exists()
         # Encrypted archives with malicious paths or link types must not escape staging.
         manifest={**MANIFEST,'version':3,'includes':[*MANIFEST['includes'],'http_files']}
-        for variant in ('escape','absolute-link','relative-link','symlink-parent','hardlink','fifo','unannounced'):
+        for variant in ('escape','absolute-link','relative-link','symlink-parent','hardlink','fifo','unannounced','chain-escape','cycle','reserved'):
             plain=root/(variant+'.tar')
             with tarfile.open(plain,'w') as tar:
                 base=[('manifest.json',json.dumps(MANIFEST if variant=='unannounced' else manifest).encode()),
@@ -152,6 +164,11 @@ def main():
                     m=tarfile.TarInfo('http/link');m.type=tarfile.LNKTYPE;m.linkname='master.key';tar.addfile(m)
                 elif variant=='fifo':
                     m=tarfile.TarInfo('http/pipe');m.type=tarfile.FIFOTYPE;tar.addfile(m)
+                elif variant in ('chain-escape','cycle'):
+                    m=tarfile.TarInfo('http/a');m.type=tarfile.SYMTYPE;m.linkname='.' if variant=='chain-escape' else 'z';tar.addfile(m)
+                    m=tarfile.TarInfo('http/z');m.type=tarfile.SYMTYPE;m.linkname='a/../outside' if variant=='chain-escape' else 'a';tar.addfile(m)
+                elif variant=='reserved':
+                    m=tarfile.TarInfo('http/z');m.type=tarfile.SYMTYPE;m.linkname='static-bin/../app';tar.addfile(m)
             encrypted=root/(variant+'-hostile.gpg')
             with _gpg_home() as home: encrypt_file(plain,encrypted,password,home)
             target=root/(variant+'-hostile-output')
@@ -173,7 +190,7 @@ def main():
         restore_recovery(v2,v2out,password)
         assert json.loads((v2out/'manifest.json').read_text())['version']==2 and (v2out/'db.conf').read_bytes()==cfg.read_bytes()
         assert not [p for p in root.iterdir() if p.name.startswith(('.pxe-recovery-export-','.pxe-recovery-restore-'))]
-        print('OK selected HTTP/TFTP trees, safe links, adversarial archives, streaming and v2 compatibility')
+        print('OK selected asset trees, link refusal, adversarial archives, streaming and v2 compatibility')
 
 
 if __name__=='__main__': main()

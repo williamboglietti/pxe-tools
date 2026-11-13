@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='pxe-delete-fixture-', dir='/var/lib') a
     with sqlite3.connect(database) as db:
         db.executescript((ROOT/'app/db/schema.sqlite.sql').read_text())
     account=pwd.getpwnam('www-data')
-    os.chown(database,account.pw_uid,account.pw_gid); database.chmod(0o660)
+    database.chmod(0o660); os.chown(database,account.pw_uid,account.pw_gid)
     os.environ.update(PXE_APP_DIR=str(ROOT/'app'), PXE_DB_PATH=str(database),
                       PXE_DB_DRIVER='sqlite', HTTP_ROOT=str(http), PXE_HTTP_ROOT=str(http))
     sys.path.insert(0, str(ROOT/'app'))

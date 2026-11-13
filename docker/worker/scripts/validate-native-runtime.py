@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 path = Path(__file__).with_name('prepare-debian-shim.py')
@@ -32,6 +33,46 @@ def ensure_mok(path):
                 raise ValueError('MOK directory must be root-owned and private')
         finally:
             os.close(fd)
+    finally:
+        os.close(parent)
+
+
+def ensure_tls(path):
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts or not path.name:
+        raise ValueError('invalid TLS path')
+    parent = guard.trusted_directory(path.parent)
+    try:
+        try:
+            os.mkdir(path.name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        directory = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            info = os.fstat(directory)
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError('TLS directory must be root-owned and private')
+            present = []
+            for name in ('cert.pem', 'key.pem'):
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                except FileNotFoundError:
+                    present.append(False)
+                    continue
+                try:
+                    file_info = os.fstat(fd)
+                    mode = stat.S_IMODE(file_info.st_mode)
+                    if (not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != 0
+                            or file_info.st_nlink != 1 or mode & 0o022
+                            or (name == 'key.pem' and mode & 0o077)):
+                        raise ValueError('TLS certificate or key must be a protected root-owned file')
+                    present.append(True)
+                finally:
+                    os.close(fd)
+            if present[0] != present[1]:
+                raise ValueError('TLS certificate and key must be present together')
+        finally:
+            os.close(directory)
     finally:
         os.close(parent)
 
@@ -70,6 +111,8 @@ if __name__ == '__main__':
             os.close(guard.trusted_directory(sys.argv[2]))
         elif sys.argv[1] == 'mok' and len(sys.argv) == 3:
             ensure_mok(sys.argv[2])
+        elif sys.argv[1] == 'tls' and len(sys.argv) == 3:
+            ensure_tls(sys.argv[2])
         elif sys.argv[1] == 'http-tree' and len(sys.argv) == 4:
             ensure_http_tree(sys.argv[2], sys.argv[3])
         else:

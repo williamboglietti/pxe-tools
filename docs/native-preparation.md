@@ -30,13 +30,20 @@ Hyper-V ; la procédure d'enrôlement varie selon le matériel.
 ## Mise à niveau et conservation des données
 
 La mise à niveau est refusée si les services PXE Tools sont encore actifs. Dans
-une fenêtre de maintenance, arrêtez-les avant la mise à niveau, puis redémarrez les
-services appropriés une fois l'opération terminée :
+une fenêtre de maintenance, arrêtez-les avant la mise à niveau. Sur une
+installation héritée, ne redémarrez pas encore : les anciens chemins peuvent être
+refusés par les nouvelles protections et demandent une migration explicite, non
+encore automatisée ni validée de bout en bout. Préservez tous les fichiers et une
+sauvegarde cohérente vérifiée, ainsi que le paquet précédent pour un retour arrière.
+Après validation des chemins de votre instance, redémarrez les services appropriés :
 
 ```sh
 sudo systemctl stop pxe-tools.target pxe-tools-admin.target pxe-tools-worker.service pxe-tools-dnsmasq-tail.service pxe-tools-nginx.service pxe-tools-pxe-http.service pxe-tools-php.service pxe-tools-dnsmasq.service pxe-tools-init.service
 sudo apt install --only-upgrade pxe-tools
+# Vérifier et, si nécessaire, migrer explicitement les anciens chemins avant reprise.
 sudo systemctl start pxe-tools-admin.target
+sudo systemctl is-active pxe-tools-init.service pxe-tools-php.service pxe-tools-nginx.service pxe-tools-worker.service
+curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/
 # Si le réseau PXE avait déjà été configuré et doit être réactivé :
 sudo systemctl start pxe-tools.target
 ```

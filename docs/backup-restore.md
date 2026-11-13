@@ -53,7 +53,11 @@ enrôlement. Le lien natif prédéfini `http/static-bin` est exclu : le paquet l
 recrée au démarrage. Tous les autres liens symboliques, les fichiers spéciaux et les permissions
 spéciales sont refusés, à l’export comme à la restauration. Une ancienne archive
 contenant de tels liens ne peut pas être restaurée par cette version ; conservez
-la source et examinez ces liens avant une nouvelle sauvegarde.
+la source et examinez ces liens avant une nouvelle sauvegarde. Les téléchargeurs
+peuvent créer des alias `netboot/<codename>/<arch>` : leur présence fait actuellement
+refuser la sélection HTTP. Ne supprimez pas ces alias pour contourner ce refus :
+ils peuvent être nécessaires au démarrage ; leur sauvegarde et leur recréation sûre
+restent à implémenter.
 
 Les chemins HTTP, MOK et TFTP indiqués sont ceux des nouvelles installations natives
 protégées. Une installation antérieure peut encore utiliser respectivement
@@ -125,7 +129,7 @@ test -z "$(ls -A /etc/pxe-tools)" && test -z "$(ls -A /var/lib/pxe-tools)"
 test -z "$(ls -A /var/lib/pxe-tools-http)" && test -z "$(ls -A /var/lib/pxe-tools-tftp)"
 # Contrôler uniquement les arbres HTTP/TFTP effectivement sélectionnés :
 python3 /usr/lib/pxe-tools/app/cli/check-restored-publication.py \
-  /root/pxe-restore/standby/http /root/pxe-restore/standby/tftp
+  --http /root/pxe-restore/standby/http --tftp /root/pxe-restore/standby/tftp
 install -m 0600 /root/pxe-restore/standby/master.key /etc/pxe-tools/master.key
 install -m 0600 /root/pxe-restore/standby/database.sqlite /var/lib/pxe-tools/pxe-tools.sqlite
 # Si ces éléments ont été sélectionnés :
@@ -135,12 +139,19 @@ cp -a /root/pxe-restore/standby/tftp/. /var/lib/pxe-tools-tftp/
 mkdir -m 0700 /var/lib/pxe-tools-native/mok
 cp -a /root/pxe-restore/standby/MOK.key /root/pxe-restore/standby/MOK.pem /root/pxe-restore/standby/MOK.der /var/lib/pxe-tools-native/mok/
 cmp /root/pxe-restore/standby/MOK.der /var/lib/pxe-tools-native/mok/MOK.der
+# Synchroniser les fichiers restaurés avant de démarrer ou redémarrer la machine.
+sync
 systemctl start pxe-tools-admin.target
+systemctl is-active pxe-tools-init.service pxe-tools-php.service pxe-tools-nginx.service pxe-tools-worker.service
+curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/
 ```
 
 Le contrôle refuse les chemins ou fichiers non détenus par root, les liens et
 les permissions d'écriture accordées au groupe ou à d'autres utilisateurs, y
-compris sur les répertoires parents. Il ne corrige rien : conservez l'archive et
+compris sur les répertoires parents. Pour TFTP seulement, il accepte l'écriture
+de groupe sur `pxelinux.cfg` et `.pxe-menu.lock` : ces deux éléments sont repris
+par le worker pour le groupe web lors du rendu. Les autres éléments doivent aussi
+être lisibles, et les répertoires traversables, par les services web et TFTP. Il ne corrige rien : conservez l'archive et
 examinez la copie en veille si un refus survient. Maintenez cette copie et ses
 parents à l'abri des écritures non autorisées jusqu'à la fin de la copie.
 

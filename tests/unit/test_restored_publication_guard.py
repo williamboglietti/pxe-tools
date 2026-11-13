@@ -40,5 +40,29 @@ class GuardTests(unittest.TestCase):
                 guard.check(root)
             self.assertEqual(asset.read_text(), 'fixture')
 
+    def test_tftp_exception_and_service_readability(self):
+        with tempfile.TemporaryDirectory(prefix='pxe-publication-check-', dir='/root') as tmp:
+            root = Path(tmp) / 'tftp'
+            root.mkdir(mode=0o755)
+            menu = root / 'pxelinux.cfg'
+            menu.mkdir(mode=0o775)
+            menu.chmod(0o775)
+            lock = root / '.pxe-menu.lock'
+            lock.touch(mode=0o660)
+            lock.chmod(0o660)
+            asset = menu / 'default'
+            asset.write_text('fixture')
+            asset.chmod(0o644)
+            guard.check(root, tftp=True)
+            with self.assertRaises(ValueError):
+                guard.check(root)
+            asset.chmod(0o600)
+            with self.assertRaises(ValueError):
+                guard.check(root, tftp=True)
+            asset.chmod(0o664)
+            with self.assertRaises(ValueError):
+                guard.check(root, tftp=True)
+            self.assertEqual(asset.read_text(), 'fixture')
+
 if __name__ == '__main__':
     unittest.main()

@@ -94,6 +94,29 @@ La configuration dnsmasq générée reste dans ce répertoire root, hors de
 `/etc/pxe-tools` qui est accessible en écriture à l'assistant web.
 Un ancien `/etc/pxe-tools/dnsmasq.conf` est conservé lors d'une mise à niveau,
 mais le service natif ne le lit plus.
+La clé TLS native est conservée dans `/var/lib/pxe-tools-native/tls`, répertoire
+root privé. Sur une instance antérieure avec `/var/lib/pxe-tools/tls`, le service
+refuse de générer une nouvelle paire tant que l'ancienne n'a pas été copiée
+explicitement. Arrêtez les services, vérifiez la sauvegarde de la paire puis
+copiez `cert.pem` et `key.pem` vers le nouveau chemin avec les permissions
+respectives `0644` et `0600`, toutes deux détenues par root. Conservez l'ancien
+répertoire pour retour arrière et vérifiez le certificat présenté avant de
+réactiver l'administration. Aucun certificat n'est déplacé automatiquement.
+
+Sur l'ancienne instance native arrêtée, après une sauvegarde vérifiée, exécuter
+en root seulement si la destination est absente :
+
+```sh
+set -eu
+test ! -e /var/lib/pxe-tools-native/tls && test ! -L /var/lib/pxe-tools-native/tls
+install -d -o root -g root -m 0700 /var/lib/pxe-tools-native/tls
+install -o root -g root -m 0644 /var/lib/pxe-tools/tls/cert.pem /var/lib/pxe-tools-native/tls/cert.pem
+install -o root -g root -m 0600 /var/lib/pxe-tools/tls/key.pem /var/lib/pxe-tools-native/tls/key.pem
+cmp -s /var/lib/pxe-tools/tls/cert.pem /var/lib/pxe-tools-native/tls/cert.pem
+cmp -s /var/lib/pxe-tools/tls/key.pem /var/lib/pxe-tools-native/tls/key.pem
+python3 /opt/pxe-tools/scripts/validate-native-runtime.py tls /var/lib/pxe-tools-native/tls
+```
+
 Le fichier root `/var/lib/pxe-tools-native/runtime.env` transmet ces chemins
 aux unités systemd. Le programme de préparation refuse tout chemin existant :
 aucune donnée n'est remplacée, déplacée ou supprimée automatiquement.

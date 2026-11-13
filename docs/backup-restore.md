@@ -40,7 +40,7 @@ python3 /usr/lib/pxe-tools/app/cli/recovery-backup.py export \
   --mok-dir /var/lib/pxe-tools-native/mok --include-mok \
   --http-root /var/lib/pxe-tools-http --include-http \
   --tftp-root /var/lib/pxe-tools-tftp --include-tftp \
-  --tls-root /var/lib/pxe-tools/tls --include-tls
+  --tls-root /var/lib/pxe-tools-native/tls --include-tls
 ```
 
 L'exemple demande chaque composant ; retirez les deux options d'un composant
@@ -59,9 +59,9 @@ refusés, à l’export comme à la restauration. Une ancienne archive contenant
 liens non pris en charge ne peut pas être restaurée par cette version ;
 conservez la source et examinez ces liens avant une nouvelle sauvegarde.
 
-Les chemins HTTP, MOK et TFTP indiqués sont ceux des nouvelles installations natives
+Les chemins HTTP, MOK, TLS et TFTP indiqués sont ceux des nouvelles installations natives
 protégées. Une installation antérieure peut encore utiliser respectivement
-`/var/lib/pxe-tools/http`, `/etc/pxe-tools/mok` et `/var/lib/pxe-tools/tftp` : identifiez les chemins
+`/var/lib/pxe-tools/http`, `/etc/pxe-tools/mok`, `/var/lib/pxe-tools/tls` et `/var/lib/pxe-tools/tftp` : identifiez les chemins
 effectivement configurés et sélectionnez-les explicitement à l'export. Aucune
 donnée de l'ancienne instance n'est déplacée ni supprimée par la sauvegarde.
 
@@ -134,7 +134,9 @@ install -m 0600 /root/pxe-restore/standby/master.key /etc/pxe-tools/master.key
 install -m 0600 /root/pxe-restore/standby/database.sqlite /var/lib/pxe-tools/pxe-tools.sqlite
 # Si ces éléments ont été sélectionnés :
 cp -a /root/pxe-restore/standby/http/. /var/lib/pxe-tools-http/
-cp -a /root/pxe-restore/standby/tls /var/lib/pxe-tools/
+install -d -o root -g root -m 0700 /var/lib/pxe-tools-native/tls
+install -o root -g root -m 0644 /root/pxe-restore/standby/tls/cert.pem /var/lib/pxe-tools-native/tls/cert.pem
+install -o root -g root -m 0600 /root/pxe-restore/standby/tls/key.pem /var/lib/pxe-tools-native/tls/key.pem
 cp -a /root/pxe-restore/standby/tftp/. /var/lib/pxe-tools-tftp/
 mkdir -m 0700 /var/lib/pxe-tools-native/mok
 cp -a /root/pxe-restore/standby/MOK.key /root/pxe-restore/standby/MOK.pem /root/pxe-restore/standby/MOK.der /var/lib/pxe-tools-native/mok/

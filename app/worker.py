@@ -40,7 +40,8 @@ from contextlib import contextmanager
 from typing import Callable, Optional
 from database_selection import select_database
 from image_delete import (cleanup_committed, components as image_delete_components,
-                          open_image_dir, require_trusted_http_root, restore_staged, stage_files, validate_files)
+                          open_image_dir, require_trusted_docker_http_root,
+                          require_trusted_http_root, restore_staged, stage_files, validate_files)
 from pxe_menu_lock import menu_lock
 
 from ansible_vault import (
@@ -331,7 +332,12 @@ def run_image_delete(job: dict) -> None:
     try:
         if os.geteuid() != 0:
             raise ValueError('root worker required for protected paths')
-        require_trusted_http_root(HTTP_ROOT)
+        if os.environ.get('PXE_SERVICE_MANAGER') == 'systemd':
+            require_trusted_http_root(HTTP_ROOT)
+        elif os.environ.get('PXE_SERVICE_MANAGER') == 's6':
+            require_trusted_docker_http_root(HTTP_ROOT)
+        else:
+            raise ValueError('image deletion requires a verified service manager')
         parts = image_delete_components(job['log'], image_id)
         fd = open_image_dir(HTTP_ROOT, parts)
         validate_files(fd, job_id)

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: LGPL-3.0-only
-"""Bounded native image deletion: protected paths and restart recovery."""
+"""Bounded image deletion and protected HTTP image paths."""
 from __future__ import annotations
 import json
 import os
 from pathlib import PurePosixPath
 import re
 import stat
+import sys
+
+DOCKER_HTTP_ROOT = '/srv/http'
+DOCKER_MARKER = '.pxe-netboot-root-v1'
+DOCKER_MARKER_CONTENT = b'pxe-netboot-root-v1\n'
 
 FILES = ('linux', 'initrd.gz', 'firmware.cpio.gz')
 COMPONENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
@@ -91,6 +96,61 @@ def require_trusted_http_root(http_root: str, marker_dir: str = '/var/lib/pxe-to
         raise ValueError('HTTP root differs from protected native marker')
 
 
+def require_trusted_docker_http_root(http_root: str, *, check_contents: bool = False) -> None:
+    """Refuse a legacy web-owned volume before serving or deleting images."""
+    if (http_root != DOCKER_HTTP_ROOT or os.geteuid() != 0
+            or os.environ.get('PXE_SERVICE_MANAGER') != 's6'
+            or not os.path.isfile('/.dockerenv')):
+        raise ValueError('protected Docker HTTP root is unavailable')
+    root = open_image_dir(http_root, ())
+    if root is None:
+        raise ValueError('Docker HTTP root is missing')
+    try:
+        marker = os.open(DOCKER_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=root)
+        try:
+            info = os.fstat(marker)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or info.st_mode & 0o022 or info.st_size != len(DOCKER_MARKER_CONTENT)
+                    or os.read(marker, len(DOCKER_MARKER_CONTENT) + 1) != DOCKER_MARKER_CONTENT):
+                raise ValueError('Docker HTTP root marker is untrusted')
+        finally:
+            os.close(marker)
+    finally:
+        os.close(root)
+    for tree_name in ('netboot', 'static-bin'):
+        tree = open_image_dir(http_root, (tree_name,))
+        if tree is None:
+            raise ValueError(f'protected {tree_name} tree is missing')
+        os.close(tree)
+    if not check_contents:
+        return
+    entries = 0
+    netboot_base = os.path.join(http_root, 'netboot')
+    for parent, directories, files in os.walk(http_root, followlinks=False):
+        for name in directories + files:
+            entries += 1
+            if entries > 100000:
+                raise ValueError('HTTP asset tree is too large to validate')
+            path = os.path.join(parent, name)
+            info = os.lstat(path)
+            if info.st_uid != 0:
+                raise ValueError('HTTP tree contains a non-root-owned entry')
+            if stat.S_ISLNK(info.st_mode):
+                resolved = os.path.realpath(path)
+                if (os.path.commonpath((netboot_base, path)) != netboot_base
+                        or os.path.commonpath((netboot_base, resolved)) != netboot_base):
+                    raise ValueError('HTTP tree contains an unsafe link')
+            elif stat.S_ISDIR(info.st_mode):
+                if info.st_mode & 0o022:
+                    raise ValueError('HTTP tree contains a writable directory')
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1 or info.st_mode & 0o022:
+                    raise ValueError('HTTP tree contains an unsafe file')
+            else:
+                raise ValueError('HTTP tree contains an unsupported entry')
+
+
 def _exists(fd: int, name: str) -> bool:
     try:
         os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -138,3 +198,13 @@ def cleanup_committed(fd: int | None, job_id: int) -> None:
         except FileNotFoundError:
             pass
     os.fsync(fd)
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] != ['--verify-docker-http-tree']:
+        raise SystemExit('expected Docker HTTP tree verification')
+    try:
+        require_trusted_docker_http_root(os.environ.get('HTTP_ROOT', DOCKER_HTTP_ROOT),
+                                         check_contents=True)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'Protected Docker HTTP tree refused: {error}')

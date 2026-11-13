@@ -103,7 +103,7 @@ def run():
                                 time.sleep(0.05)
                             # An unrelated nginx can change ownership after this master starts.
                             os.chown(hostile, nobody, -1)
-                            os.chmod(hostile, 0o700)
+                            assert hostile.stat().st_mode & 0o777 == 0o700
                             assert post(sock) == (500 if broken else 200), (config_name, broken, iteration)
                             if not broken:
                                 for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi'):

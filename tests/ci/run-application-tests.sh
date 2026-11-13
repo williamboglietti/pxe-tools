@@ -52,6 +52,10 @@ python3 tests/integration/test_native_package_permissions.py
 bash tests/integration/test_clean_release_checkout.sh
 echo '::endgroup::'
 
+echo '::group::Protected image deletion and crash recovery'
+PXE_IMAGE_DELETE_TEST=1 python3 tests/integration/test_image_delete_worker.py
+echo '::endgroup::'
+
 echo '::group::Concurrent installation log append'
 PXE_INSTALL_LOG_ISOLATED=1 python3 tests/integration/test_install_log_concurrency.py
 echo '::endgroup::'

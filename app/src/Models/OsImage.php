@@ -121,7 +121,7 @@ final class OsImage
      */
     public static function localDir(array $image): string
     {
-        $root = rtrim((string)(getenv('PXE_HTTP_ROOT') ?: self::HTTP_ROOT), '/');
+        $root = rtrim((string)(getenv('PXE_HTTP_ROOT') ?: getenv('HTTP_ROOT') ?: self::HTTP_ROOT), '/');
         $version = (string)($image['version_full'] ?? '');
         $parts = $version !== '' ? [$image['distro'], $version, $image['arch']] : [$image['version'], $image['arch']];
         foreach ($parts as $part) {
@@ -254,6 +254,7 @@ final class OsImage
     /** Shared reasons keep the rendered actions aligned with server revalidation. */
     public static function activationBlock(array $image, array $dependencies, bool $on): ?string
     {
+        if (self::deletePending((int)$image['id'])) return 'Suppression de cette image en cours.';
         if (!$on && $dependencies['blocking'] !== []) return implode(' ', $dependencies['blocking']);
         if ($on && in_array($image['status'], [self::STATUS_PENDING, self::STATUS_FAILED], true) && !empty($dependencies['active'])) {
             return 'Image utilisée par une opération active : son activation relancerait le téléchargement.';
@@ -263,6 +264,7 @@ final class OsImage
 
     public static function downloadBlock(array $image, array $dependencies): ?string
     {
+        if (self::deletePending((int)$image['id'])) return 'Suppression de cette image en cours.';
         if (!empty($dependencies['active'])) return 'Image utilisée par une opération active : remplacement refusé.';
         if ($image['status'] === self::STATUS_DOWNLOADED && $dependencies['available'] && $dependencies['blocking'] !== []) {
             return implode(' ', $dependencies['blocking']);
@@ -344,6 +346,47 @@ final class OsImage
             if ($pdo->inTransaction()) $pdo->rollBack();
             throw $error;
         }
+    }
+
+    /** A fixed numeric image ID is the only operation the worker accepts. */
+    public static function deletePending(int $id): bool
+    {
+        $stmt = Db::get()->prepare("SELECT 1 FROM init_jobs WHERE job_type=? AND status IN ('pending','running') LIMIT 1");
+        $stmt->execute(['image:delete:' . $id]);
+        return $stmt->fetchColumn() !== false;
+    }
+
+    /** Preserve the original unprivileged path for writable legacy volumes. */
+    public static function webCanDeleteDirect(array $image): bool
+    {
+        // Never use the legacy direct path when PHP itself is privileged or
+        // its effective identity cannot be established.
+        if (!function_exists('posix_geteuid') || posix_geteuid() === 0) return false;
+        $directory = self::localDir($image);
+        while (!file_exists($directory) && !is_link($directory)) {
+            $parent = dirname($directory);
+            if ($parent === $directory) return false;
+            $directory = $parent;
+        }
+        return !is_link($directory) && is_dir($directory) && is_writable($directory);
+    }
+
+    public static function queueDelete(int $id): int
+    {
+        $job = 0;
+        self::withImageLock($id, static function () use ($id, &$job): void {
+            $image = self::findById($id);
+            if (self::deletePending($id)) throw new \RuntimeException('Suppression déjà en cours.');
+            $dependencies = self::dependencies($id);
+            if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
+            self::localDir($image); // Reject malformed components before queuing.
+            $meta = json_encode(['id' => $id, 'distro' => $image['distro'], 'version' => $image['version'],
+                'version_full' => $image['version_full'], 'arch' => $image['arch']], JSON_THROW_ON_ERROR);
+            $stmt = Db::get()->prepare("INSERT INTO init_jobs(job_type,status,message,log) VALUES(?,'pending',?,?)");
+            $stmt->execute(['image:delete:' . $id, 'Suppression de l’image en attente', $meta]);
+            $job = (int)Db::get()->lastInsertId();
+        });
+        return $job;
     }
 
     /** Lock replacement candidates together, before the transaction's first snapshot read. */
@@ -428,7 +471,7 @@ final class OsImage
     }
 
     /** Revalidate inside the transaction and restore files if SQL deletion fails. */
-    public static function deleteWithFiles(int $id): void
+    public static function deleteWithFiles(int $id, ?int $jobId = null): void
     {
         $scope = self::findById($id);
         if ($scope === null) return;
@@ -439,27 +482,70 @@ final class OsImage
             self::lockImageGroup($pdo, $scope);
             $img = self::findById($id);
             if ($img === null) { $pdo->rollBack(); return; }
+            if ($jobId === null && self::deletePending($id)) {
+                throw new \RuntimeException('Suppression déjà en cours.');
+            }
+            if ($jobId !== null) {
+                $job = $pdo->prepare("SELECT log FROM init_jobs WHERE id=? AND job_type=? AND status='running'");
+                $job->execute([$jobId, 'image:delete:' . $id]);
+                $raw = $job->fetchColumn();
+                $meta = is_string($raw) ? json_decode($raw, true, 16, JSON_THROW_ON_ERROR) : null;
+                $expected = ['id' => $id, 'distro' => $img['distro'], 'version' => $img['version'],
+                    'version_full' => $img['version_full'], 'arch' => $img['arch']];
+                if ($meta !== $expected) throw new \RuntimeException('Tâche de suppression modifiée ; image conservée.');
+            }
+            $dir = self::localDir($img);
+            if ($jobId !== null) {
+                if ($jobId <= 0) throw new \RuntimeException('Identifiant de tâche invalide.');
+                // A crash before the SQL commit can leave staged files. Put
+                // them back before rechecking dependencies or trying again.
+                foreach (['linux', 'initrd.gz', 'firmware.cpio.gz'] as $file) {
+                    $path = $dir . '/' . $file;
+                    $backup = $path . '.pxe-delete-' . $jobId;
+                    if (is_link($path) || is_link($backup)) throw new \RuntimeException('Lien inattendu ; fichiers conservés.');
+                    if (file_exists($backup)) {
+                        if (file_exists($path) || !is_file($backup) || !@rename($backup, $path)) {
+                            throw new \RuntimeException('Reprise ambiguë ; fichiers conservés pour vérification.');
+                        }
+                    }
+                }
+                self::syncImageDir($dir);
+            }
             $dependencies = self::dependencies($id);
             if ($dependencies['blocking'] !== []) throw new \RuntimeException(implode(' ', $dependencies['blocking']));
-            $dir = self::localDir($img);
             foreach (['linux', 'initrd.gz', 'firmware.cpio.gz'] as $file) {
                 $path = $dir . '/' . $file;
+                if (is_link($path)) throw new \RuntimeException('Lien inattendu ; fichier conservé.');
                 if (!is_file($path)) continue;
-                $backup = $path . '.delete-' . bin2hex(random_bytes(8));
+                $backup = $path . ($jobId === null ? '.delete-' . bin2hex(random_bytes(8)) : '.pxe-delete-' . $jobId);
+                if (file_exists($backup) || is_link($backup)) throw new \RuntimeException('Destination de quarantaine occupée.');
                 if (!@rename($path, $backup)) throw new \RuntimeException('Impossible de retirer les fichiers de cette image.');
                 $moved[$path] = $backup;
             }
+            if ($jobId !== null) self::syncImageDir($dir);
             $pdo->prepare('DELETE FROM os_images WHERE id = ?')->execute([$id]);
             $pdo->commit();
         } catch (\Throwable $error) {
             if ($pdo->inTransaction()) $pdo->rollBack();
             $unrestored = [];
             foreach ($moved as $path => $backup) if (!@rename($backup, $path)) $unrestored[] = $path;
+            if ($jobId !== null && $moved !== []) self::syncImageDir($dir);
             if ($unrestored !== []) throw new \RuntimeException('Suppression refusée ; restauration manuelle nécessaire : ' . implode(', ', $unrestored), 0, $error);
             throw $error;
         }
         foreach ($moved as $backup) {
             if (!@unlink($backup)) throw new \RuntimeException('Image retirée du catalogue, mais un fichier .delete doit être nettoyé : ' . $backup);
         }
+        if ($jobId !== null) self::syncImageDir($dir);
+    }
+
+    private static function syncImageDir(string $directory): void
+    {
+        if (!is_dir($directory)) return;
+        $stream = @fopen($directory, 'r');
+        if ($stream === false) throw new \RuntimeException('Répertoire de l’image inaccessible ; fichiers conservés.');
+        try {
+            if (!fsync($stream)) throw new \RuntimeException('Synchronisation du répertoire impossible ; fichiers conservés.');
+        } finally { fclose($stream); }
     }
 }

@@ -56,4 +56,4 @@ est conservée mais n'est pas migrée automatiquement.
 Le code du socle est distribué sous [LGPL-3.0](COPYING.LESSER). Les composants
 tiers et leurs notices sont recensés dans [THIRD-PARTY.md](THIRD-PARTY.md).
 Les sources et matériaux de reliage des utilitaires embarqués sont disponibles
-dans [la notice et les archives correspondantes](https://packages.pxetools.com/sources/static-helpers/2026-11-12/README.md).
+dans [la notice et les archives correspondantes](https://github.com/williamboglietti/pxe-tools/releases/tag/sources-2026-11-12).

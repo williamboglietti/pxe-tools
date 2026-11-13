@@ -50,6 +50,21 @@ class RecoveryTests(unittest.TestCase):
                         with self.assertRaises(ValueError): module.recover(target, False)
                         self.assertFalse(target.exists())
 
+    def test_stale_live_release_cannot_select_an_older_snapshot(self):
+        older = archive(content=b'old release')
+        newer = archive(content=b'new release')
+        assets = [{'name': f'snapshot-{run}-1.tar.gz', 'id': run, 'size': len(data),
+                   'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}
+                  for run, data in [(1, older), (2, newer)]]
+        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'assets': assets}
+        result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
+             patch.object(module.subprocess, 'run', return_value=result), \
+             patch.object(module, 'live_release', return_value=b'old release'), \
+             patch.object(module, 'gh', return_value=newer):
+            with self.assertRaises(ValueError): module.recover(Path(d) / 'previous', False)
+
     def test_bootstrap_only_when_no_prior_assets(self):
         metadata = {'tag_name':'apt-snapshots', 'draft':False, 'assets':[]}
         result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())

@@ -28,7 +28,16 @@ def publish(source: Path, destination: Path) -> None:
             or not source.parent.name.startswith('pxe-image.')
             or source.name not in ('linux', 'initrd.gz', 'firmware.cpio.gz', 'source.iso')):
         raise ValueError('invalid image staging path')
-    stage = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_root = os.open('/var/tmp', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root_info = os.fstat(temporary_root)
+        if (root_info.st_uid != 0 or
+                (root_info.st_mode & 0o022 and not root_info.st_mode & stat.S_ISVTX)):
+            raise ValueError('untrusted temporary root')
+        stage = os.open(source.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=temporary_root)
+    finally:
+        os.close(temporary_root)
     try:
         stage_info = os.fstat(stage)
         if (stage_info.st_uid != 0 or stat.S_IMODE(stage_info.st_mode) != 0o700

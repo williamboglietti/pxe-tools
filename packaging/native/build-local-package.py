@@ -138,6 +138,7 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
         for name, text in [('preinst',preinst),('postinst',POSTINST),('prerm',PRERM),('postrm',POSTRM)]:
             p=control/name; p.write_text(text.replace('pxe-tools-local-test', package_name)); p.chmod(0o755)
         copy_tree(ROOT/'app', root/'usr/lib/pxe-tools/app', tracked)
+        (root/'usr/lib/pxe-tools/app/src/native-build-version.txt').write_text(version + '\n', encoding='utf-8')
         copy_tree(ROOT/'docker/worker/scripts', root/'opt/pxe-tools/scripts', tracked)
         copy_tree(ROOT/'docker/worker/templates', root/'opt/pxe-tools/templates', tracked)
         copy_tree(ROOT/'docker/pxe-tools/init', root/'opt/pxe-tools/init', tracked)

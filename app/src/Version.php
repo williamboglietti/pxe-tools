@@ -14,6 +14,14 @@ final class Version
 
     public static function displayNumber(): string
     {
+        // Native packages carry their exact Debian version separately from the
+        // SemVer build version used by Docker.
+        $nativeVersion = @file_get_contents(__DIR__ . '/native-build-version.txt');
+        $nativeVersion = is_string($nativeVersion) ? trim($nativeVersion) : '';
+        if (preg_match('/\A[0-9][A-Za-z0-9.+~\-]{0,40}\z/', $nativeVersion)) {
+            return $nativeVersion;
+        }
+
         $version = @file_get_contents(__DIR__ . '/build-version.txt');
         $version = is_string($version) ? trim($version) : '';
 

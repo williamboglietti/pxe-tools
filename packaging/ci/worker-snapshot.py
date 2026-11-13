@@ -4,6 +4,7 @@
 from __future__ import annotations
 import argparse
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,9 @@ import tarfile
 import urllib.error
 import urllib.request
 
-TAG = 'apt-snapshots'
+TAG = Path('packaging/ci/snapshot-release-tag.txt').read_text().strip()
+if not re.fullmatch(r'apt-snapshots(?:-[a-z0-9]+)*', TAG):
+    raise ValueError('invalid persistent snapshot release tag')
 RELEASE_URL = 'https://packages.pxetools.com/apt/dists/stable/InRelease'
 MAX_SNAPSHOT = 512 * 1024 * 1024
 
@@ -36,6 +39,17 @@ def live_release() -> bytes | None:
         raise
 
 
+def validate_recovered(root: Path) -> None:
+    spec = importlib.util.spec_from_file_location('static_apt', 'packaging/native/prepare-static-apt.py')
+    if spec is None or spec.loader is None:
+        raise ValueError('snapshot verifier unavailable')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    verifier.validate(root, Path('packaging/ci/pxe-tools-public.gpg'),
+                      'CD8B4493876B4FBD1009FE2DB195E5DE026807EC',
+                      '76CA2883C9DACEB52D9E806A1F2D96C9062271AB', allow_expired=True)
+
+
 def recover(destination: Path, bootstrap: bool) -> None:
     repository = os.environ['GITHUB_REPOSITORY']
     release = subprocess.run(['gh', 'api', f'repos/{repository}/releases/tags/{TAG}'],
@@ -47,7 +61,16 @@ def recover(destination: Path, bootstrap: bool) -> None:
     metadata = json.loads(release.stdout)
     if metadata.get('draft') or metadata.get('tag_name') != TAG:
         raise ValueError('snapshot release must be published under the fixed tag')
-    assets = [a for a in metadata.get('assets', [])
+    if not isinstance(metadata.get('id'), int):
+        raise ValueError('snapshot release ID missing')
+    pages = json.loads(gh('api', '--paginate', '--slurp',
+                          f'repos/{repository}/releases/{metadata["id"]}/assets?per_page=100'))
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise ValueError('invalid snapshot asset pagination')
+    all_assets = [asset for page in pages for asset in page]
+    if len(all_assets) >= 950:
+        raise ValueError('snapshot release is near its asset limit; rotate before publication')
+    assets = [a for a in all_assets
               if re.fullmatch(r'snapshot-[0-9]+-[0-9]+\.tar\.gz', a.get('name', ''))]
     # A DNS, TLS or network failure is never evidence that no repository
     # exists: bootstrap requires an explicit HTTP 404 from the HTTPS origin.
@@ -96,6 +119,7 @@ def recover(destination: Path, bootstrap: bool) -> None:
                 raise ValueError('snapshot destination already exists')
             destination.mkdir(parents=True)
             archive.extractall(destination, filter='data')
+            validate_recovered(destination / 'snapshot')
             print('Recovered the snapshot matching the live signed metadata.')
             return
     raise ValueError('no persistent snapshot matches the live InRelease')

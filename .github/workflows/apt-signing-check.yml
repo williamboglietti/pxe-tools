@@ -25,7 +25,9 @@ jobs:
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
       - name: Verify persistent Worker snapshot recovery
-        run: python3 -m unittest discover -s tests -p 'test_worker_snapshot.py' -v
+        run: python3 -m unittest discover -s tests -p 'test_worker_*.py' -v
+      - name: Verify signed provenance
+        run: PXE_APT_PROOF_FIXTURE=1 python3 tests/integration/test_apt_provenance.py
       - name: Verify release asset selection
         run: python3 -m unittest discover -s tests -p 'test_release_asset.py' -v
       - name: Verify CI signer with disposable keys

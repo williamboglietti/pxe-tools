@@ -168,12 +168,6 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
             finally:
                 os.close(fd)
 
-        sign('--output', str(release_dir / 'InRelease'), '--clearsign', str(release_dir / 'Release'))
-        sign('--armor', '--output', str(release_dir / 'Release.gpg'), '--detach-sign',
-             str(release_dir / 'Release'))
-        command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'InRelease'))
-        command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'Release.gpg'),
-                str(release_dir / 'Release'))
         if previous is not None:
             def previous_path(relative: str) -> Path:
                 result = previous
@@ -265,6 +259,24 @@ def build(package: Path, destination: Path, gnupg_home: Path, fingerprint: str,
                             raise ValueError('immutable object collision')
                     else:
                         shutil.copyfile(item, dest)
+        # Cover retained objects as well as the current APT index. The manifest
+        # is embedded in signed Release and calculated from canonical paths.
+        if release_candidate:
+            rows = []
+            for path in sorted(stage.rglob('*')):
+                if path.is_file() and path.parent != release_dir:
+                    with path.open('rb') as stream:
+                        checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
+                    rows.append(f'{checksum} {path.stat().st_size} {path.relative_to(stage).as_posix()}\n')
+            manifest_hash = hashlib.sha256(''.join(rows).encode('utf-8')).hexdigest()
+            release = f'X-PXE-Snapshot-SHA256: {manifest_hash}\n'.encode('ascii') + release
+            (release_dir / 'Release').write_bytes(release)
+        sign('--output', str(release_dir / 'InRelease'), '--clearsign', str(release_dir / 'Release'))
+        sign('--armor', '--output', str(release_dir / 'Release.gpg'), '--detach-sign',
+             str(release_dir / 'Release'))
+        command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'InRelease'))
+        command('gpg', '--homedir', str(gnupg_home), '--batch', '--verify', str(release_dir / 'Release.gpg'),
+                str(release_dir / 'Release'))
         # Reserve the output name exclusively; do not replace an existing tree.
         destination.mkdir(mode=0o700)
         try:

@@ -11,7 +11,7 @@ on:
     - cron: '17 3 */2 * *'
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
@@ -60,7 +60,8 @@ jobs:
           set -euo pipefail
           PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
           PXE_CI_SIGNING_FIXTURE=1 bash tests/integration/test_ci_signing_candidate.sh
-          python3 -m unittest discover -s tests -p 'test_worker_snapshot.py' -v
+          python3 -m unittest discover -s tests -p 'test_worker_*.py' -v
+          PXE_APT_PROOF_FIXTURE=1 python3 tests/integration/test_apt_provenance.py
       - name: Retrieve the approved immutable package
         if: steps.manifest.outputs.ready == 'true'
         shell: bash
@@ -150,6 +151,9 @@ jobs:
           retention-days: 30
 
   publish:
+    permissions:
+      contents: write
+      actions: read
     needs: prepare
     if: needs.prepare.outputs.ready == 'true'
     environment: production
@@ -199,15 +203,16 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/snapshot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
           tar -C "$RUNNER_TEMP/candidate" -czf "$archive" snapshot
-          gh release upload apt-snapshots "$archive" --repo "$GITHUB_REPOSITORY"
+          tag=$(cat packaging/ci/snapshot-release-tag.txt)
+          [[ "$tag" =~ ^apt-snapshots(-[a-z0-9]+)*$ ]]
+          gh release upload "$tag" "$archive" --repo "$GITHUB_REPOSITORY"
       - name: Deploy signed Worker assets
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PACKAGES_PXETOOLS_COM }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: packaging/cloudflare/node_modules/.bin/wrangler deploy --config packaging/cloudflare/wrangler.jsonc --assets "$RUNNER_TEMP/assets"
       - name: Check deployed signed metadata
         shell: bash
         run: |
           set -euo pipefail
-          curl --proto '=https' --fail --silent --show-error --retry 5 --retry-delay 10 --max-time 60 --user-agent 'curl/8.14.1' https://packages.pxetools.com/apt/dists/stable/InRelease -o "$RUNNER_TEMP/live-InRelease"
-          cmp "$RUNNER_TEMP/candidate/snapshot/dists/stable/InRelease" "$RUNNER_TEMP/live-InRelease"
+          python3 packaging/ci/wait-worker-release.py "$RUNNER_TEMP/candidate/snapshot/dists/stable/InRelease"

@@ -36,12 +36,13 @@ class RecoveryTests(unittest.TestCase):
                 data = archive(name)
                 assets = [{'name':'snapshot-1-1.tar.gz', 'id': 42, 'size': len(data),
                            'digest':'sha256:' + hashlib.sha256(data).hexdigest()}]
-                metadata = {'tag_name':'apt-snapshots', 'draft':False, 'assets':assets}
+                metadata = {'tag_name':'apt-snapshots', 'draft':False, 'id': 123, 'assets':assets}
                 result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
                 with patch.dict(os.environ, {'GITHUB_REPOSITORY':'example/project'}), \
                      patch.object(module.subprocess, 'run', return_value=result), \
                      patch.object(module, 'live_release', return_value=live), \
-                     patch.object(module, 'gh', return_value=data):
+                     patch.object(module, 'gh', side_effect=[json.dumps([assets]).encode(), data]), \
+                     patch.object(module, 'validate_recovered'):
                     target = Path(d) / 'previous'
                     if succeeds:
                         module.recover(target, False)
@@ -56,28 +57,50 @@ class RecoveryTests(unittest.TestCase):
         assets = [{'name': f'snapshot-{run}-1.tar.gz', 'id': run, 'size': len(data),
                    'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}
                   for run, data in [(1, older), (2, newer)]]
-        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'assets': assets}
+        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'id': 123, 'assets': assets}
         result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
         with tempfile.TemporaryDirectory() as d, \
              patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
              patch.object(module.subprocess, 'run', return_value=result), \
              patch.object(module, 'live_release', return_value=b'old release'), \
-             patch.object(module, 'gh', return_value=newer):
+             patch.object(module, 'gh', side_effect=[json.dumps([assets]).encode(), newer]):
             with self.assertRaises(ValueError): module.recover(Path(d) / 'previous', False)
 
+    def test_over_100_assets_are_paginated(self):
+        data = archive()
+        assets = [{'name': f'snapshot-{n}-1.tar.gz', 'id': n, 'size': len(data),
+                   'digest': 'sha256:' + hashlib.sha256(data).hexdigest()} for n in range(1, 151)]
+        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'id': 123}
+        result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}, clear=False), \
+             patch.object(module.subprocess, 'run', return_value=result), \
+             patch.object(module, 'live_release', return_value=b'signed release'), \
+             patch.object(module, 'gh', side_effect=[json.dumps([assets[:100], assets[100:]]).encode(), data]) as gh, \
+             patch.object(module, 'validate_recovered'):
+            module.recover(Path(d) / 'previous', False)
+            self.assertTrue(gh.call_args.args[-1].endswith('/150'))
+
+    def test_503_does_not_authorize_bootstrap(self):
+        error = urllib.error.HTTPError('https://example.invalid', 503, 'unavailable', {}, None)
+        with patch.object(module.urllib.request, 'urlopen', side_effect=error):
+            with self.assertRaises(urllib.error.HTTPError): module.live_release()
+
     def test_bootstrap_only_when_no_prior_assets(self):
-        metadata = {'tag_name':'apt-snapshots', 'draft':False, 'assets':[]}
+        metadata = {'tag_name':'apt-snapshots', 'draft':False, 'id': 123, 'assets':[]}
         result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
         with tempfile.TemporaryDirectory() as d, \
              patch.dict(os.environ, {'GITHUB_REPOSITORY':'example/project'}), \
              patch.object(module.subprocess, 'run', return_value=result), \
-             patch.object(module, 'live_release', return_value=None):
+             patch.object(module, 'live_release', return_value=None), \
+             patch.object(module, 'gh', return_value=b'[[]]'):
             module.recover(Path(d) / 'previous', True)
             with self.assertRaises(ValueError): module.recover(Path(d) / 'previous', False)
         with tempfile.TemporaryDirectory() as d, \
              patch.dict(os.environ, {'GITHUB_REPOSITORY':'example/project'}), \
              patch.object(module.subprocess, 'run', return_value=result), \
-             patch.object(module, 'live_release', side_effect=urllib.error.URLError('DNS failure')):
+             patch.object(module, 'live_release', side_effect=urllib.error.URLError('DNS failure')), \
+             patch.object(module, 'gh', return_value=b'[[]]'):
             with self.assertRaises(urllib.error.URLError): module.recover(Path(d) / 'previous', True)
 
 

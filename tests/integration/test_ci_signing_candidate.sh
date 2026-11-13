@@ -99,6 +99,15 @@ if [[ "${PXE_STATIC_WRANGLER:-}" == 1 ]]; then
         cat "$fixture/http-update.log" >&2; exit 1;
     }
 fi
+cp -a "$fixture/next" "$fixture/injected-static"
+injected_hash=$(printf 'unsigned object' | sha256sum | awk '{print $1}')
+printf 'unsigned object' > "$fixture/injected-static/dists/stable/main/binary-amd64/by-hash/SHA256/$injected_hash"
+if python3 "$prepare" "$fixture/injected-static" "$fixture/static-injected" --keyring "$fixture/public.gpg" \
+    --primary-fingerprint "$primary" --signing-fingerprint "$sub" > "$fixture/static-injected.log" 2>&1; then
+    echo 'Unsigned retained object unexpectedly staged' >&2; exit 1
+fi
+grep -q 'signed snapshot object manifest does not match' "$fixture/static-injected.log"
+test ! -e "$fixture/static-injected"
 cp -a "$fixture/next" "$fixture/tampered-static"
 printf corrupt >> "$fixture/tampered-static/dists/stable/main/binary-amd64/Packages"
 if python3 "$prepare" "$fixture/tampered-static" "$fixture/static-bad" --keyring "$fixture/public.gpg" \

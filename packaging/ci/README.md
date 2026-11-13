@@ -21,7 +21,7 @@ Worker. Les notices applicatives pointent directement vers cette release.
 
 Avant la première publication, créer une release GitHub publique persistante
 `apt-snapshots` et configurer dans l'environnement GitHub `production` les
-secrets `APT_SIGNING_KEY`, `APT_SIGNING_PASSPHRASE`, `CLOUDFLARE_API_TOKEN` et
+secrets `APT_SIGNING_KEY`, `APT_SIGNING_PASSPHRASE`, `PACKAGES_PXETOOLS_COM` et
 la variable `CLOUDFLARE_ACCOUNT_ID`. Le jeton Cloudflare doit être limité au
 Worker de distribution et à la zone du domaine. La première exécution manuelle
 utilise l'option `bootstrap` seulement après vérification de l'absence de dépôt
@@ -48,3 +48,18 @@ Il faut vérifier les réponses publiques, puis tester `apt update`, l'installat
 l'interface et PXE sur les VM isolées avant annonce. La limite de 25 MiB
 s'applique aussi à chaque futur paquet, et le nombre d'assets conservés est
 limité par l'offre Cloudflare.
+
+La release GitHub accepte au maximum 1 000 assets et chaque snapshot est limité
+à 512 Mio (archive et contenu extrait) par le vérificateur. Le workflow bloque
+à 950 assets. Avant ce seuil, créer une nouvelle release publique nommée
+`apt-snapshots-<identifiant>`, y copier le dernier asset de snapshot **exact**,
+vérifier son SHA-256 et sa correspondance avec `InRelease` public, puis modifier
+`packaging/ci/snapshot-release-tag.txt` par PR revue. Conserver les anciennes
+releases. Ne jamais supprimer un snapshot pour contourner un état de déploiement
+inconnu ; en cas d'échec après archivage, vérifier l'état réel du Worker avant
+intervention.
+
+L'amorçage requiert une réponse HTTPS 404 explicite du domaine, une release de
+snapshots vide et l'option manuelle `bootstrap` ; DNS, TLS, HTTP 503 et panne
+réseau ne valent pas autorisation d'écraser un dépôt. L'intégralité des objets
+du snapshot est couverte par une empreinte intégrée à `Release` et sa signature.

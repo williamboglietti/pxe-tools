@@ -41,7 +41,7 @@ def allowed(relative: str) -> bool:
             or re.fullmatch(rf'pool/main/p/pxe-tools/pxe-tools-{HEX}\.deb', relative) is not None)
 
 
-def validate(root: Path, keyring: Path, primary: str, signing: str) -> None:
+def validate(root: Path, keyring: Path, primary: str, signing: str, *, allow_expired: bool = False) -> None:
     if root.is_symlink() or not root.is_dir() or keyring.is_symlink() or not keyring.is_file():
         raise ValueError('snapshot and trusted public keyring must exist and not be symlinks')
     if not all(re.fullmatch(r'(?:[0-9A-F]{40}|[0-9A-F]{64})', value) for value in (primary, signing)):
@@ -87,8 +87,16 @@ def validate(root: Path, keyring: Path, primary: str, signing: str) -> None:
         if line not in text.splitlines():
             raise ValueError('release metadata is not suitable for static publication')
     expires = re.findall(r'(?m)^Valid-Until: (.+)$', text)
-    if len(expires) != 1 or parsedate_to_datetime(expires[0]) <= datetime.now(timezone.utc) + timedelta(hours=1):
+    if len(expires) != 1 or (not allow_expired and parsedate_to_datetime(expires[0]) <= datetime.now(timezone.utc) + timedelta(hours=1)):
         raise ValueError('release metadata expires too soon')
+    snapshot_hashes = re.findall(r'(?m)^X-PXE-Snapshot-SHA256: ([0-9a-f]{64})$', text)
+    rows = []
+    for relative in sorted(files):
+        if relative not in ('dists/stable/InRelease', 'dists/stable/Release', 'dists/stable/Release.gpg'):
+            path = root / relative
+            rows.append(f'{digest(path)} {path.stat().st_size} {relative}\n')
+    if len(snapshot_hashes) != 1 or hashlib.sha256(''.join(rows).encode('utf-8')).hexdigest() != snapshot_hashes[0]:
+        raise ValueError('signed snapshot object manifest does not match')
     section = re.search(r'(?ms)^SHA256:\s*\n((?: [^\n]+\n)+)', text)
     if not section:
         raise ValueError('release metadata lacks SHA256 checksums')

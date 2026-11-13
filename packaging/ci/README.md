@@ -1,5 +1,15 @@
 # Publication APT par Worker
 
+Les constructeurs natifs exigent un checkout Git avec son index : les entrées
+copiées doivent être suivies et lisibles selon les modes publics. Une archive
+source sans métadonnées Git est refusée ; reconstruisez depuis un checkout
+authentifié. Les fichiers suivis mais modifiés restent des entrées possibles :
+la revue de leur contenu et des secrets demeure indispensable avant publication.
+Les modes sont normalisés dans le seul arbre temporaire des paquets, sans
+modifier le checkout. La CI de construction destinée à la publication exige en
+plus que HEAD corresponde au commit approuvé et que l'index et l'arbre de travail
+ne présentent aucune modification suivie.
+
 Le dépôt prévu est `https://packages.pxetools.com/apt/`, avec la clé publique à
 `https://packages.pxetools.com/pxe-tools-archive-keyring.gpg` (empreinte
 `CD8B4493876B4FBD1009FE2DB195E5DE026807EC`). Debian 13 amd64 est la seule

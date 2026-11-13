@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 """Build the optional native Ansible package for local testing or release."""
 import argparse
+import importlib.util
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+_inventory_spec = importlib.util.spec_from_file_location('pxe_source_inventory', ROOT/'packaging/native/source_inventory.py')
+if _inventory_spec is None or _inventory_spec.loader is None:
+    raise RuntimeError('Package source inventory unavailable')
+source_inventory = importlib.util.module_from_spec(_inventory_spec)
+_inventory_spec.loader.exec_module(source_inventory)
 CONTROL = '''Package: {package_name}
 Version: {version}
 Architecture: all
@@ -92,8 +99,8 @@ def build(destination: Path, version: str = '0.0.1~local1', *, package_name: str
         raise FileExistsError('Refusing to overwrite an existing package')
     if not re.fullmatch(r'[0-9][A-Za-z0-9.+~\-]{0,40}', version):
         raise ValueError('Invalid package version')
-    dropin=ROOT/'packaging/native/ansible-worker.conf'
-    if dropin.is_symlink() or not dropin.is_file(): raise ValueError('Unsupported source file')
+    tracked = source_inventory.tracked_files(ROOT)
+    dropin=source_inventory.checked_file(ROOT, ROOT/'packaging/native/ansible-worker.conf', tracked)
     with tempfile.TemporaryDirectory(prefix='pxe-native-ansible-package-') as temporary:
         root=Path(temporary)/'root'; control=root/'DEBIAN'; control.mkdir(parents=True)
         (control/'control').write_text(CONTROL.format(version=version, package_name=package_name, maintainer=maintainer, base_package=base_package, minimum_base=minimum_base, maximum_base=maximum_base))
@@ -108,6 +115,12 @@ def build(destination: Path, version: str = '0.0.1~local1', *, package_name: str
                                        'Source: https://github.com/williamboglietti/pxe-tools\n\n'
                                        'Files: *\nCopyright: PXE Tools contributors\nLicense: LGPL-3.0-only\n'
                                        ' On Debian systems, see /usr/share/common-licenses/LGPL-3.\n')
+        # Staging may inherit the caller's umask; never alter the checkout.
+        for path in (root, *root.rglob('*')):
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                raise ValueError('Unsupported staged package item')
+            mode = stat.S_IMODE(path.stat().st_mode)
+            path.chmod(0o755 if path.is_dir() or mode & 0o111 else 0o644)
         archive=Path(temporary)/'package.deb'
         subprocess.run(['dpkg-deb','--build','--root-owner-group',str(root),str(archive)],check=True,stdout=subprocess.DEVNULL)
         with destination.open('xb') as output, archive.open('rb') as source: shutil.copyfileobj(source,output)

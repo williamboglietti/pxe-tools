@@ -95,6 +95,7 @@ def main():
                 ('dhcp_proxy_netmask','255.255.255.0'),('https_enabled','off')])
             password=run('openssl','passwd','-6','-salt','pxefixture','fixture-password').stdout.strip()
             config={'distro':'debian','codename':'trixie','version_full':'13.0',
+                    '_pending_action_id':7,
                     'hostname':'pxe-fixture','domain':'example.test','partition_mode':'default',
                     'network_mode':'dhcp','root_login_mode':'disabled','system_disk_path':'/dev/vda',
                     'system_disk_identity':{'kind':'serial','value':'PXE-TEST-ONE','status':'valid'},
@@ -108,6 +109,8 @@ def main():
                               'services_select':[],'hw_detect_load_firmware':False}}}
             db.execute('INSERT INTO machines(mac,hostname,status,install_config_json) VALUES(?,?,?,?)',
                        ('02:00:00:00:00:01','pxe-fixture','configured',json.dumps(config)))
+            db.execute("INSERT INTO actions(id,machine_id,type,status,token,created_by) "
+                       "VALUES(7,1,'install_only','running',?,'fixture')", ('a'*64,))
             db.execute("INSERT INTO os_images(distro,version,arch,codename,version_full,enabled,status) VALUES('debian','13.0','amd64','trixie','13.0',1,'downloaded')")
         # A stale but valid DB must never drive the appliance, even when its
         # path is present in the inherited environment.

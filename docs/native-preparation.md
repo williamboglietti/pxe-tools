@@ -78,6 +78,11 @@ disponible pour SQLite ; la migration guidée reste à développer.
 SQLite est la seule base prise en charge. Une configuration MySQL/MariaDB
 existante est refusée avant connexion ; elle et ses données sont conservées,
 sans migration automatique vers SQLite.
+Le fichier SQLite doit être un fichier ordinaire directement sous
+`/var/lib/pxe-tools`, sans lien symbolique. L'initialisation refuse un chemin
+extérieur et exécute la création et les migrations avec le compte `www-data`.
+Une instance utilisant un autre emplacement doit être déplacée explicitement
+avec sa configuration et sa clé avant de démarrer cette version.
 
 ### Chemins natifs protégés et instances existantes
 

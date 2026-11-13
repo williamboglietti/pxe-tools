@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class PreseedInvariants(unittest.TestCase):
     def render(self, config, inventory=None, running_action_token=None, global_root_hash=None, template=None, expected_status=200,
-               module_enabled=None, module_key=None, stale_key=None):
+               module_enabled=None, module_key=None, stale_key=None, machine_status='configured',
+               installation_status=None, previous_installation=False):
         with tempfile.TemporaryDirectory(prefix='pxe-preseed-review-') as tmp:
             data = Path(tmp)
             connection = sqlite3.connect(data / 'pxe-tools.sqlite')
@@ -23,9 +24,14 @@ class PreseedInvariants(unittest.TestCase):
                 connection.execute("INSERT INTO settings(key,value) VALUES ('ansible_enabled',?)", (module_enabled,))
             if module_key is not None:
                 connection.execute("INSERT INTO settings(key,value) VALUES ('ansible_ssh_pubkey',?)", (module_key,))
-            connection.execute("INSERT INTO machines(mac,status,install_config_json,inventory_json) VALUES (?,?,?,?)", ('02:00:00:00:00:01','configured',json.dumps(config), None if inventory is None else json.dumps(inventory)))
+            connection.execute("INSERT INTO machines(mac,status,install_config_json,inventory_json) VALUES (?,?,?,?)", ('02:00:00:00:00:01',machine_status,json.dumps(config), None if inventory is None else json.dumps(inventory)))
+            if previous_installation:
+                connection.execute("INSERT INTO actions(id,machine_id,type,status,token,created_by) VALUES (6,1,'install_only','success',?,'test')", ('e' * 64,))
+                connection.execute("INSERT INTO installations(machine_id,install_status,action_id) VALUES (1,'success',6)")
             if running_action_token:
                 connection.execute("INSERT INTO actions(id,machine_id,type,status,token,created_by) VALUES (7,1,'install_only','running',?,'test')", (running_action_token,))
+            if installation_status is not None:
+                connection.execute("INSERT INTO installations(machine_id,install_status,action_id) VALUES (1,?,?)", (installation_status, 7 if running_action_token else None))
             connection.commit()
             connection.close()
             (data / 'preseed-base.cfg').write_text(template or '{{BOOTLOADER_BLOCK}}\n{{NETWORK_BLOCK}}\n{{PACKAGES_BLOCK}}\n{{ACCOUNTS_BLOCK}}\n{{PARTITION_BLOCK}}\n{{ADMIN_USER_BLOCK}}\n{{EARLY_COMMAND_BLOCK}}\n')
@@ -90,6 +96,23 @@ if [ "$n" -le "$FAILURES" ]; then exit "$CODE"; fi
         self.assertIn('/api/install-end?mac=', output)
         without_action = self.render({'distro': 'debian'})
         self.assertNotIn('/api/install-end?mac=', without_action)
+
+    def test_preseed_closes_after_install_and_reopens_for_new_action(self):
+        config = {'distro': 'debian'}
+        token = 'a' * 64
+        self.assertIn('d-i ', self.render(config, running_action_token=token,
+                                         installation_status='in_progress'))
+        for state in ('success', 'failed', 'aborted'):
+            with self.subTest(state=state):
+                self.assertEqual(self.render(config, running_action_token=token,
+                                             installation_status=state,
+                                             expected_status=404), '')
+        self.assertEqual(self.render(config, machine_status='installed',
+                                     previous_installation=True, expected_status=404), '')
+        self.assertEqual(self.render(config, machine_status='configured',
+                                     previous_installation=True, expected_status=404), '')
+        self.assertIn('d-i ', self.render(config, running_action_token=token,
+                                         previous_installation=True))
 
     def test_signed_boot_packages_are_added_only_for_debian_uefi_amd64(self):
         config = {'distro': 'debian', 'codename': 'trixie',

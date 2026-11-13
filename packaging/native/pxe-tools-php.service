@@ -7,5 +7,6 @@ Type=simple
 RuntimeDirectory=pxe-tools-php
 UMask=0077
 EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+EnvironmentFile=-/var/lib/pxe-tools-native/runtime.env
 ExecStart=/bin/sh /usr/lib/pxe-tools/native/start-php-fpm.sh
 Restart=on-failure

@@ -2,11 +2,13 @@
 import hashlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 path = Path(__file__).resolve().parents[2] / 'docker/worker/scripts/prepare-debian-shim.py'
@@ -16,6 +18,53 @@ spec.loader.exec_module(shim)
 
 
 class DebianShimAcquisition(unittest.TestCase):
+    def test_staging_name_cannot_follow_existing_link(self):
+        with tempfile.TemporaryDirectory(prefix='pxe-stage-unit-') as temporary:
+            root = Path(temporary)
+            witness = root / 'witness'
+            witness.write_bytes(b'original')
+            (root / ('.pxe-shim-' + '0' * 32)).symlink_to(witness)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(shim.secrets, 'token_hex', return_value='0' * 32):
+                    with self.assertRaises(OSError):
+                        shim.write_staged(fd, b'changed')
+            finally:
+                os.close(fd)
+            self.assertEqual(witness.read_bytes(), b'original')
+
+    def test_publication_rolls_back_second_rename_failure_and_sets_mode(self):
+        with tempfile.TemporaryDirectory(prefix='pxe-shim-publish-') as temporary:
+            root = Path(temporary)
+            for name in ('mmx64.efi', 'grubnetx64.efi'):
+                (root / name).write_bytes(b'old-' + name.encode())
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, fd)
+            original_replace = os.replace
+            calls = []
+            def fail_second(*args, **kwargs):
+                calls.append(args)
+                if len(calls) == 2:
+                    raise OSError('fixture interrupted second rename')
+                return original_replace(*args, **kwargs)
+            with mock.patch.object(shim, 'previous_target',
+                                   side_effect=lambda d, name: (root / name).read_bytes()), \
+                    mock.patch.object(shim.os, 'replace', side_effect=fail_second):
+                with self.assertRaises(OSError):
+                    shim.publish_pair(fd, b'MZ new shim', b'MZ new mok')
+            for name in ('mmx64.efi', 'grubnetx64.efi'):
+                self.assertEqual((root / name).read_bytes(), b'old-' + name.encode())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['grubnetx64.efi', 'mmx64.efi'])
+            old_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(shim, 'previous_target',
+                                       side_effect=lambda d, name: (root / name).read_bytes()):
+                    shim.publish_pair(fd, b'MZ new shim', b'MZ new mok')
+            finally:
+                os.umask(old_umask)
+            for name in ('mmx64.efi', 'grubnetx64.efi'):
+                self.assertEqual((root / name).stat().st_mode & 0o777, 0o644)
+
     def test_extraction_reads_only_one_regular_bounded_exact_member(self):
         def extract(entries):
             archive = io.BytesIO()
@@ -65,6 +114,19 @@ class DebianShimAcquisition(unittest.TestCase):
     def test_fail_closed_preserves_installed_pair_until_all_checks_succeed(self):
         with tempfile.TemporaryDirectory(prefix='pxe-shim-unit-') as temp:
             root = Path(temp); dest = root / 'tftp'; dest.mkdir()
+            @contextmanager
+            def fixture_lock(directory):
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    yield fd
+                finally:
+                    os.close(fd)
+            lock_patch = mock.patch.object(shim, 'locked_destination', side_effect=fixture_lock)
+            target_patch = mock.patch.object(shim, 'previous_target',
+                                             side_effect=lambda fd, name: (dest / name).read_bytes()
+                                             if (dest / name).exists() else None)
+            lock_patch.start(); self.addCleanup(lock_patch.stop)
+            target_patch.start(); self.addCleanup(target_patch.stop)
             key = root / 'archive.gpg'; key.write_bytes(b'fixture')
             for name in ('grubnetx64.efi', 'mmx64.efi'):
                 (dest / name).write_bytes(b'previous-' + name.encode())

@@ -11,6 +11,11 @@ set -euo pipefail
 : "${BOOTSTRAP_SCRIPTS_DIR:=/opt/pxe-tools/bootstrap}"
 : "${REBUILD:=0}"
 
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" tftp "$TFTP_ROOT"
+    python3 "$BOOTSTRAP_SCRIPTS_DIR/validate-native-runtime.py" mok "$MOK_DIR"
+fi
+
 # PXE_IP : IP du serveur PXE Tools (anciennement ORCHESTRATOR_IP). Settings DB en
 # priorité (posée par le wizard /init/network), fallback env legacy. Aligné sur
 # render-dnsmasq-conf.sh et render_template.py. Sans cette source, on fail proprement.

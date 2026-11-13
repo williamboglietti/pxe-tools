@@ -8,6 +8,9 @@ set -euo pipefail
 
 : "${TFTP_ROOT:=/srv/tftp}"
 
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+    python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" tftp "$TFTP_ROOT"
+fi
 mkdir -p "$TFTP_ROOT" "$TFTP_ROOT/pxelinux.cfg"
 
 copy_if_changed() {

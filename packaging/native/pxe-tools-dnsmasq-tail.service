@@ -5,5 +5,6 @@ After=pxe-tools-dnsmasq.service pxe-tools-nginx.service
 [Service]
 Type=simple
 EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+EnvironmentFile=-/var/lib/pxe-tools-native/runtime.env
 ExecStart=/bin/sh /opt/pxe-tools/native/dnsmasq-tail.sh
 Restart=on-failure

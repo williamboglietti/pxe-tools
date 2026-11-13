@@ -7,6 +7,7 @@ After=pxe-tools-init.service pxe-tools-pxe-http.service
 Type=simple
 EnvironmentFile=/usr/lib/pxe-tools/native/default.env
 EnvironmentFile=-/etc/pxe-tools/network.env
+EnvironmentFile=-/var/lib/pxe-tools-native/runtime.env
 ExecStartPre=/bin/sh /opt/pxe-tools/init/render-dnsmasq-conf.sh
 ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/pxe-tools/dnsmasq.conf
 Restart=on-failure

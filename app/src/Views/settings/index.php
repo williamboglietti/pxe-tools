@@ -154,7 +154,7 @@ $dnsRowHtml = function ($val): string {
       Génère un nouveau keypair RSA 2048-bit et reconstruit le GRUB EFI signé.
       <strong>Toutes les machines déjà enrôlées en Secure Boot devront ré-enrôler la nouvelle clé</strong>
       via <code>mokutil --import http://&lt;IP&gt;/MOK.der</code> avant leur prochain PXE boot.
-      L'ancien keypair est sauvegardé dans <code>/etc/pxe-tools/mok/backup-&lt;timestamp&gt;/</code>.
+      L'ancienne paire de clés est conservée dans un sous-répertoire <code>backup-&lt;timestamp&gt;</code> du répertoire MOK de l'instance.
     </p>
     <form method="post" action="/settings/regenerate-mok"
           onsubmit="return confirm('Régénérer la clé MOK ? Les machines en Secure Boot devront ré-enrôler la nouvelle clé.');">

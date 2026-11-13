@@ -52,6 +52,31 @@ SQLite est la seule base prise en charge. Une configuration MySQL/MariaDB
 existante est refusée avant connexion ; elle et ses données sont conservées,
 sans migration automatique vers SQLite.
 
+### Chemins natifs protégés et instances existantes
+
+Sur une nouvelle installation, le TFTP se trouve dans
+`/var/lib/pxe-tools-tftp`, les fichiers HTTP dans `/var/lib/pxe-tools-http`,
+les rendus dans `/var/lib/pxe-tools-native/rendered` et la MOK dans
+`/var/lib/pxe-tools-native/mok`.
+Le fichier root `/var/lib/pxe-tools-native/runtime.env` transmet ces chemins
+aux unités systemd. Le programme de préparation refuse tout chemin existant :
+aucune donnée n'est remplacée, déplacée ou supprimée automatiquement.
+
+Une instance héritée sans ce marqueur conserve ses anciens chemins. Si ses
+répertoires TFTP, HTTP, de rendus ou MOK, ou leurs parents, sont modifiables par
+le service web, l'initialisation et les tâches natives refusent les écritures
+privilégiées jusqu'à leur migration explicite.
+Une migration demande une fenêtre d'arrêt et une sauvegarde chiffrée vérifiée
+selon [la procédure de restauration](backup-restore.md). Restaurez une copie
+dans les nouveaux emplacements protégés, sans écraser les anciens ; confirmez
+la correspondance clé privée/certificat et l'empreinte de la MOK avec une
+référence administrateur indépendante ou les clients déjà enrôlés. L'ancien
+parent étant modifiable par le service web, sa seule présence n'établit pas
+l'authenticité de sa MOK. Vérifiez les données restaurées et gardez les chemins
+d'origine pour le retour arrière ; ne réactivez le PXE qu'après confirmation
+explicite. Ne régénérez pas la MOK pour cette migration : les clients devraient
+alors être réenrôlés.
+
 ## Proxy inverse
 
 Le contrôle d'origine des formulaires accepte `X-Forwarded-Host` uniquement

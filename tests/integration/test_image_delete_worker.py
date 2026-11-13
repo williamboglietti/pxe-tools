@@ -34,7 +34,8 @@ with tempfile.TemporaryDirectory(prefix='pxe-delete-fixture-', dir='/var/lib') a
     account=pwd.getpwnam('www-data')
     database.chmod(0o660); os.chown(database,account.pw_uid,account.pw_gid)
     os.environ.update(PXE_APP_DIR=str(ROOT/'app'), PXE_DB_PATH=str(database),
-                      PXE_DB_DRIVER='sqlite', HTTP_ROOT=str(http), PXE_HTTP_ROOT=str(http))
+                      PXE_DB_DRIVER='sqlite', HTTP_ROOT=str(http), PXE_HTTP_ROOT=str(http),
+                      PXE_SERVICE_MANAGER='systemd')
     sys.path.insert(0, str(ROOT/'app'))
     spec = importlib.util.spec_from_file_location('worker_delete_test', ROOT/'app/worker.py')
     worker = importlib.util.module_from_spec(spec); spec.loader.exec_module(worker)

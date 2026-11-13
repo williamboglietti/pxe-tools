@@ -70,6 +70,7 @@ echo '::endgroup::'
 
 echo '::group::Protected image deletion and crash recovery'
 PXE_IMAGE_DELETE_TEST=1 python3 tests/integration/test_image_delete_worker.py
+PXE_DOCKER_HTTP_TEST=1 python3 tests/integration/test_docker_http_tree.py
 echo '::endgroup::'
 
 echo '::group::Concurrent installation log append'

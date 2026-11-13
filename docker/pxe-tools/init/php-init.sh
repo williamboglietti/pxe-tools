@@ -18,6 +18,13 @@ set -eu
 
 DB_CONF="/etc/pxe-tools/db.conf"
 : "${PXE_APP_DIR:=/app}"
+# A Docker volume keeps its old ownership across image upgrades. Native
+# systemd uses a different protected HTTP root and must retain its own guard.
+case "${PXE_SERVICE_MANAGER:-}" in
+    s6) python3 "$PXE_APP_DIR/image_delete.py" --verify-docker-http-tree ;;
+    systemd) ;;
+    *) echo '[php-init] ERREUR : superviseur non pris en charge.' >&2; exit 1 ;;
+esac
 SCHEMA_SQLITE="$PXE_APP_DIR/db/schema.sqlite.sql"
 MIGRATE_PHP="$PXE_APP_DIR/db/migrate.php"
 # Path par défaut SQLite. Priorité : env PXE_DB_PATH > env ORCHESTRATOR_DB (legacy

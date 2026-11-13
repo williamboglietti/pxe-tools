@@ -28,6 +28,7 @@ def run_init(temp_root: Path) -> subprocess.CompletedProcess[str]:
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
         "HOME": str(temp_root),
         "LC_ALL": "C",
+        "PXE_SERVICE_MANAGER": "systemd",
     }
     return subprocess.run(
         ["/bin/sh", str(target)],

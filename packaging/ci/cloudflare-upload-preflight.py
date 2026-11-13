@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-only
-"""Upload a harmless Worker version without changing a deployment or a route."""
+"""Upload an inert version without deploying it.
+
+The fixture contains no data even if a version URL is reachable. Comparing the
+public response is an availability check, not proof of the domain binding;
+verify that binding separately with administrator-level read access.
+"""
 from __future__ import annotations
 import json
+import hashlib
+import urllib.error
 import os
 import re
 import secrets
@@ -48,14 +55,26 @@ def observe(account: str, token: str) -> dict:
     current = max(deploy, key=lambda item: item['created_on'])
     if not isinstance(current.get('versions'), list) or not current['versions']:
         raise ValueError('Current deployment has no traffic versions')
-    domains = call(account, token, f'domains?hostname={HOST}&service={WORKER}')
-    if not isinstance(domains, list) or len(domains) != 1:
-        raise ValueError('Cannot verify the dedicated domain binding')
-    domain = domains[0]
-    if (domain.get('hostname') != HOST or domain.get('service') != WORKER
-            or domain.get('enabled') is not True or domain.get('previews_enabled') is not False):
-        raise ValueError('Dedicated domain or preview routing is not in the expected state')
-    return {'subdomain': subdomain, 'deployment': current, 'domain': domain}
+    return {'subdomain': subdomain, 'deployment': current}
+
+
+def observe_public_domain() -> tuple[int, str]:
+    request = urllib.request.Request('https://packages.pxetools.com/apt/dists/stable/InRelease',
+                                     headers={'User-Agent': 'curl/8.14.1', 'Cache-Control': 'no-cache'})
+    try:
+        try:
+            response = urllib.request.urlopen(request, timeout=20)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        with response:
+            data = response.read(1024 * 1024 + 1)
+            code = response.status
+        if len(data) > 1024 * 1024 or code not in (200, 404):
+            raise ValueError('unexpected public response')
+        return code, hashlib.sha256(data).hexdigest()
+    except Exception:
+        raise ValueError('Cannot verify the public domain response') from None
+
 
 
 def multipart() -> tuple[bytes, str]:
@@ -72,6 +91,7 @@ def check(account: str, token: str) -> None:
     if not re.fullmatch(r'[0-9a-f]{32}', account) or not token:
         raise ValueError('Cloudflare credentials are missing or invalid')
     before = observe(account, token)
+    public_before = observe_public_domain()
     body, content_type = multipart()
     try:
         uploaded = call(account, token, f'scripts/{WORKER}/versions', body, content_type)
@@ -79,9 +99,10 @@ def check(account: str, token: str) -> None:
             raise ValueError('Version upload response lacks a version ID')
     finally:
         after = observe(account, token)
-        if before != after:
-            raise ValueError('Worker deployment or domain changed during upload; investigate')
-    print('An inert version was uploaded; current deployment and domain are unchanged.')
+        public_after = observe_public_domain()
+        if before != after or public_before != public_after:
+            raise ValueError('Worker deployment or public response changed during upload; investigate')
+    print('An inert version was uploaded; deployment and public response match before and after.')
 
 
 if __name__ == '__main__':

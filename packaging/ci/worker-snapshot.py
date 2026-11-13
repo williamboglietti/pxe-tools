@@ -56,7 +56,12 @@ def recover(destination: Path, bootstrap: bool) -> None:
         if bootstrap and not assets:
             return
         raise ValueError('live InRelease is missing while prior snapshots exist')
-    for asset in reversed(assets):
+    # Never fall back to an older matching public response: an edge cache or
+    # propagation delay could otherwise silently discard a later deployment.
+    # A failed deploy after snapshot upload requires operator investigation.
+    assets.sort(key=lambda item: tuple(map(int, re.fullmatch(
+        r'snapshot-([0-9]+)-([0-9]+)\.tar\.gz', item['name']).groups())), reverse=True)
+    for asset in assets[:1]:
         size = asset.get('size', 0)
         if not isinstance(size, int) or size <= 0 or size > MAX_SNAPSHOT:
             raise ValueError('snapshot asset size is invalid')

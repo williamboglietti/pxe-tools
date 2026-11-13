@@ -29,12 +29,16 @@ antérieur. Le cron renouvelle ensuite les mêmes octets tous les deux jours.
 
 Chaque publication conserve au préalable un snapshot signé dans la release
 `apt-snapshots`. Au renouvellement, la CI retrouve le snapshot correspondant
-exactement à `InRelease` public, valide sa signature, conserve ses paquets et
+le plus récent et exige sa correspondance exacte avec `InRelease` public ; elle
+valide sa signature, conserve ses paquets et
 index by-hash SHA256 et SHA512 et interdit de réutiliser une version avec des
 octets différents. Ne pas supprimer ces assets : ils sont nécessaires au
 renouvellement et à la conservation des liens clients. Un run concurrent est
 sérialisé ; les déploiements effectués hors CI ne le sont pas et peuvent bloquer
-la reprise. Surveiller les échecs et agir avant l'expiration de l'index.
+la reprise. Après un échec entre la sauvegarde et le déploiement, la CI refuse
+de revenir automatiquement à un snapshot plus ancien : vérifier l'état effectif
+du Worker avant toute intervention sur la release. Surveiller les échecs et agir
+avant l'expiration de l'index.
 
 Le déploiement associe la nouvelle version du Worker à ses assets. La propagation
 mondiale n'est pas instantanée ; l'ancienne et la nouvelle version peuvent

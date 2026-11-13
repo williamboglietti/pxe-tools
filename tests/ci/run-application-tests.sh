@@ -43,3 +43,7 @@ echo '::endgroup::'
 echo '::group::Native PXE HTTP interface binding'
 python3 tests/unit/test_native_pxe_http_bind.py
 echo '::endgroup::'
+
+echo '::group::Concurrent installation log append'
+PXE_INSTALL_LOG_ISOLATED=1 python3 tests/integration/test_install_log_concurrency.py
+echo '::endgroup::'

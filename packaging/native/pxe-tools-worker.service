@@ -5,6 +5,7 @@ After=pxe-tools-nginx.service
 [Service]
 Type=simple
 EnvironmentFile=/usr/lib/pxe-tools/native/default.env
+EnvironmentFile=-/etc/pxe-tools/network.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /usr/lib/pxe-tools/app/worker.py
 Restart=on-failure

@@ -126,7 +126,7 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
             shutil.copy2(ROOT/name, docs/name)
         copy_tree(ROOT/'third_party/licenses', docs/'licenses')
         native=root/'usr/lib/pxe-tools/native'; native.mkdir(parents=True)
-        for name in ('default.env','init.sh','start-php-fpm.sh','php-fpm.conf','nginx.conf','pxe-nginx.conf'):
+        for name in ('default.env','init.sh','start-php-fpm.sh','php-fpm.conf','nginx.conf','pxe-nginx.conf','render-pxe-http.py'):
             shutil.copy2(ROOT/'packaging/native'/name, native/name)
         units=root/'usr/lib/systemd/system'; units.mkdir(parents=True)
         for unit in (sorted((ROOT/'packaging/native').glob('pxe-tools.*'))
@@ -142,6 +142,8 @@ def build(destination: Path, version: str, *, package_name: str = 'pxe-tools-loc
             data=data.replace('include fastcgi_params;', 'include /etc/nginx/fastcgi_params;')
             (templates/name).write_text(data)
         pxe=(ROOT/'docker/pxe-tools/nginx/pxe.conf').read_text()
+        pxe=replace_exact(pxe,'listen 80 default_server;', 'listen @@PXE_IPV4@@:80 default_server;\n    listen 127.0.0.1:80;')
+        pxe=replace_exact(pxe,'    listen [::]:80 default_server;\n', '')
         pxe=replace_exact(pxe,'/app/public','/usr/lib/pxe-tools/app/public')
         pxe=replace_exact(pxe,'/srv/http','/var/lib/pxe-tools/http')
         pxe=replace_exact(pxe,'/run/php/php8.4-fpm.sock','/run/pxe-tools-php/fpm.sock')

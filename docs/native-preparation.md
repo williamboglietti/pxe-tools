@@ -90,3 +90,28 @@ métadonnées stables, la récupération de l'image échouera jusqu'à leur mise
 jour ou à une évolution réfléchie de cette politique. Ce contrôle réduit la
 fenêtre de rejeu sans garantir qu'une métadonnée signée encore acceptée
 correspond à la toute dernière version disponible.
+
+
+Le service HTTP PXE natif écoute uniquement sur l’adresse IPv4 `pxe_ip`
+configurée pour l’interface PXE, ainsi que sur `127.0.0.1` pour les rappels
+locaux de l’installation. Avant le démarrage, il vérifie que cette
+adresse est effectivement présente sur l’interface, avec une attente maximale
+de 30 secondes ; sinon, le démarrage refuse d’exposer les fichiers et le service DHCP/TFTP reste arrêté. Après
+tout changement de réseau, appliquer la configuration via l’interface pour
+recréer l’écoute. Un autre service lié à toutes les adresses sur le port 80
+peut empêcher le démarrage : inspecter le conflit et le résoudre explicitement.
+La liaison à une adresse ne filtre pas l’interface d’arrivée : un client d’un
+autre réseau peut joindre cette adresse si elle est routée. Si l’adresse est
+déplacée après le démarrage, le service ne le détecte pas automatiquement.
+Utilisez un pare-feu restrictif et réappliquez la configuration après tout
+changement réseau pour maintenir l’isolation souhaitée.
+
+Pour une configuration héritée sans clés `pxe_interface` ou `pxe_ip` dans
+SQLite, les trois services natifs HTTP PXE, dnsmasq et worker lisent également
+le fichier optionnel `/etc/pxe-tools/network.env`. Il peut contenir par exemple
+`PXE_INTERFACE=eth1` et `PXE_IP=192.0.2.1` ; l’ancien nom `ORCHESTRATOR_IP`
+reste accepté pour l’adresse. Une clé présente dans SQLite, même vide, prime
+sur cet environnement. Un ancien override systemd attaché à un seul service
+n’est pas transmis automatiquement aux autres : reporter ses valeurs réseau
+dans ce fichier commun. Sans valeurs cohérentes le service HTTP refuse de
+démarrer.

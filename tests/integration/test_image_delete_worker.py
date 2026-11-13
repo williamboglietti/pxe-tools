@@ -153,6 +153,24 @@ w.run_bootstrap_job(job)
     worker.reap_running_zombies(); assert state(number)=='pending'
     run(number); assert state(number)=='success' and not list(path.glob('*.pxe-delete-*'))
 
+    # Stop the actual worker after SQLite has committed but before cleanup.
+    # The test-only barrier makes the otherwise very short interval observable.
+    path=image(11); number=queue(11); barrier=root/'after-commit'
+    postcommit_child=child.replace(
+        'w.run_bootstrap_job(job)',
+        "import time\ndef pause_before_cleanup(*args):\n Path(sys.argv[6]).touch()\n time.sleep(60)\nw.cleanup_committed=pause_before_cleanup\nw.run_bootstrap_job(job)")
+    process=subprocess.Popen([sys.executable,'-c',postcommit_child,str(ROOT),str(http),str(database),str(marker),str(number),str(barrier)],
+                             env=os.environ.copy(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not barrier.exists() and process.poll() is None:
+        time.sleep(.001)
+    assert barrier.exists() and process.poll() is None, 'could not observe committed deletion before cleanup'
+    os.killpg(process.pid, 9); process.wait(timeout=10)
+    assert not sql('SELECT id FROM os_images WHERE id=11')
+    assert len(list(path.glob(f'*.pxe-delete-{number}'))) == 3
+    worker.reap_running_zombies(); assert state(number)=='pending'
+    run(number); assert state(number)=='success' and not list(path.glob('*.pxe-delete-*'))
+
     # The unprivileged child uses the parent's selected SQLite path even if
     # the historical web-writable configuration changes before it starts.
     path=image(9); number=queue(9)

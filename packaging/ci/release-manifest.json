@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0~beta1",
+  "release_tag": "v0.1.0-beta1",
+  "source_commit": "8581eb48b639f9f34c84499d8475cddfd59b16ef",
+  "build_run_id": "43348575569",
+  "package_asset": "pxe-tools_0.1.0-beta1_amd64.deb",
+  "package_sha256": "5521ad38a8c888ba018b395d40e1d0deccc4c47482c5464919896cf2d75306f7"
+}

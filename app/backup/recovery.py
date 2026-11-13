@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 from .openpgp import BackupError, MAX_ARCHIVE, MAX_PLAINTEXT, _decrypt_bounded, _gpg_home, _publish, encrypt_file
 from .assets import (MAX_ASSET_BYTES, MAX_ASSET_ENTRIES, TREE_CATEGORIES, add_tree,
-                     inspect_tree, safe_asset_name, safe_link_target)
+                     inspect_tree, safe_asset_name)
 
 MAX_DB = 512 * 1024 * 1024
 MANIFEST = {'format': 'pxe-tools-offline-recovery', 'version': 1,
@@ -322,11 +322,6 @@ def _unpack_authenticated(plain: Path, root: Path) -> tuple[list[str], dict, dic
                         raise BackupError('invalid asset directory')
                     target.mkdir(mode=0o700)
                     directories[member.name] = member.mode
-                elif member.issym():
-                    if len(parts) == 1 or member.size != 0:
-                        raise BackupError('invalid asset symbolic link')
-                    safe_link_target(member.name, member.linkname)
-                    links[member.name] = member.linkname
                 elif member.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
                     if len(parts) == 1:
                         raise BackupError('asset root must be a directory')
@@ -392,7 +387,7 @@ def _unpack_authenticated(plain: Path, root: Path) -> tuple[list[str], dict, dic
             directories, files, links)
 
 
-def _prepare_standby(database: Path) -> None:
+def _prepare_standby(database: Path, *, has_http: bool) -> None:
     """Make the authenticated copy inert before publishing it to the operator.
 
     The original archive stays unchanged. Unknown schemas or missing columns
@@ -403,10 +398,18 @@ def _prepare_standby(database: Path) -> None:
         "INSERT OR IGNORE INTO settings(key,value) VALUES('wizard_completed','0')",
         "UPDATE settings SET value='off' WHERE key='dhcp_proxy_enabled'",
         "INSERT OR IGNORE INTO settings(key,value) VALUES('dhcp_proxy_enabled','off')",
+        "UPDATE settings SET value='off' WHERE key='ansible_enabled'",
+        "INSERT OR IGNORE INTO settings(key,value) VALUES('ansible_enabled','off')",
+        "UPDATE settings SET value='off' WHERE key='ansible_repo_webhook_enabled'",
+        "INSERT OR IGNORE INTO settings(key,value) VALUES('ansible_repo_webhook_enabled','off')",
         "UPDATE actions SET token=lower(hex(randomblob(32)))",
         "UPDATE boot_sessions SET token=lower(hex(randomblob(32)))",
         "UPDATE actions SET status='aborted', ended_at=CURRENT_TIMESTAMP WHERE status NOT IN ('success','failed','cancelled','aborted') OR status IS NULL",
         "UPDATE init_jobs SET status='failed', message='Interrupted by standby restore' WHERE status NOT IN ('success','failed','skipped','cancelled','aborted') OR status IS NULL",
+        # The worker can automatically retry the latest failed GitHub push or
+        # delete after Ansible is enabled again. Add a terminal sentinel for
+        # each such job type, retaining the original failure and its log.
+        "INSERT INTO init_jobs(job_type,status,message,ended_at) SELECT j.job_type,'cancelled','Retry blocked by standby restore',CURRENT_TIMESTAMP FROM init_jobs AS j WHERE j.status='failed' AND (j.job_type LIKE 'preset:push_github:%' OR j.job_type LIKE 'preset:delete_github:%') AND j.id=(SELECT MAX(id) FROM init_jobs WHERE job_type=j.job_type)",
         "UPDATE installations SET install_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE install_status NOT IN ('success','failed','aborted','cancelled') OR install_status IS NULL",
         "UPDATE installations SET ansible_status='aborted' WHERE ansible_status IS NOT NULL AND ansible_status NOT IN ('success','failed','aborted','cancelled','no_role','skipped')",
         "UPDATE wipes SET wipe_status='aborted', ended_at=CURRENT_TIMESTAMP WHERE wipe_status NOT IN ('success','failed','aborted','cancelled') OR wipe_status IS NULL",
@@ -422,6 +425,10 @@ def _prepare_standby(database: Path) -> None:
         with db:
             for statement in updates:
                 db.execute(statement)
+            if not has_http:
+                # Metadata alone must not advertise images whose HTTP files
+                # were not selected for this restore.
+                db.execute("UPDATE os_images SET enabled=0, status='failed', error_msg='HTTP files were not included in the restore'")
         if db.execute('PRAGMA integrity_check').fetchone() != ('ok',) or db.execute('PRAGMA foreign_key_check').fetchone() is not None:
             raise BackupError('standby database integrity check failed')
 
@@ -443,7 +450,7 @@ def restore_recovery(archive: Path, destination: Path, passphrase: bytes) -> Non
                     os.chmod(plain, 0o600)
                     _decrypt_bounded(source, output, passphrase, home)
                 names, directories, files, links = _unpack_authenticated(plain, root)
-                _prepare_standby(root/'database.sqlite')
+                _prepare_standby(root/'database.sqlite', has_http='http' in directories)
                 # Exclusive directory creation cannot replace an existing path.
                 # A crash after this point can leave a partial private directory.
                 destination.mkdir(mode=0o700)

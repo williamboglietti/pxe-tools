@@ -48,8 +48,10 @@ et non modifiable par d'autres. La correspondance entre la base, sa clé et le
 fichier de configuration reste à confirmer par l'administrateur. Sans MOK
 restaurée, les clients Secure Boot déjà enrôlés peuvent nécessiter un nouvel
 enrôlement. Le lien natif prédéfini `http/static-bin` est exclu : le paquet le
-recrée au démarrage. Les liens absolus ou sortants des autres arborescences,
-les fichiers spéciaux et les permissions spéciales sont refusés.
+recrée au démarrage. Tous les autres liens symboliques, les fichiers spéciaux et les permissions
+spéciales sont refusés, à l’export comme à la restauration. Une ancienne archive
+contenant de tels liens ne peut pas être restaurée par cette version ; conservez
+la source et examinez ces liens avant une nouvelle sauvegarde.
 
 Pour inclure les données du complément Ansible natif, ajouter explicitement
 `--ansible-root /var/lib/pxe-tools-ansible --include-ansible`. Cette sélection
@@ -94,8 +96,15 @@ Le chemin d'entrée désigne la copie de l'archive transférée sur cette machin
 La restauration vérifie son authentification et l'intégrité SQLite avant de
 publier le répertoire. Elle révoque les jetons d'actions et de sessions de boot,
 interrompt les opérations en attente, désactive le DHCP proxy et impose une
-nouvelle confirmation de l'assistant réseau. Elle ne modifie pas l'archive, ne
+nouvelle confirmation de l'assistant réseau. Elle désactive également Ansible
+et son webhook en conservant l'URL du dépôt pour une éventuelle réactivation explicite. Elle
+empêche aussi la relance automatique des anciennes publications GitHub en
+échec, dont les journaux restent conservés. Elle
+ne modifie pas l'archive, ne
 remplace pas un chemin existant et ne démarre aucun service.
+Si les fichiers HTTP n'ont pas été sélectionnés, les images enregistrées sont
+désactivées et marquées en échec pour éviter d'annoncer des fichiers absents ;
+elles doivent être vérifiées et retéléchargées avant utilisation.
 
 Vérifiez le manifeste et les fichiers sélectionnés dans `standby`. Pour les
 chemins natifs par défaut, et uniquement si les deux répertoires créés ci-dessus

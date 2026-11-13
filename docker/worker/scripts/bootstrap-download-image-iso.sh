@@ -60,12 +60,14 @@ fi
 
 label="$distro $version_full $arch"
 dest_dir="$HTTP_ROOT/netboot/$distro/$version_full/$arch"
-iso_path="$dest_dir/.tmp.iso"
 if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
     python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$distro/$version_full/$arch"
-else
-    mkdir -p "$dest_dir"
 fi
+stage_dir=$(mktemp -d /var/tmp/pxe-image.XXXXXXXX)
+trap 'rm -rf -- "$stage_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+iso_path="$stage_dir/.tmp.iso"
+publisher="$(dirname "${BASH_SOURCE[0]}")/publish-verified-image.py"
 
 echo "[download-image-iso] ▶ id=$IMAGE_ID $label"
 echo "[download-image-iso]   iso_url=$iso_url"
@@ -144,8 +146,7 @@ echo "[download-image-iso]   taille upstream : $(human_size "$iso_size")"
 # 2. Download avec progress live (50% du job)
 # ------------------------------------------------------------------------
 publish "$label · téléchargement…" 2
-rm -f "$iso_path"
-wget -c -L --tries=3 --timeout=60 -q -O "$iso_path" "$iso_url" &
+wget -L --tries=3 --timeout=60 -q -O "$iso_path" "$iso_url" &
 wget_pid=$!
 
 while kill -0 "$wget_pid" 2>/dev/null; do
@@ -209,7 +210,7 @@ publish "$label · extraction du système depuis l'image téléchargée…" 55
 # en tâche de fond et on republie le même message toutes les 5s pour garder
 # updated_at frais (même pattern que le monitoring wget ci-dessus).
 # ------------------------------------------------------------------------
-extract_tmp=$(mktemp -d)
+extract_tmp=$(mktemp -d "$stage_dir/extract.XXXXXXXX")
 7z e -y "-o$extract_tmp" "$iso_path" "$kernel_in_iso" "$initrd_in_iso" >/dev/null 2>&1 &
 extract_pid=$!
 while kill -0 "$extract_pid" 2>/dev/null; do
@@ -238,18 +239,18 @@ fi
 
 # Normalise les noms : on stocke en /srv/http/netboot/<distro>/<version_full>/<arch>/
 # avec linux + initrd.gz pour rester compatible avec render_template (legacy convention).
-mv "$extracted_kernel" "$dest_dir/linux"
+mv "$extracted_kernel" "$stage_dir/linux"
 # initrd.gz pour debian (déjà .gz). Pour ubuntu (casper/initrd non-.gz), on
 # renomme en initrd.gz quand même pour conserver une convention unique côté
 # templates GRUB. Le contenu est gzip-compressé dans les 2 cas.
-mv "$extracted_initrd" "$dest_dir/initrd.gz"
+mv "$extracted_initrd" "$stage_dir/initrd.gz"
 rm -rf "$extract_tmp"
 
 # Explique le "saut" de taille avant qu'il ne soit visible : l'espace conservé
 # (noyau + initrd) est bien plus petit que l'ISO complète — normal, seuls ces
 # deux fichiers servent au démarrage réseau, le reste de l'ISO (paquets,
 # installeur graphique, etc.) est inutile ici et n'a jamais été conservé.
-extracted_size=$(( $(stat -c%s "$dest_dir/linux" 2>/dev/null || echo 0) + $(stat -c%s "$dest_dir/initrd.gz" 2>/dev/null || echo 0) ))
+extracted_size=$(( $(stat -c%s "$stage_dir/linux" 2>/dev/null || echo 0) + $(stat -c%s "$stage_dir/initrd.gz" 2>/dev/null || echo 0) ))
 publish "$label · système extrait ($(human_size "$extracted_size")) — l'image téléchargée ($(human_size "$iso_real_size")) va être supprimée, seuls le noyau et le système minimal sont conservés" 88
 
 # ------------------------------------------------------------------------
@@ -259,19 +260,19 @@ publish "$label · système extrait ($(human_size "$extracted_size")) — l'imag
 # ------------------------------------------------------------------------
 if [ -n "${firmware_url:-}" ]; then
     publish "$label · téléchargement des pilotes réseau…" 90
-    if wget -q --tries=3 --timeout=60 -O "$dest_dir/firmware.cpio.gz" "$firmware_url"; then
+    if wget -q --tries=3 --timeout=60 -O "$stage_dir/firmware.cpio.gz" "$firmware_url"; then
         # F-05 : le firmware est un 2e initrd chargé au boot → un cpio trafiqué =
         # exécution de code en initramfs. Vérif obligatoire ; échec = fatal.
-        if verify_firmware "$dest_dir/firmware.cpio.gz" "$firmware_url"; then
-            echo "[download-image-iso]   ✓ firmware.cpio.gz vérifié ($(human_size "$(stat -c%s "$dest_dir/firmware.cpio.gz" 2>/dev/null || echo 0)"))"
+        if verify_firmware "$stage_dir/firmware.cpio.gz" "$firmware_url"; then
+            echo "[download-image-iso]   ✓ firmware.cpio.gz vérifié ($(human_size "$(stat -c%s "$stage_dir/firmware.cpio.gz" 2>/dev/null || echo 0)"))"
         else
-            rm -f "$dest_dir/firmware.cpio.gz" "$dest_dir/linux" "$dest_dir/initrd.gz"
             publish_error "Vérification d'intégrité du firmware échouée — image rejetée."
             echo "[download-image-iso] ✗ id=$IMAGE_ID intégrité firmware INVALIDE" >&2
             exit 1
         fi
     else
-        rm -f "$dest_dir/firmware.cpio.gz"
+        rm -f "$stage_dir/firmware.cpio.gz"
+        python3 "$publisher" --remove "$dest_dir/firmware.cpio.gz"
         echo "[download-image-iso]   ⚠ firmware injoignable ($firmware_url) — skip (non-fatal)"
     fi
 fi
@@ -287,16 +288,6 @@ fi
 #     ferait dévier le discovery vers un kernel/initrd figé (skew anna). On le
 #     réserve donc à extract_method='direct'.
 # ------------------------------------------------------------------------
-if [ -n "${codename:-}" ] && [ "$extract_method" = "direct" ]; then
-    if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
-        python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$codename"
-    else
-        mkdir -p "$HTTP_ROOT/netboot/$codename"
-    fi
-    ln -sfn "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
-    echo "[download-image-iso]   symlink netboot/$codename/$arch → ../$distro/$version_full/$arch"
-fi
-
 publish "$label · finalisation…" 95
 
 # ------------------------------------------------------------------------
@@ -304,19 +295,34 @@ publish "$label · finalisation…" 95
 # ------------------------------------------------------------------------
 keep_iso=$(sqlite3 "$PXE_DB_PATH" "SELECT value FROM settings WHERE key='keep_iso'" 2>/dev/null || echo "")
 if [ "$keep_iso" = "on" ]; then
-    mv "$iso_path" "$dest_dir/source.iso"
+    mv "$iso_path" "$stage_dir/source.iso"
+    python3 "$publisher" "$stage_dir/source.iso" "$dest_dir/source.iso"
     echo "[download-image-iso]   keep_iso=on → ISO conservée à $dest_dir/source.iso"
 else
     rm -f "$iso_path"
     echo "[download-image-iso]   cleanup ISO (.tmp.iso supprimé)"
 fi
 
+# Every published boot artifact has passed its signature and checksum checks.
+python3 "$publisher" "$stage_dir/linux" "$dest_dir/linux"
+python3 "$publisher" "$stage_dir/initrd.gz" "$dest_dir/initrd.gz"
+if [ -s "$stage_dir/firmware.cpio.gz" ]; then
+    python3 "$publisher" "$stage_dir/firmware.cpio.gz" "$dest_dir/firmware.cpio.gz"
+fi
+if [ -n "${codename:-}" ] && [ "$extract_method" = "direct" ]; then
+    if [ "${PXE_SERVICE_MANAGER:-}" = systemd ]; then
+        python3 "$(dirname "${BASH_SOURCE[0]}")/validate-native-runtime.py" http-tree "$HTTP_ROOT" "netboot/$codename"
+    fi
+    python3 "$publisher" --alias "../$distro/$version_full/$arch" "$HTTP_ROOT/netboot/$codename/$arch"
+    echo "[download-image-iso]   symlink netboot/$codename/$arch → ../$distro/$version_full/$arch"
+fi
+
 # ------------------------------------------------------------------------
 # 5. Mark downloaded + size_bytes (somme kernel+initrd+firmware, pas l'ISO)
 # ------------------------------------------------------------------------
-size=$(( $(stat -c%s "$dest_dir/linux" 2>/dev/null || echo 0) \
-      + $(stat -c%s "$dest_dir/initrd.gz" 2>/dev/null || echo 0) \
-      + $(stat -c%s "$dest_dir/firmware.cpio.gz" 2>/dev/null || echo 0) ))
+size=$(( $(stat -c%s "$stage_dir/linux" 2>/dev/null || echo 0) \
+      + $(stat -c%s "$stage_dir/initrd.gz" 2>/dev/null || echo 0) \
+      + $(stat -c%s "$stage_dir/firmware.cpio.gz" 2>/dev/null || echo 0) ))
 # Commit the completed image and a subsequent menu render together. A render
 # already running may have read the old image state, so only a pending render
 # can be reused.

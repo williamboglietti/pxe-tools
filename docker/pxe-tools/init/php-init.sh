@@ -275,9 +275,16 @@ PYTHON
 }
 DETECTED_DB=""
 EMPTY_DB_PROOF=""
+SEEN_DB=""
 for candidate in "$SQLITE_DEFAULT" "$LEGACY_SQLITE" /var/lib/pxe-tools/pxe-tools.sqlite; do
     if [ -f "$candidate" ] && [ -s "$candidate" ]; then
         if [ ! -e "$DB_CONF" ] && [ ! -L "$DB_CONF" ]; then
+            if [ "$SEEN_DB" = "$candidate" ]; then continue; fi
+            if [ -n "$SEEN_DB" ]; then
+                echo '[php-init] ERREUR : plusieurs bases détectées sans configuration ; examen requis.' >&2
+                exit 1
+            fi
+            SEEN_DB="$candidate"
             classification=$(classify_setup_db "$candidate") || exit 1
             case "$classification" in
                 empty:*)
@@ -291,7 +298,7 @@ for candidate in "$SQLITE_DEFAULT" "$LEGACY_SQLITE" /var/lib/pxe-tools/pxe-tools
             esac
         fi
         DETECTED_DB="$candidate"
-        break
+        if [ -e "$DB_CONF" ] || [ -L "$DB_CONF" ]; then break; fi
     fi
 done
 if [ ! -e "$DB_CONF" ] && [ ! -L "$DB_CONF" ] && [ -n "$DETECTED_DB" ] && \

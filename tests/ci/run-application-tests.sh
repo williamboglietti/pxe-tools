@@ -31,6 +31,7 @@ echo '::endgroup::'
 
 echo '::group::External database fail-closed and SQLite worker'
 php tests/unit/test_first_visit_database.php
+python3 tests/unit/test_empty_setup_database.py
 PXE_EXTERNAL_DB_TEST=1 python3 tests/integration/test_external_db_fail_closed.py
 PXE_INIT_PATH_TEST=1 python3 tests/integration/test_php_init_sqlite_path_guard.py
 PXE_WIZARD_DB_TEST=1 python3 tests/integration/test_wizard_database_support.py

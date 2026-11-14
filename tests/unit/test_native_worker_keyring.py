@@ -12,14 +12,16 @@ spec.loader.exec_module(worker)
 
 
 class NativeWorkerKeyring(unittest.TestCase):
-    def test_only_affected_ubuntu_package_selects_fallback(self):
-        release = {'ID': 'ubuntu', 'VERSION_ID': '24.04'}
-        self.assertEqual(worker.worker_environment({}, release, '2023.4ubuntu1'),
-                         {'DEBIAN_ARCHIVE_KEYRING': worker.FALLBACK})
-        for version in ('2025.1ubuntu1', '2023.4ubuntu1.1', ''):
-            self.assertEqual(worker.worker_environment({}, release, version), {})
+    def test_only_affected_ubuntu_and_zorin_package_selects_fallback(self):
+        for release in ({'ID': 'ubuntu', 'VERSION_ID': '24.04'},
+                        {'ID': 'zorin', 'VERSION_ID': '18'}):
+            self.assertEqual(worker.worker_environment({}, release, '2023.4ubuntu1'),
+                             {'DEBIAN_ARCHIVE_KEYRING': worker.FALLBACK})
+            for version in ('2025.1ubuntu1', '2023.4ubuntu1.1', ''):
+                self.assertEqual(worker.worker_environment({}, release, version), {})
         for release in ({'ID': 'debian', 'VERSION_ID': '13'},
-                        {'ID': 'ubuntu', 'VERSION_ID': '26.04'}, {}):
+                        {'ID': 'ubuntu', 'VERSION_ID': '26.04'},
+                        {'ID': 'zorin', 'VERSION_ID': '17'}, {}):
             self.assertEqual(worker.worker_environment({}, release, '2023.4ubuntu1'), {})
 
     def test_explicit_keyring_even_empty_is_never_overridden(self):

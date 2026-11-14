@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-only
-"""Start the worker with a bounded workaround for Ubuntu 24.04's old keyring."""
+"""Start the worker with a bounded workaround for the old Ubuntu keyring."""
 import os
 from pathlib import Path
 import subprocess
@@ -15,7 +15,8 @@ def worker_environment(environment, os_release, keyring_version):
     # invalid/empty path: the verifier then fails closed instead of overriding it.
     if 'DEBIAN_ARCHIVE_KEYRING' in result:
         return result
-    if (os_release.get('ID') == 'ubuntu' and os_release.get('VERSION_ID') == '24.04'
+    if ((os_release.get('ID'), os_release.get('VERSION_ID')) in
+            (('ubuntu', '24.04'), ('zorin', '18'))
             and keyring_version == '2023.4ubuntu1'):
         result['DEBIAN_ARCHIVE_KEYRING'] = FALLBACK
     return result

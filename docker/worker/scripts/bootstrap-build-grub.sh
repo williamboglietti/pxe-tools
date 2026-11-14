@@ -141,9 +141,12 @@ if [ ! -f "$TFTP_ROOT/grubx64.efi" ]; then
     echo '[bootstrap-grub] ERREUR : GRUB signé indisponible.' >&2
     exit 1
 fi
-host_id=''
-if [ -r /etc/os-release ]; then host_id=$(. /etc/os-release; printf '%s' "${ID:-}"); fi
-if [ "${PXE_SERVICE_MANAGER:-}" = systemd ] && [ "$host_id" = ubuntu ]; then
+host_id='' host_version=''
+if [ -r /etc/os-release ]; then
+    host_id=$(. /etc/os-release; printf '%s' "${ID:-}")
+    host_version=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+fi
+if [ "${PXE_SERVICE_MANAGER:-}" = systemd ] && { [ "$host_id" = ubuntu ] || { [ "$host_id" = zorin ] && [ "$host_version" = 18 ]; }; }; then
     : "${DEBIAN_ARCHIVE_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg}"
     python3 "$BOOTSTRAP_SCRIPTS_DIR/prepare-debian-shim.py" "$TFTP_ROOT" "$DEBIAN_ARCHIVE_KEYRING"
 else

@@ -94,9 +94,10 @@ python3 "$helper" "$fixture/package-next.deb" "$fixture/next" \
 cmp "$old_index" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
 test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
-if ! cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"; then
-    # Both files contain public fixture material only. Keep the strict byte
-    # comparison and capture packet structure before the temporary fixture is
+python3 "$root/tests/unit/test_openpgp_fixture_comparison.py"
+if ! python3 "$root/tests/support/compare_openpgp_fixture.py" "$fixture/public.gpg" "$fixture/exported-public.gpg"; then
+    # Both files contain public fixture material only. Capture packet
+    # structure before the temporary fixture is
     # removed so an intermittent difference can be diagnosed.
     echo 'Public fixture key exports differ; packet diagnostics follow.' >&2
     gpg --version | sed -n '1p' >&2
@@ -108,6 +109,25 @@ if ! cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"; then
     done
     exit 1
 fi
+# GnuPG 2.4.4 may pad an Ed25519 signature MPI during import/export. The
+# packet comparator above accepts only that encoding difference, retaining all
+# other packets and bytes. Independently import both public certificates,
+# verify every signature and the exact key fingerprints, then compare their
+# normalized exports byte for byte.
+printf '%s\n%s\n' "$primary" "$sub" > "$fixture/expected-fingerprints"
+for name in public exported-public; do
+    normalized_home="$fixture/normalize-$name"
+    mkdir -m 0700 "$normalized_home"
+    gpg --homedir "$normalized_home" --batch --import "$fixture/$name.gpg" > /dev/null 2>&1
+    gpg --homedir "$normalized_home" --batch --with-colons --with-fingerprint --with-subkey-fingerprint \
+        --check-sigs > "$fixture/$name.signatures" 2>/dev/null
+    awk -F: '$1 == "sig" { count++; if ($2 != "!") exit 1 } END { if (count < 2) exit 1 }' "$fixture/$name.signatures"
+    awk -F: '$1 == "fpr" { print $10 }' "$fixture/$name.signatures" > "$fixture/$name.fingerprints"
+    cmp "$fixture/expected-fingerprints" "$fixture/$name.fingerprints"
+    gpg --homedir "$normalized_home" --batch --export "$primary" > "$fixture/$name.normalized.gpg"
+    gpgconf --homedir "$normalized_home" --kill gpg-agent >/dev/null 2>&1 || true
+done
+cmp "$fixture/public.normalized.gpg" "$fixture/exported-public.normalized.gpg"
 gpgv --keyring "$fixture/exported-public.gpg" "$fixture/next/dists/stable/InRelease" > /dev/null 2>&1
 # Exercise a real APT client against the signed two-package snapshot, without
 # installing anything on the test host or changing its configured sources.

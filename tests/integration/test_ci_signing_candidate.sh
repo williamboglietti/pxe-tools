@@ -94,7 +94,20 @@ python3 "$helper" "$fixture/package-next.deb" "$fixture/next" \
 cmp "$old_index" "$fixture/next/dists/stable/main/binary-amd64/by-hash/SHA256/$old_hash"
 test "$(find "$fixture/next/pool" -name '*.deb' | wc -l | tr -d ' ')" = 2
 gpg --homedir "$gnupg" --batch --export "$primary" > "$fixture/public.gpg"
-cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"
+if ! cmp "$fixture/public.gpg" "$fixture/exported-public.gpg"; then
+    # Both files contain public fixture material only. Keep the strict byte
+    # comparison and capture packet structure before the temporary fixture is
+    # removed so an intermittent difference can be diagnosed.
+    echo 'Public fixture key exports differ; packet diagnostics follow.' >&2
+    gpg --version | sed -n '1p' >&2
+    sha256sum "$fixture/public.gpg" "$fixture/exported-public.gpg" >&2
+    for public_file in "$fixture/public.gpg" "$fixture/exported-public.gpg"; do
+        echo "Public fixture: $(basename "$public_file")" >&2
+        gpg --batch --with-colons --show-keys "$public_file" >&2 || true
+        gpg --batch --list-packets "$public_file" >&2 || true
+    done
+    exit 1
+fi
 gpgv --keyring "$fixture/exported-public.gpg" "$fixture/next/dists/stable/InRelease" > /dev/null 2>&1
 # Exercise a real APT client against the signed two-package snapshot, without
 # installing anything on the test host or changing its configured sources.

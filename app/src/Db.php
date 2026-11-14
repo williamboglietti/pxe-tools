@@ -165,7 +165,8 @@ final class Db
         $cfg = self::config();
         // Routine reads must not create a database before setup. The wizard's
         // explicit connection test and schema initialization use connect().
-        if ($cfg['driver'] === 'sqlite' && !is_file($cfg['path'])) {
+        if ($cfg['driver'] === 'sqlite' && (!is_file($cfg['path']) ||
+            ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER')))) {
             throw new RuntimeException('Base SQLite indisponible');
         }
         $pdo = self::connect($cfg, $enableWal);

@@ -29,8 +29,12 @@ class EmptySetupDatabase(unittest.TestCase):
             self.assertTrue(result.stdout.startswith('empty:'))
             self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), digest)
             (root / 'setup.sqlite-wal').touch()
+            (root / 'setup.sqlite-shm').write_bytes(bytes(32768))
+            self.assertTrue(classify(db).stdout.startswith('empty:'))
+            (root / 'setup.sqlite-wal').write_bytes(b'nonempty')
             self.assertNotEqual(classify(db).returncode, 0)
             (root / 'setup.sqlite-wal').unlink()
+            (root / 'setup.sqlite-shm').unlink()
             link = root / 'link'
             link.symlink_to(db)
             self.assertNotEqual(classify(link).returncode, 0)

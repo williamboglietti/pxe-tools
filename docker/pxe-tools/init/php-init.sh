@@ -225,11 +225,24 @@ from urllib.parse import quote
 
 path = sys.argv[1]
 try:
-    def no_sidecars():
-        for suffix in ('-wal', '-shm', '-journal'):
-            if os.path.lexists(path + suffix):
-                raise ValueError('SQLite auxiliary file present')
-    no_sidecars()
+    def sidecars():
+        if os.path.lexists(path + '-journal'):
+            raise ValueError('SQLite rollback journal present')
+        result = []
+        for suffix in ('-wal', '-shm'):
+            try:
+                item = os.stat(path + suffix, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 or
+                    (suffix == '-wal' and item.st_size != 0) or
+                    (suffix == '-shm' and item.st_size != 32768)):
+                raise ValueError('SQLite auxiliary file requires examination')
+            result.append((suffix, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns))
+        if any(item[0] == '-shm' for item in result) and not any(item[0] == '-wal' for item in result):
+            raise ValueError('SQLite shared memory without WAL')
+        return result
+    aux_before = sidecars()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         before = os.fstat(fd)
@@ -246,10 +259,13 @@ try:
         after = os.fstat(fd)
         current = os.stat(path, follow_symlinks=False)
         fields = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-        no_sidecars()
+        aux_after = sidecars()
         if fields(before) != fields(after) or fields(after) != fields(current):
             raise ValueError('SQLite file changed during inspection')
-        print(('empty:' + ':'.join(map(str, fields(after)))) if empty else 'populated')
+        if aux_before != aux_after:
+            raise ValueError('SQLite auxiliary files changed during inspection')
+        aux = ''.join(':' + ','.join(map(str, item)) for item in aux_after)
+        print(('empty:' + ':'.join(map(str, fields(after))) + aux) if empty else 'populated')
     finally:
         os.close(fd)
 except (OSError, sqlite3.Error, ValueError) as error:
@@ -326,7 +342,17 @@ try:
             path = '/var/lib/pxe-tools/' + name
             fields = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             expected = path + ':empty:' + ':'.join(map(str, fields))
-            proven_empty = proof == expected and not any(os.path.lexists(path + s) for s in ('-wal', '-shm', '-journal'))
+            aux = []
+            for suffix in ('-wal', '-shm'):
+                try:
+                    item = os.stat(path + suffix, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
+                    raise ValueError('unexpected SQLite auxiliary file')
+                aux.append((suffix, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns))
+            expected += ''.join(':' + ','.join(map(str, item)) for item in aux)
+            proven_empty = proof == expected and not os.path.lexists(path + '-journal')
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_size != 0 and not proven_empty):
                 raise ValueError('unexpected database before setup')
             if proven_empty:

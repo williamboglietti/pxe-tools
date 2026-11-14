@@ -36,6 +36,9 @@ Hyper-V ; la procédure d'enrôlement varie selon le matériel.
 
 ## Mise à niveau et conservation des données
 
+Si la bêta 4 refuse de démarrer après une visite avant l'assistant et signale
+`presets.static_cidr absente`, consultez le [diagnostic de configuration initiale interrompue](reprise-configuration-initiale.md).
+
 La mise à niveau est refusée si les services PXE Tools sont encore actifs. Avant
 de commencer, prévoyez une fenêtre d'arrêt, une sauvegarde chiffrée vérifiée et
 conservez le paquet de la version précédente ainsi que les chemins et la

@@ -21,6 +21,15 @@ try {
     if (!\Admin\Db::testConnection(['driver' => 'sqlite', 'path' => $db])['ok'] || file_exists($db)) {
         throw new RuntimeException('Connection test created a database or failed');
     }
+    touch($db);
+    putenv('PXE_DB_DRIVER');
+    \Admin\Db::resetForTests();
+    try {
+        \Admin\Db::get();
+        throw new RuntimeException('Unconfigured database was opened');
+    } catch (RuntimeException $error) {
+        if ($error->getMessage() !== 'Base SQLite indisponible') throw $error;
+    }
     echo "OK first visit preserves absent database\n";
 } finally {
     if (file_exists($db)) unlink($db);

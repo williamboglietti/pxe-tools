@@ -256,6 +256,7 @@ final class Db
         }
         self::$config = null;
         self::$instance = null;
+        self::$workerSqlite = false;
     }
 
     // -------------------------------------------------------------------
@@ -421,5 +422,6 @@ final class Db
     {
         self::$instance = null;
         self::$config   = null;
+        self::$workerSqlite = false;
     }
 }

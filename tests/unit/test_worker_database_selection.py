@@ -58,6 +58,15 @@ class DatabaseSelectionTest(unittest.TestCase):
         self.assertIn('ne prend actuellement en charge que SQLite', output.getvalue())
         self.assertNotIn('fixture-password', output.getvalue())
 
+    def test_native_worker_does_not_open_unconfigured_database(self):
+        with patch.dict(os.environ, {'PXE_SERVICE_MANAGER': 'systemd'}), \
+             patch.object(worker, 'purge_unlock_dir'), \
+             patch.object(worker, 'schema_ready', side_effect=AssertionError('unconfigured database accessed')), \
+             patch.object(worker.time, 'sleep', side_effect=KeyboardInterrupt), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                worker.main()
+
     def test_invalid_config_fails_closed_without_exposing_contents(self):
         for content in ('not-json fixture-password', '{}', '{"driver":"sqlite","path":"relative"}'):
             with self.subTest(content=content):

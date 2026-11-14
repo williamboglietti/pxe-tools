@@ -30,8 +30,14 @@ try {
     } catch (RuntimeException $error) {
         if ($error->getMessage() !== 'Base SQLite indisponible') throw $error;
     }
+    \Admin\Db::resetForTests();
+    \Admin\Db::useWorkerSqlite($db);
+    if ((int)\Admin\Db::get()->query('SELECT 1')->fetchColumn() !== 1) {
+        throw new RuntimeException('Explicit worker database unavailable');
+    }
     echo "OK first visit preserves absent database\n";
 } finally {
+    \Admin\Db::resetForTests();
     if (file_exists($db)) unlink($db);
     rmdir($dir);
 }

@@ -31,6 +31,7 @@ final class Db
 
     private static ?PDO $instance = null;
     private static ?array $config = null;
+    private static bool $workerSqlite = false;
 
     /** Pin a worker child to the SQLite database already selected by its parent. */
     public static function useWorkerSqlite(string $path): void
@@ -40,6 +41,7 @@ final class Db
             throw new RuntimeException('Configuration de base worker invalide.');
         }
         self::$config = self::normalizeConfig(['driver' => 'sqlite', 'path' => $path]);
+        self::$workerSqlite = true;
     }
 
     /**
@@ -166,7 +168,7 @@ final class Db
         // Routine reads must not create a database before setup. The wizard's
         // explicit connection test and schema initialization use connect().
         if ($cfg['driver'] === 'sqlite' && (!is_file($cfg['path']) ||
-            ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER')))) {
+            ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER') && !self::$workerSqlite))) {
             throw new RuntimeException('Base SQLite indisponible');
         }
         $pdo = self::connect($cfg, $enableWal);
@@ -220,6 +222,7 @@ final class Db
         }
         // Invalide le cache interne pour que les prochains appels relisent
         self::$config   = null;
+        self::$workerSqlite = false;
         self::$instance = null;
     }
 

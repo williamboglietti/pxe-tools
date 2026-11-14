@@ -18,6 +18,9 @@ try {
     }
     \Admin\Models\Setting::get('db_init_done');
     if (file_exists($db)) throw new RuntimeException('Setup page created a database');
+    if (!\Admin\Db::testConnection(['driver' => 'sqlite', 'path' => $db])['ok'] || file_exists($db)) {
+        throw new RuntimeException('Connection test created a database or failed');
+    }
     echo "OK first visit preserves absent database\n";
 } finally {
     if (file_exists($db)) unlink($db);

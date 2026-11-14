@@ -105,7 +105,7 @@ final class WizardController
 
         // Test connexion AVANT d'écrire db.conf — sinon on bloque l'admin en boucle
         // db_pending sur une config bidon.
-        $res = Db::testConnection($cfg);
+        $res = Db::testConnection($cfg, true);
         if (!$res['ok']) {
             // L'admin doit voir l'erreur pour corriger ses creds.
             $msg = urlencode(substr((string)$res['error'], 0, 200));

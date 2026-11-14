@@ -177,10 +177,18 @@ final class Db
      * Test connexion sans toucher au singleton ni écrire db.conf.
      * Utilisé par le wizard /init/db pour le bouton "Tester la connexion".
      */
-    public static function testConnection(array $cfg): array
+    public static function testConnection(array $cfg, bool $createSqlite = false): array
     {
         try {
             $cfg = self::normalizeConfig($cfg);
+            if ($cfg['driver'] === 'sqlite' && !is_file($cfg['path']) && !$createSqlite) {
+                if (!is_dir(dirname($cfg['path'])) || !is_writable(dirname($cfg['path']))) {
+                    throw new RuntimeException('Répertoire SQLite inaccessible en écriture');
+                }
+                $pdo = new PDO('sqlite::memory:');
+                $pdo->query('SELECT 1')->fetch();
+                return ['ok' => true, 'error' => null];
+            }
             $pdo = self::connect($cfg);
             $pdo->query('SELECT 1')->fetch();
             return ['ok' => true, 'error' => null];

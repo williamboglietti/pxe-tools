@@ -163,6 +163,11 @@ final class Db
             return self::$instance;
         }
         $cfg = self::config();
+        // Routine reads must not create a database before setup. The wizard's
+        // explicit connection test and schema initialization use connect().
+        if ($cfg['driver'] === 'sqlite' && !is_file($cfg['path'])) {
+            throw new RuntimeException('Base SQLite indisponible');
+        }
         $pdo = self::connect($cfg, $enableWal);
         self::$instance = $pdo;
         return $pdo;

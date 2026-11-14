@@ -192,13 +192,6 @@ final class InitGuard
         //    auto-génère db.conf + pose db_init_done=1 si orchestrator.sqlite
         //    existe (cf. Phase F).
         try {
-            // PDO SQLite creates a file on connect. A first visit must not
-            // manufacture a database that a later restart mistakes for an
-            // existing legacy installation before setup has completed.
-            $config = Db::config();
-            if ($config['driver'] === 'sqlite' && !is_file($config['path'])) {
-                return self::STATE_DB_PENDING;
-            }
             $pdo = Db::get();
             $pdo->query('SELECT 1 FROM settings LIMIT 1')->fetch();
         } catch (\Throwable) {

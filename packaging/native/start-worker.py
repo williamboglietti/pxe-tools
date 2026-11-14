@@ -7,6 +7,9 @@ import subprocess
 
 FALLBACK = '/usr/lib/pxe-tools/native/keyrings/debian-archive-2025.1.gpg'
 WORKER = '/usr/lib/pxe-tools/app/worker.py'
+BASE_HELPER = Path('/opt/pxe-tools/scripts/host-base.sh')
+if not BASE_HELPER.exists():
+    BASE_HELPER = Path(__file__).resolve().parents[2] / 'docker/worker/scripts/host-base.sh'
 
 
 def worker_environment(environment, os_release, keyring_version):
@@ -15,8 +18,9 @@ def worker_environment(environment, os_release, keyring_version):
     # invalid/empty path: the verifier then fails closed instead of overriding it.
     if 'DEBIAN_ARCHIVE_KEYRING' in result:
         return result
-    if ((os_release.get('ID'), os_release.get('VERSION_ID')) in
-            (('ubuntu', '24.04'), ('zorin', '18'))
+    detected = subprocess.run(['/bin/sh', '-c', '. "$1"; pxe_tools_detect_base', 'pxe', str(BASE_HELPER)],
+                              env=os_release, stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+    if (detected == 'ubuntu:noble'
             and keyring_version == '2023.4ubuntu1'):
         result['DEBIAN_ARCHIVE_KEYRING'] = FALLBACK
     return result
@@ -27,7 +31,7 @@ def main():
     release = {}
     for line in Path('/etc/os-release').read_text().splitlines():
         key, sep, value = line.partition('=')
-        if sep and key in ('ID', 'VERSION_ID'):
+        if sep and key in ('ID', 'ID_LIKE', 'VERSION_ID', 'VERSION_CODENAME', 'UBUNTU_CODENAME'):
             release[key] = value.strip().strip('"').strip("'")
     query = subprocess.run(['dpkg-query', '-W', '-f=${Version}', 'debian-archive-keyring'],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

@@ -13,8 +13,8 @@ Le [paquet source Debian](https://packages.debian.org/source/trixie/debian-archi
 publie la provenance et le fichier de droits ; celui-ci précise que les clés du
 trousseau ne sont pas soumises au droit d'auteur. Seul le trousseau est repris.
 
-Le worker choisit cette copie uniquement sur Ubuntu 24.04 ou Zorin OS 18
-([basé sur Ubuntu 24.04](https://help.zorin.com/docs/apps-games/install-apps/)) quand la version
+Le worker choisit cette copie uniquement pour la base Ubuntu noble identifiée
+et quand la version
 installée du paquet Ubuntu est exactement `2023.4ubuntu1`, dont le trousseau
 ne vérifie pas les signatures actuelles de Debian 13. Une autre version du
 paquet utilise le trousseau système ; une valeur `DEBIAN_ARCHIVE_KEYRING`

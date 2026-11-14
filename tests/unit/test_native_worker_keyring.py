@@ -12,20 +12,38 @@ spec.loader.exec_module(worker)
 
 
 class NativeWorkerKeyring(unittest.TestCase):
-    def test_only_affected_ubuntu_and_zorin_package_selects_fallback(self):
-        for release in ({'ID': 'ubuntu', 'VERSION_ID': '24.04'},
-                        {'ID': 'zorin', 'VERSION_ID': '18'}):
+    def test_base_detection_requires_consistent_evidence(self):
+        cases = [
+            ({'ID': 'debian', 'VERSION_ID': '12', 'VERSION_CODENAME': 'bookworm'}, 'debian:bookworm'),
+            ({'ID': 'debian', 'VERSION_ID': '13', 'VERSION_CODENAME': 'trixie'}, 'debian:trixie'),
+            ({'ID': 'ubuntu', 'VERSION_ID': '26.04', 'VERSION_CODENAME': 'resolute'}, 'ubuntu:resolute'),
+            ({'ID': 'example', 'ID_LIKE': 'debian ubuntu', 'UBUNTU_CODENAME': 'noble'}, 'ubuntu:noble'),
+            ({'ID': 'example', 'ID_LIKE': 'ubuntu'}, ''),
+            ({'ID': 'example', 'ID_LIKE': 'notubuntu', 'UBUNTU_CODENAME': 'noble'}, ''),
+            ({'ID': 'ubuntu', 'VERSION_ID': '24.04', 'VERSION_CODENAME': 'resolute'}, ''),
+        ]
+        for release, expected in cases:
+            result = subprocess.run(['/bin/sh', '-c', '. "$1"; pxe_tools_detect_base',
+                                     'fixture', str(worker.BASE_HELPER)], env=release,
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), expected)
+
+    def test_only_affected_noble_package_selects_fallback(self):
+        for release in ({'ID': 'ubuntu', 'VERSION_ID': '24.04', 'VERSION_CODENAME': 'noble'},
+                        {'ID': 'example', 'ID_LIKE': 'ubuntu debian', 'UBUNTU_CODENAME': 'noble'}):
             self.assertEqual(worker.worker_environment({}, release, '2023.4ubuntu1'),
                              {'DEBIAN_ARCHIVE_KEYRING': worker.FALLBACK})
             for version in ('2025.1ubuntu1', '2023.4ubuntu1.1', ''):
                 self.assertEqual(worker.worker_environment({}, release, version), {})
         for release in ({'ID': 'debian', 'VERSION_ID': '13'},
-                        {'ID': 'ubuntu', 'VERSION_ID': '26.04'},
-                        {'ID': 'zorin', 'VERSION_ID': '17'}, {}):
+                        {'ID': 'ubuntu', 'VERSION_ID': '26.04', 'VERSION_CODENAME': 'resolute'},
+                        {'ID': 'example', 'ID_LIKE': 'ubuntu'},
+                        {'ID': 'example', 'UBUNTU_CODENAME': 'noble'},
+                        {'ID': 'ubuntu', 'VERSION_ID': '26.04', 'VERSION_CODENAME': 'noble'}, {}):
             self.assertEqual(worker.worker_environment({}, release, '2023.4ubuntu1'), {})
 
     def test_explicit_keyring_even_empty_is_never_overridden(self):
-        release = {'ID': 'ubuntu', 'VERSION_ID': '24.04'}
+        release = {'ID': 'ubuntu', 'VERSION_ID': '24.04', 'VERSION_CODENAME': 'noble'}
         for value in ('/admin/keyring.gpg', ''):
             env = {'DEBIAN_ARCHIVE_KEYRING': value}
             self.assertEqual(worker.worker_environment(env, release, '2023.4ubuntu1'), env)

@@ -24,6 +24,11 @@ try {
     touch($db);
     putenv('PXE_DB_DRIVER');
     \Admin\Db::resetForTests();
+    $before = hash_file('sha256', $db);
+    $result = \Admin\Db::testConnection(['driver' => 'sqlite', 'path' => $db]);
+    if (empty($result['deferred']) || hash_file('sha256', $db) !== $before || file_exists($db . '-wal')) {
+        throw new RuntimeException('Connection check modified the unconfigured database');
+    }
     try {
         \Admin\Db::get();
         throw new RuntimeException('Unconfigured database was opened');

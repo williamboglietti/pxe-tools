@@ -184,13 +184,17 @@ final class Db
     {
         try {
             $cfg = self::normalizeConfig($cfg);
-            if ($cfg['driver'] === 'sqlite' && !is_file($cfg['path']) && !$createSqlite) {
+            if ($cfg['driver'] === 'sqlite' && !$createSqlite &&
+                (!is_file($cfg['path']) || ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER')))) {
                 if (!is_dir(dirname($cfg['path'])) || !is_writable(dirname($cfg['path']))) {
                     throw new RuntimeException('Répertoire SQLite inaccessible en écriture');
                 }
+                if (file_exists($cfg['path']) && !is_readable($cfg['path'])) {
+                    throw new RuntimeException('Base SQLite illisible');
+                }
                 $pdo = new PDO('sqlite::memory:');
                 $pdo->query('SELECT 1')->fetch();
-                return ['ok' => true, 'error' => null];
+                return ['ok' => true, 'error' => null, 'deferred' => true];
             }
             $pdo = self::connect($cfg);
             $pdo->query('SELECT 1')->fetch();

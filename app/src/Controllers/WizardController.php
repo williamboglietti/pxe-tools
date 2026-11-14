@@ -164,7 +164,9 @@ final class WizardController
         $res = Db::testConnection($cfg);
         header('Content-Type: text/html; charset=UTF-8');
         if ($res['ok']) {
-            echo '<span class="db-test-result db-test-result--ok">✓ Connexion réussie</span>';
+            echo !empty($res['deferred'])
+                ? '<span class="db-test-result db-test-result--ok">✓ Chemin accessible ; la base sera vérifiée à la validation.</span>'
+                : '<span class="db-test-result db-test-result--ok">✓ Connexion réussie</span>';
         } else {
             $msg = htmlspecialchars((string)$res['error'], ENT_QUOTES, 'UTF-8');
             echo "<span class=\"db-test-result db-test-result--err\">✗ Échec : $msg</span>";

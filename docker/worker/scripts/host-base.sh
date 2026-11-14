@@ -18,6 +18,7 @@ pxe_tools_detect_base() {
 }
 
 if [ "${1:-}" = --detect ]; then
+    unset ID ID_LIKE VERSION_ID VERSION_CODENAME UBUNTU_CODENAME
     . /etc/os-release
     pxe_tools_detect_base
 fi

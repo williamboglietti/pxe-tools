@@ -215,11 +215,90 @@ set_master_key_owner "$MASTER_KEY"
 #     que db.conf n'a pas encore été posé. Garantit qu'un upgrade d'image
 #     ne déclenche pas le wizard à nouveau sur un déploiement existant.
 # -----------------------------------------------------------------------------
+classify_setup_db() {
+    python3 - "$1" <<'PYTHON'
+import os
+import sqlite3
+import stat
+import sys
+from urllib.parse import quote
+
+path = sys.argv[1]
+try:
+    def sidecars():
+        if os.path.lexists(path + '-journal'):
+            raise ValueError('SQLite rollback journal present')
+        result = []
+        for suffix in ('-wal', '-shm'):
+            try:
+                item = os.stat(path + suffix, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 or
+                    (suffix == '-wal' and item.st_size != 0) or
+                    (suffix == '-shm' and item.st_size != 32768)):
+                raise ValueError('SQLite auxiliary file requires examination')
+            result.append((suffix, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns))
+        if any(item[0] == '-shm' for item in result) and not any(item[0] == '-wal' for item in result):
+            raise ValueError('SQLite shared memory without WAL')
+        return result
+    aux_before = sidecars()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError('SQLite file is not a regular unlinked file')
+        uri = 'file:' + quote('/proc/self/fd/' + str(fd), safe='/') + '?mode=ro&immutable=1'
+        con = sqlite3.connect(uri, uri=True)
+        try:
+            if con.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                raise ValueError('SQLite integrity check failed')
+            empty = con.execute('SELECT count(*) FROM sqlite_master').fetchone()[0] == 0
+        finally:
+            con.close()
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        fields = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        aux_after = sidecars()
+        if fields(before) != fields(after) or fields(after) != fields(current):
+            raise ValueError('SQLite file changed during inspection')
+        if aux_before != aux_after:
+            raise ValueError('SQLite auxiliary files changed during inspection')
+        aux = ''.join(':' + ','.join(map(str, item)) for item in aux_after)
+        print(('empty:' + ':'.join(map(str, fields(after))) + aux) if empty else 'populated')
+    finally:
+        os.close(fd)
+except (OSError, sqlite3.Error, ValueError) as error:
+    print('[php-init] SQLite ambiguë ou illisible : ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYTHON
+}
 DETECTED_DB=""
+EMPTY_DB_PROOF=""
+SEEN_DB=""
 for candidate in "$SQLITE_DEFAULT" "$LEGACY_SQLITE" /var/lib/pxe-tools/pxe-tools.sqlite; do
     if [ -f "$candidate" ] && [ -s "$candidate" ]; then
+        if [ ! -e "$DB_CONF" ] && [ ! -L "$DB_CONF" ]; then
+            if [ "$SEEN_DB" = "$candidate" ]; then continue; fi
+            if [ -n "$SEEN_DB" ]; then
+                echo '[php-init] ERREUR : plusieurs bases détectées sans configuration ; examen requis.' >&2
+                exit 1
+            fi
+            SEEN_DB="$candidate"
+            classification=$(classify_setup_db "$candidate") || exit 1
+            case "$classification" in
+                empty:*)
+                    if [ "$EMPTY_DB_PROOF" = "$candidate:$classification" ]; then continue; fi
+                    if [ -n "$EMPTY_DB_PROOF" ]; then
+                        echo '[php-init] ERREUR : plusieurs bases vides détectées ; examen requis.' >&2
+                        exit 1
+                    fi
+                    EMPTY_DB_PROOF="$candidate:$classification"
+                    continue ;;
+            esac
+        fi
         DETECTED_DB="$candidate"
-        break
+        if [ -e "$DB_CONF" ] || [ -L "$DB_CONF" ]; then break; fi
     fi
 done
 if [ ! -e "$DB_CONF" ] && [ ! -L "$DB_CONF" ] && [ -n "$DETECTED_DB" ] && \
@@ -250,12 +329,14 @@ if [ ! -f "$DB_CONF" ]; then
     chown www-data:www-data /var/lib/pxe-tools
     # Le worker historique peut avoir créé une base vide en root avant le
     # wizard. Ne toucher qu'à ces deux fichiers connus, avec O_NOFOLLOW.
-    python3 - <<'PYTHON'
+    python3 - "$EMPTY_DB_PROOF" <<'PYTHON'
 import os
 import pwd
 import stat
+import sys
 
 directory = os.open('/var/lib/pxe-tools', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+proof = sys.argv[1]
 try:
     account = pwd.getpwnam('www-data')
     for name in ('pxe-tools.sqlite', 'orchestrator.sqlite'):
@@ -265,9 +346,27 @@ try:
             continue
         try:
             info = os.fstat(database)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+            path = '/var/lib/pxe-tools/' + name
+            fields = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            expected = path + ':empty:' + ':'.join(map(str, fields))
+            aux = []
+            for suffix in ('-wal', '-shm'):
+                try:
+                    item = os.stat(path + suffix, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
+                    raise ValueError('unexpected SQLite auxiliary file')
+                aux.append((suffix, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns))
+            expected += ''.join(':' + ','.join(map(str, item)) for item in aux)
+            proven_empty = proof == expected and not os.path.lexists(path + '-journal')
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_size != 0 and not proven_empty):
                 raise ValueError('unexpected database before setup')
-            os.fchown(database, account.pw_uid, account.pw_gid)
+            if proven_empty:
+                if (info.st_uid, info.st_gid) != (account.pw_uid, account.pw_gid):
+                    raise ValueError('empty database ownership requires examination')
+            else:
+                os.fchown(database, account.pw_uid, account.pw_gid)
         finally:
             os.close(database)
 finally:

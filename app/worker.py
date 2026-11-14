@@ -3301,7 +3301,11 @@ def main() -> None:
         try:
             candidate, database_source = configured_worker_database()
             DB_PATH = candidate
-            if schema_ready():
+            # Native setup can preserve a deliberately unconfigured empty
+            # database. Even a read-only SQLite connection may create WAL/SHM
+            # files, so wait for an explicit configuration before opening it.
+            configured = database_source != 'default' or os.environ.get('PXE_SERVICE_MANAGER') != 'systemd'
+            if configured and schema_ready():
                 active_database = (candidate, database_source)
                 break
             reason = 'En attente de la base SQLite et de son schéma (assistant initial).'

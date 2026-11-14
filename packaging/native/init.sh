@@ -32,4 +32,11 @@ fi
 /bin/sh /opt/pxe-tools/init/php-init.sh
 /bin/sh /opt/pxe-tools/init/bootstrap-tls.sh
 python3 /opt/pxe-tools/scripts/validate-native-runtime.py tls "$TLS_DIR"
-/bin/bash /opt/pxe-tools/scripts/bootstrap-render-templates.sh
+# php-init has already verified the unconfigured state (including any empty
+# SQLite fixture). Preserve existing menus until the wizard creates db.conf;
+# the worker queues the initial render once setup has initialized the schema.
+if [ ! -e /etc/pxe-tools/db.conf ] && [ ! -L /etc/pxe-tools/db.conf ] && [ -z "${PXE_DB_DRIVER:-}" ]; then
+    echo '[pxe-tools-init] Base non configurée ; rendu PXE différé.'
+else
+    /bin/bash /opt/pxe-tools/scripts/bootstrap-render-templates.sh
+fi

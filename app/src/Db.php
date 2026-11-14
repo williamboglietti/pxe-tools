@@ -31,6 +31,7 @@ final class Db
 
     private static ?PDO $instance = null;
     private static ?array $config = null;
+    private static bool $workerSqlite = false;
 
     /** Pin a worker child to the SQLite database already selected by its parent. */
     public static function useWorkerSqlite(string $path): void
@@ -40,6 +41,7 @@ final class Db
             throw new RuntimeException('Configuration de base worker invalide.');
         }
         self::$config = self::normalizeConfig(['driver' => 'sqlite', 'path' => $path]);
+        self::$workerSqlite = true;
     }
 
     /**
@@ -163,6 +165,12 @@ final class Db
             return self::$instance;
         }
         $cfg = self::config();
+        // Routine reads must not create a database before setup. The wizard's
+        // explicit connection test and schema initialization use connect().
+        if ($cfg['driver'] === 'sqlite' && (!is_file($cfg['path']) ||
+            ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER') && !self::$workerSqlite))) {
+            throw new RuntimeException('Base SQLite indisponible');
+        }
         $pdo = self::connect($cfg, $enableWal);
         self::$instance = $pdo;
         return $pdo;
@@ -172,10 +180,22 @@ final class Db
      * Test connexion sans toucher au singleton ni écrire db.conf.
      * Utilisé par le wizard /init/db pour le bouton "Tester la connexion".
      */
-    public static function testConnection(array $cfg): array
+    public static function testConnection(array $cfg, bool $createSqlite = false): array
     {
         try {
             $cfg = self::normalizeConfig($cfg);
+            if ($cfg['driver'] === 'sqlite' && !$createSqlite &&
+                (!is_file($cfg['path']) || ((!file_exists(self::CONFIG_PATH) && !is_link(self::CONFIG_PATH)) && !getenv('PXE_DB_DRIVER')))) {
+                if (!is_dir(dirname($cfg['path'])) || !is_writable(dirname($cfg['path']))) {
+                    throw new RuntimeException('Répertoire SQLite inaccessible en écriture');
+                }
+                if (file_exists($cfg['path']) && !is_readable($cfg['path'])) {
+                    throw new RuntimeException('Base SQLite illisible');
+                }
+                $pdo = new PDO('sqlite::memory:');
+                $pdo->query('SELECT 1')->fetch();
+                return ['ok' => true, 'error' => null, 'deferred' => true];
+            }
             $pdo = self::connect($cfg);
             $pdo->query('SELECT 1')->fetch();
             return ['ok' => true, 'error' => null];
@@ -206,6 +226,7 @@ final class Db
         }
         // Invalide le cache interne pour que les prochains appels relisent
         self::$config   = null;
+        self::$workerSqlite = false;
         self::$instance = null;
     }
 
@@ -235,6 +256,7 @@ final class Db
         }
         self::$config = null;
         self::$instance = null;
+        self::$workerSqlite = false;
     }
 
     // -------------------------------------------------------------------
@@ -400,5 +422,6 @@ final class Db
     {
         self::$instance = null;
         self::$config   = null;
+        self::$workerSqlite = false;
     }
 }

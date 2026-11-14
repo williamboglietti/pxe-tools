@@ -36,14 +36,10 @@ Description: {description}
 PREINST = '''#!/bin/sh
 set -eu
 if [ "$1" = install ]; then
-    if [ -e /opt/pxe-tools ] || [ -L /opt/pxe-tools ]; then
-        echo 'pxe-tools-local-test: existing /opt/pxe-tools preserved; installation refused' >&2
-        exit 1
-    fi
-    if [ -e /usr/lib/pxe-tools ] || [ -L /usr/lib/pxe-tools ]; then
-        # Old versions may leave only interpreter caches after purge. Refuse
-        # anything unknown before removing those narrowly recognised files.
-        python3 - /usr/lib/pxe-tools <<'PXE_CACHE_CLEANUP'
+    if [ -e /usr/lib/pxe-tools ] || [ -L /usr/lib/pxe-tools ] || \
+       [ -e /opt/pxe-tools ] || [ -L /opt/pxe-tools ]; then
+        # Scan both roots before removing any narrowly recognised caches.
+        python3 - /usr/lib/pxe-tools /opt/pxe-tools <<'PXE_CACHE_CLEANUP'
 @@PXE_CACHE_CLEANUP@@
 PXE_CACHE_CLEANUP
     fi

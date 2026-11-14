@@ -36,6 +36,9 @@ Hyper-V ; la procédure d'enrôlement varie selon le matériel.
 
 ## Mise à niveau et conservation des données
 
+Si la bêta 4 refuse de démarrer après une visite avant l'assistant et signale
+`presets.static_cidr absente`, consultez le [diagnostic de configuration initiale interrompue](reprise-configuration-initiale.md).
+
 La mise à niveau est refusée si les services PXE Tools sont encore actifs. Avant
 de commencer, prévoyez une fenêtre d'arrêt, une sauvegarde chiffrée vérifiée et
 conservez le paquet de la version précédente ainsi que les chemins et la
@@ -175,16 +178,17 @@ simulés ; ils ne constituent pas une validation d'un fournisseur SSO réel.
 
 ## Fraîcheur des métadonnées Debian netboot
 
-Sur Ubuntu 24.04 avec le paquet `debian-archive-keyring` version
+Sur Ubuntu 24.04 et Zorin OS 18 avec le paquet `debian-archive-keyring` version
 `2023.4ubuntu1`, le worker utilise une copie du trousseau Debian 2025.1 fournie
 par PXE Tools, car la version Ubuntu ne reconnaît pas toutes les signatures
 actuelles de Debian 13. Le [détail de sa provenance et de sa maintenance](../packaging/native/keyrings/README.md)
 est conservé avec le trousseau. Un trousseau configuré explicitement via
 `DEBIAN_ARCHIVE_KEYRING` reste prioritaire ; le système utilise sinon son propre
 trousseau pour les autres versions du paquet. Aucun échec de signature n'est
-contourné. La prise en charge complète d'Ubuntu reste à valider avant annonce.
+contourné. Zorin indique que sa version 18 repose sur [Ubuntu 24.04](https://help.zorin.com/docs/apps-games/install-apps/).
+La prise en charge complète de ces systèmes reste à valider avant annonce.
 
-Pour le démarrage de clients Debian depuis un hôte Ubuntu, le shim Ubuntu ne
+Pour le démarrage de clients Debian depuis un hôte Ubuntu ou Zorin OS 18, le shim Ubuntu ne
 fait pas confiance à la signature Debian du noyau. Le worker prépare donc un
 couple shim et MokManager Debian, sans installer leurs paquets ni modifier les
 sources APT du système : il utilise un état APT temporaire et un trousseau

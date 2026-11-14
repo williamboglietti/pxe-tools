@@ -82,6 +82,7 @@ class ExternalDatabaseFailClosed(unittest.TestCase):
 
     def test_sqlite_file_overrides_external_environment_and_remains_usable(self):
         path = self.root / 'fixture.sqlite'
+        path.touch()
         original = json.dumps({'driver':'sqlite', 'path':str(path), 'fixture_marker':'preserve',
                                'metadata': {'driver': 'mysql'}}).encode()
         CONFIG.write_bytes(original)
@@ -93,9 +94,10 @@ class ExternalDatabaseFailClosed(unittest.TestCase):
         self.assertEqual(CONFIG.read_bytes(), original)
         self.no_connection()
 
-    def test_default_sqlite_remains_usable(self):
+    def test_explicit_sqlite_remains_usable(self):
         path = self.root / 'default.sqlite'
-        env = dict(self.clean_env, PXE_DB_PATH=str(path))
+        path.touch()
+        env = dict(self.clean_env, PXE_DB_DRIVER='sqlite', PXE_DB_PATH=str(path))
         result = self.run_php(env, '''$db=\\Admin\\Db::get(); $db->exec('CREATE TABLE fixture(id INTEGER)');
                                        $db->exec('INSERT INTO fixture VALUES(9)');
                                        if ((int)$db->query('SELECT id FROM fixture')->fetchColumn() !== 9) exit(10);''')

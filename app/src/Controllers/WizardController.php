@@ -105,7 +105,7 @@ final class WizardController
 
         // Test connexion AVANT d'écrire db.conf — sinon on bloque l'admin en boucle
         // db_pending sur une config bidon.
-        $res = Db::testConnection($cfg);
+        $res = Db::testConnection($cfg, true);
         if (!$res['ok']) {
             // L'admin doit voir l'erreur pour corriger ses creds.
             $msg = urlencode(substr((string)$res['error'], 0, 200));
@@ -164,7 +164,9 @@ final class WizardController
         $res = Db::testConnection($cfg);
         header('Content-Type: text/html; charset=UTF-8');
         if ($res['ok']) {
-            echo '<span class="db-test-result db-test-result--ok">✓ Connexion réussie</span>';
+            echo !empty($res['deferred'])
+                ? '<span class="db-test-result db-test-result--ok">✓ Chemin accessible ; la base sera vérifiée à la validation.</span>'
+                : '<span class="db-test-result db-test-result--ok">✓ Connexion réussie</span>';
         } else {
             $msg = htmlspecialchars((string)$res['error'], ENT_QUOTES, 'UTF-8');
             echo "<span class=\"db-test-result db-test-result--err\">✗ Échec : $msg</span>";

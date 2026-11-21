@@ -120,6 +120,30 @@ for option in --previous-primary-fingerprint --previous-signing-fingerprint; do
     fi
     test ! -e "$fixture/invalid-transition"
 done
+# Keep the same source and keyring path across both signed candidates.
+# APT must be able to authenticate both publishers during the overlap.
+client="$fixture/transition-client"
+mkdir -p "$client/lists/partial" "$client/download"
+touch "$client/status"
+cat "$fixture/public.gpg" "$fixture/transition-public.gpg" > "$client/keyring.gpg"
+ln -s "$fixture/good" "$client/repository"
+printf 'deb [signed-by=%s] file:%s stable main\n' "$client/keyring.gpg" "$client/repository" > "$client/source.list"
+transition_apt=(-o "APT::Sandbox::User=$(id -un)" -o "Dir::Etc::sourcelist=$client/source.list"
+    -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$client/lists" -o "Dir::State::status=$client/status"
+    -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o APT::Update::Error-Mode=any)
+check_transition_client() {
+    apt-get "${transition_apt[@]}" update > "$client/update.log" 2>&1 || {
+        cat "$client/update.log" >&2; return 1;
+    }
+    (cd "$client/download" && apt-get "${transition_apt[@]}" download "pxe-tools=1.0~fixture$1") \
+        > "$client/download.log" 2>&1 || { cat "$client/download.log" >&2; return 1; }
+    cmp "$client/download/pxe-tools_1.0~fixture${1}_amd64.deb" "$2"
+}
+check_transition_client 1 "$fixture/package.deb"
+ln -sfn "$fixture/transition" "$client/repository"
+check_transition_client 2 "$fixture/package-next.deb"
+echo 'OK the same APT source and two-key keyring accepted both snapshots.'
+
 python3 "$root/tests/unit/test_openpgp_fixture_comparison.py"
 if ! python3 "$root/tests/support/compare_openpgp_fixture.py" "$fixture/public.gpg" "$fixture/exported-public.gpg"; then
     # Both files contain public fixture material only. Capture packet

@@ -81,6 +81,22 @@ class RecoveryTests(unittest.TestCase):
             module.recover(Path(d) / 'previous', False)
             self.assertTrue(gh.call_args.args[-1].endswith('/150'))
 
+    def test_recovery_checks_the_requested_signing_identity(self):
+        data = archive()
+        assets = [{'name': 'snapshot-1-1.tar.gz', 'id': 42, 'size': len(data),
+                   'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}]
+        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'id': 123}
+        result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
+             patch.object(module.subprocess, 'run', return_value=result), \
+             patch.object(module, 'live_release', return_value=b'signed release'), \
+             patch.object(module, 'gh', side_effect=[json.dumps([assets]).encode(), data]), \
+             patch.object(module, 'validate_recovered') as validate:
+            target = Path(directory) / 'previous'
+            module.recover(target, False, key='new')
+            validate.assert_called_once_with(target / 'snapshot', key='new')
+
     def test_503_does_not_authorize_bootstrap(self):
         with patch.object(module.public_http, 'fetch', return_value=(503, b'')):
             with self.assertRaisesRegex(ValueError, 'HTTP 503'): module.live_release()

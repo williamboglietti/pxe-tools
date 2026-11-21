@@ -41,18 +41,22 @@ def live_release() -> bytes | None:
 
 
 
-def validate_recovered(root: Path) -> None:
+def validate_recovered(root: Path, *, key: str = 'old') -> None:
     spec = importlib.util.spec_from_file_location('static_apt', 'packaging/native/prepare-static-apt.py')
     if spec is None or spec.loader is None:
         raise ValueError('snapshot verifier unavailable')
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
-    verifier.validate(root, Path('packaging/ci/pxe-tools-public.gpg'),
-                      'CD8B4493876B4FBD1009FE2DB195E5DE026807EC',
-                      '76CA2883C9DACEB52D9E806A1F2D96C9062271AB', allow_expired=True)
+    keyring, primary, signing = {
+        'old': ('pxe-tools-public.gpg', 'CD8B4493876B4FBD1009FE2DB195E5DE026807EC',
+                '76CA2883C9DACEB52D9E806A1F2D96C9062271AB'),
+        'new': ('pxe-tools-next-public.gpg', '17410C3B457E574257281551CFC35C536A61C3CF',
+                'A807812C7D83085301C630CD1DC963B9AF9C6908'),
+    }[key]
+    verifier.validate(root, Path('packaging/ci') / keyring, primary, signing, allow_expired=True)
 
 
-def recover(destination: Path, bootstrap: bool) -> None:
+def recover(destination: Path, bootstrap: bool, *, key: str = 'old') -> None:
     repository = os.environ['GITHUB_REPOSITORY']
     release = subprocess.run(['gh', 'api', f'repos/{repository}/releases/tags/{TAG}'],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -121,7 +125,7 @@ def recover(destination: Path, bootstrap: bool) -> None:
                 raise ValueError('snapshot destination already exists')
             destination.mkdir(parents=True)
             archive.extractall(destination, filter='data')
-            validate_recovered(destination / 'snapshot')
+            validate_recovered(destination / 'snapshot', key=key)
             print('Recovered the snapshot matching the live signed metadata.')
             return
     raise ValueError('no persistent snapshot matches the live InRelease')
@@ -131,5 +135,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('destination', type=Path)
     parser.add_argument('--bootstrap', action='store_true')
+    parser.add_argument('--key', choices=('old', 'new'), default='old')
     args = parser.parse_args()
-    recover(args.destination, args.bootstrap)
+    recover(args.destination, args.bootstrap, key=args.key)

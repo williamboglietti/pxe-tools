@@ -7,6 +7,10 @@ on:
         description: First publication only, when no prior snapshot exists
         type: boolean
         default: false
+      primary_transition:
+        description: First publication signed by the new primary, after the client keyrings are ready
+        type: boolean
+        default: false
   schedule:
     - cron: '17 3 */2 * *'
 
@@ -21,7 +25,7 @@ concurrency:
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main' && github.ref_protected
-    environment: production
+    environment: prod
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -62,11 +66,32 @@ jobs:
           PXE_CI_SIGNING_FIXTURE=1 bash tests/integration/test_ci_signing_candidate.sh
           python3 -m unittest discover -s tests -p 'test_worker_*.py' -v
           PXE_APT_PROOF_FIXTURE=1 python3 tests/integration/test_apt_provenance.py
+      - name: Recover the previously deployed snapshot
+        if: steps.manifest.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          PRIMARY_TRANSITION: ${{ inputs.primary_transition }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--key new)
+          if [[ "$PRIMARY_TRANSITION" == true ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$BOOTSTRAP" == true ]]; then
+              echo 'The primary transition requires a manual run with a previous snapshot.' >&2
+              exit 1
+            fi
+            args=(--key old)
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$BOOTSTRAP" == true ]]; then
+            args+=(--bootstrap)
+          fi
+          python3 packaging/ci/worker-snapshot.py "$RUNNER_TEMP/previous" "${args[@]}"
       - name: Retrieve the approved immutable package
         if: steps.manifest.outputs.ready == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PRIMARY_TRANSITION: ${{ inputs.primary_transition }}
         run: |
           set -euo pipefail
           manifest=packaging/ci/release-manifest.json
@@ -114,31 +139,26 @@ jobs:
               test "$(cat "$RUNNER_TEMP/build-artifact/ansible-package.sha256")" = "$(jq -er '.ansible_package_sha256' "$manifest")"
             fi
           else
-            curl --proto '=https' --silent --show-error --fail --max-time 60 --user-agent 'curl/8.14.1' \
-              https://packages.pxetools.com/apt/dists/stable/InRelease --output "$RUNNER_TEMP/prior-InRelease"
+            prior="$RUNNER_TEMP/previous/snapshot/dists/stable"
+            keyring=packaging/ci/pxe-tools-next-public.gpg
+            primary=17410C3B457E574257281551CFC35C536A61C3CF
+            signing=A807812C7D83085301C630CD1DC963B9AF9C6908
+            if [[ "$PRIMARY_TRANSITION" == true ]]; then
+              keyring=packaging/ci/pxe-tools-public.gpg
+              primary=CD8B4493876B4FBD1009FE2DB195E5DE026807EC
+              signing=76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+            fi
             python3 packaging/ci/verify-published-provenance.py \
-              --inrelease "$RUNNER_TEMP/prior-InRelease" --keyring packaging/ci/pxe-tools-public.gpg \
-              --manifest "$manifest" --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
-              --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+              --inrelease "$prior/InRelease" --packages "$prior/main/binary-amd64/Packages" \
+              --keyring "$keyring" --manifest "$manifest" \
+              --primary-fingerprint "$primary" --signing-fingerprint "$signing"
           fi
           printf '%s\n' "$asset" > "$RUNNER_TEMP/package-asset.txt"
-      - name: Recover the previously deployed snapshot
-        if: steps.manifest.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BOOTSTRAP: ${{ inputs.bootstrap }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=()
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$BOOTSTRAP" == true ]]; then
-            args+=(--bootstrap)
-          fi
-          python3 packaging/ci/worker-snapshot.py "$RUNNER_TEMP/previous" "${args[@]}"
       - name: Sign and verify the approved package
         if: steps.manifest.outputs.ready == 'true'
         shell: bash
         env:
+          PRIMARY_TRANSITION: ${{ inputs.primary_transition }}
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
           APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
         run: |
@@ -156,12 +176,17 @@ jobs:
           fi
           previous=()
           if [[ -d "$RUNNER_TEMP/previous/snapshot" ]]; then previous+=(--previous "$RUNNER_TEMP/previous/snapshot"); fi
+          if [[ "$PRIMARY_TRANSITION" == true ]]; then
+            previous+=(--previous-keyring "$PWD/packaging/ci/pxe-tools-public.gpg"
+              --previous-primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC
+              --previous-signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB)
+          fi
           python3 packaging/native/ci-sign-apt-candidate.py "${previous[@]}" \
             "$RUNNER_TEMP/package/$asset" "$RUNNER_TEMP/candidate/snapshot" \
-            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
-            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB \
+            --primary-fingerprint 17410C3B457E574257281551CFC35C536A61C3CF \
+            --signing-fingerprint A807812C7D83085301C630CD1DC963B9AF9C6908 \
             --source-commit "$source" --build-run-id "$run_id" --approved-package-sha256 "$sha" \
-            --public-key-output "$RUNNER_TEMP/candidate/public.gpg" "${module_args[@]}"
+            "${module_args[@]}"
       - name: Retain signed snapshot for publication
         if: steps.manifest.outputs.ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -177,7 +202,7 @@ jobs:
       actions: read
     needs: prepare
     if: needs.prepare.outputs.ready == 'true'
-    environment: production
+    environment: prod
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -204,11 +229,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmp "$RUNNER_TEMP/candidate/public.gpg" packaging/ci/pxe-tools-public.gpg
           python3 packaging/native/prepare-static-apt.py "$RUNNER_TEMP/candidate/snapshot" "$RUNNER_TEMP/assets" \
-            --keyring packaging/ci/pxe-tools-public.gpg \
-            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
-            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+            --keyring packaging/ci/pxe-tools-next-public.gpg \
+            --primary-fingerprint 17410C3B457E574257281551CFC35C536A61C3CF \
+            --signing-fingerprint A807812C7D83085301C630CD1DC963B9AF9C6908
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24

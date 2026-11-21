@@ -2,6 +2,8 @@
 
 Pour les limites actuelles de rotation de clé, la reprise des instantanés et la portée des essais APT, voir [état de la rotation et reprise](../../docs/apt-trust-and-recovery.md).
 
+Pour le changement de primaire et la préparation des clients existants, suivre la [procédure de transition](../../docs/apt-primary-transition.md).
+
 Les constructeurs natifs exigent un checkout Git avec son index : les entrées
 copiées doivent être suivies et lisibles selon les modes publics. Une archive
 source sans métadonnées Git est refusée ; reconstruisez depuis un checkout
@@ -17,7 +19,7 @@ ne présentent aucune modification suivie.
 
 Le dépôt prévu est `https://packages.pxetools.com/apt/`, avec la clé publique à
 `https://packages.pxetools.com/pxe-tools-archive-keyring.gpg` (empreinte
-`CD8B4493876B4FBD1009FE2DB195E5DE026807EC`). Debian 13 amd64 est la seule
+`17410C3B457E574257281551CFC35C536A61C3CF` après la transition). Debian 13 amd64 est la seule
 plateforme dont le parcours a été validé ; MySQL et MariaDB ne sont pas pris en
 charge par le paquet natif.
 
@@ -43,7 +45,7 @@ empreintes avant publication. Les deux grosses archives dépassent la limite de
 Worker. Les notices applicatives pointent directement vers cette release.
 
 Avant la première publication, créer une release GitHub publique persistante
-`apt-snapshots` et configurer dans l'environnement GitHub `production` les
+`apt-snapshots` et configurer dans l'environnement GitHub `prod` les
 secrets `APT_SIGNING_KEY`, `APT_SIGNING_PASSPHRASE`, `PACKAGES_PXETOOLS_COM` et
 la variable `CLOUDFLARE_ACCOUNT_ID`. Le jeton Cloudflare doit être limité au
 Worker de distribution ; l'association du domaine est gérée séparément. La première exécution manuelle

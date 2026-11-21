@@ -44,7 +44,7 @@ jobs:
   verify-production-signature:
     needs: verify
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected
-    environment: production
+    environment: prod
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -71,6 +71,6 @@ jobs:
         run: |
           python3 packaging/native/ci-sign-apt-candidate.py \
             "$RUNNER_TEMP/fixture.deb" "$RUNNER_TEMP/fixture-apt" \
-            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
-            --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+            --primary-fingerprint 17410C3B457E574257281551CFC35C536A61C3CF \
+            --signing-fingerprint A807812C7D83085301C630CD1DC963B9AF9C6908
       # No upload or publication: this signs only a local synthetic fixture.

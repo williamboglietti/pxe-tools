@@ -24,6 +24,16 @@ jobs:
         run: npm ci --prefix packaging/cloudflare
       - name: Verify APT candidate with disposable keys
         run: PXE_RELEASE_APT_FIXTURE=1 bash tests/integration/test_apt_release_candidate.sh
+      - name: Rehearse client certificate and APT publication staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/integration/test_apt_signing_rotation.py -v
+          PXE_APT_ROTATION_FIXTURE=1 bash tests/integration/test_apt_rotation_rehearsal.sh
+      - name: Verify public APT from an isolated empty client state
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: PXE_PUBLIC_APT_READONLY=1 bash tests/integration/test_public_apt_readonly.sh
       - name: Verify version upload and deployment ordering
         run: bash tests/integration/test_worker_version_deploy.sh
       - name: Verify bounded public HTTP helper

@@ -51,6 +51,39 @@ class RecoveryTests(unittest.TestCase):
                         with self.assertRaises(ValueError): module.recover(target, False)
                         self.assertFalse(target.exists())
 
+    def test_alternate_trust_requires_complete_explicit_identities_before_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            keyring = root / 'keyring.gpg'
+            keyring.write_bytes(b'fixture')
+            for options in ({'keyring': keyring},
+                            {'keyring': keyring, 'primary': 'A' * 40},
+                            {'keyring': keyring, 'primary': 'A' * 40, 'signing': 'not-a-fingerprint'},
+                            {'keyring': root / 'missing', 'primary': 'A' * 40, 'signing': 'B' * 40}):
+                with self.subTest(options=options), patch.object(module.subprocess, 'run') as remote:
+                    with self.assertRaisesRegex(ValueError, 'complete explicit'):
+                        module.recover(root / 'destination', False, **options)
+                    remote.assert_not_called()
+                    self.assertFalse((root / 'destination').exists())
+
+    def test_failed_validation_leaves_no_partial_recovery(self):
+        data = archive()
+        assets = [{'name': 'snapshot-1-1.tar.gz', 'id': 42, 'size': len(data),
+                   'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}]
+        metadata = {'tag_name': 'apt-snapshots', 'draft': False, 'id': 123}
+        result = subprocess.CompletedProcess([], 0, json.dumps(metadata).encode())
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
+             patch.object(module.subprocess, 'run', return_value=result), \
+             patch.object(module, 'live_release', return_value=b'signed release'), \
+             patch.object(module, 'gh', side_effect=[json.dumps([assets]).encode(), data]), \
+             patch.object(module, 'validate_recovered', side_effect=ValueError('invalid signature')):
+            target = Path(d) / 'previous'
+            with self.assertRaisesRegex(ValueError, 'invalid signature'):
+                module.recover(target, False)
+            self.assertFalse(target.exists())
+            self.assertFalse(list(Path(d).glob('.pxe-recover-*')))
+
     def test_stale_live_release_cannot_select_an_older_snapshot(self):
         older = archive(content=b'old release')
         newer = archive(content=b'new release')

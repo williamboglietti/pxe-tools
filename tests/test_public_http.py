@@ -10,6 +10,13 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 class HttpTests(unittest.TestCase):
+    def test_transition_url_is_fixed_and_validated_before_fetch(self):
+        with patch.object(module, '_fetch', return_value=(200, b'ok')) as fetch:
+            self.assertEqual(module.fetch_transition('a' * 64, 'new.InRelease'), (200, b'ok'))
+            fetch.assert_called_once_with('https://packages.pxetools.com/apt-transition/sha256/' + 'a' * 64 + '/new.InRelease')
+            with self.assertRaises(ValueError):
+                module.fetch_transition('a' * 64, '../secret')
+            self.assertEqual(fetch.call_count, 1)
     def test_http_status_and_body_are_returned(self):
         def curl(args, **kwargs):
             self.assertEqual(args[0], 'curl')

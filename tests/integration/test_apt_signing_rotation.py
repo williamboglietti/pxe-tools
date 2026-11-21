@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-only
 """Characterize signing-subkey rotation using temporary keys and no APT state."""
+import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +12,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SIGNER = ROOT / 'packaging/native/ci-sign-apt-candidate.py'
+INSPECTOR = ROOT / 'packaging/native/check-apt-key-transition.py'
+spec = importlib.util.spec_from_file_location('pxe_apt_rotation_proof', ROOT / 'packaging/ci/apt-proof.py')
+proof = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(proof)
 
 
 class SigningRotationFixture(unittest.TestCase):
@@ -76,6 +82,59 @@ class SigningRotationFixture(unittest.TestCase):
         self.assertNotEqual(self.verify(self.old_key, self.new_signature).returncode, 0)
         self.assert_signer(self.verify(self.new_key, self.new_signature), self.new_signer)
         self.assert_signer(self.verify(self.new_key, self.old_signature), self.old_signer)
+
+    def test_provenance_keyring_requires_an_explicit_exact_transition_pair(self):
+        proof.validate_keyring(self.old_key, self.primary, self.old_signer)
+        with self.assertRaises(ValueError):
+            proof.validate_keyring(self.new_key, self.primary, self.new_signer)
+        proof.validate_keyring(self.new_key, self.primary, self.new_signer, self.old_signer)
+        with self.assertRaises(ValueError):
+            proof.validate_keyring(self.new_key, self.primary, self.new_signer, '0' * 40)
+        with self.assertRaises(ValueError):
+            proof.validate_keyring(self.new_key, self.primary, self.new_signer, self.new_signer)
+
+    def test_read_only_inspector_pins_certificate_shapes_and_rejects_wrong_material(self):
+        def check(old_key, new_key, primary, old, new):
+            return subprocess.run([sys.executable, str(INSPECTOR),
+                                   '--old-certificate', str(old_key), '--new-certificate', str(new_key),
+                                   '--primary-fingerprint', primary, '--old-signing-fingerprint', old,
+                                   '--new-signing-fingerprint', new], capture_output=True, text=True)
+        before = (self.old_key.read_bytes(), self.new_key.read_bytes())
+        result = check(self.old_key, self.new_key, self.primary, self.old_signer, self.new_signer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import hashlib
+        report = json.loads(result.stdout)
+        self.assertEqual(report['new_certificate_sha256'], hashlib.sha256(before[1]).hexdigest())
+        self.assertTrue(report['independent_fingerprint_verification_required'])
+        self.assertFalse(report['client_keyring_modified'])
+        self.assertEqual((self.old_key.read_bytes(), self.new_key.read_bytes()), before)
+        self.assertNotEqual(check(self.old_key, self.new_key, self.primary, self.old_signer, '0' * 40).returncode, 0)
+        self.assertNotEqual(check(self.old_key, self.old_key, self.primary, self.old_signer, self.new_signer).returncode, 0)
+        secret = self.root / 'secret-old.gpg'
+        secret.write_bytes(self.run_checked(*self.gpg, '--export-secret-keys', self.primary))
+        self.assertNotEqual(check(secret, self.new_key, self.primary, self.old_signer, self.new_signer).returncode, 0)
+        link = self.root / 'old-link.gpg'
+        link.symlink_to(self.old_key)
+        self.assertNotEqual(check(link, self.new_key, self.primary, self.old_signer, self.new_signer).returncode, 0)
+
+    def test_transition_imports_only_old_public_subkey_before_calling_builder(self):
+        secret = self.run_checked(*self.gpg, '--armor', '--export-secret-subkeys',
+                                  self.new_signer + '!').decode()
+        env = dict(os.environ, APT_SIGNING_KEY=secret, APT_SIGNING_PASSPHRASE=self.passphrase,
+                   TMPDIR='/tmp')
+        result = subprocess.run([sys.executable, str(SIGNER), str(self.root / 'missing.deb'),
+                                 str(self.root / 'unused-transition'),
+                                 '--primary-fingerprint', self.primary,
+                                 '--signing-fingerprint', self.new_signer,
+                                 '--previous', str(self.root),
+                                 '--transition-previous-signing-fingerprint', self.old_signer,
+                                 '--transition-previous-public-key', str(self.old_key)],
+                                env=env, capture_output=True, text=True)
+        # The deliberately absent package makes the builder fail only after the
+        # signer has accepted the public-only transition and invoked it.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('python3 failed', result.stderr)
+        self.assertFalse((self.root / 'unused-transition').exists())
 
     def test_current_ci_signer_refuses_a_bundle_with_two_signing_subkeys(self):
         secret = self.run_checked(*self.gpg, '--armor', '--export-secret-subkeys', self.primary).decode()

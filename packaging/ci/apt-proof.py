@@ -19,7 +19,8 @@ def verify_signature(keyring: Path, infile: Path, signing: str, primary: str,
         raise ValueError('Unexpected APT signing subkey or primary')
 
 
-def validate_keyring(keyring: Path, primary: str, signing: str) -> None:
+def validate_keyring(keyring: Path, primary: str, signing: str,
+                     additional_signing: str | None = None) -> None:
     if keyring.is_symlink() or not keyring.is_file() or keyring.stat().st_size > 131072:
         raise ValueError('Public keyring must be a small regular file')
     shown = subprocess.run(['gpg', '--batch', '--with-colons', '--show-keys', str(keyring)], capture_output=True)
@@ -28,12 +29,20 @@ def validate_keyring(keyring: Path, primary: str, signing: str) -> None:
         raise ValueError('Cannot inspect public keyring')
     rows = [line.split(':') for line in shown.stdout.decode('utf-8').splitlines()]
     fingerprints = [row[9].upper() for row in rows if row[0] == 'fpr']
+    expected_subkeys = {signing}
+    if additional_signing is not None:
+        if (not re.fullmatch(r'(?:[0-9A-F]{40}|[0-9A-F]{64})', additional_signing)
+                or additional_signing in (primary, signing)):
+            raise ValueError('Invalid additional transition signing fingerprint')
+        expected_subkeys.add(additional_signing)
     if (len([row for row in rows if row[0] == 'pub']) != 1
-            or len([row for row in rows if row[0] == 'sub']) != 1
-            or fingerprints != [primary, signing]
+            or len([row for row in rows if row[0] == 'sub']) != len(expected_subkeys)
+            or len(fingerprints) != 1 + len(expected_subkeys)
+            or not fingerprints or fingerprints[0] != primary
+            or set(fingerprints[1:]) != expected_subkeys
             or any(row[0] in ('sec', 'ssb') for row in rows)
             or re.search(rb':secret (?:sub )?key packet:', packets.stdout)):
-        raise ValueError('Keyring must contain only the expected public primary and signing subkey')
+        raise ValueError('Keyring must contain only the expected public primary and signing subkeys')
 
 
 def package_identity(snapshot: dict[str, bytes], module: tuple[str, str] | None = None) -> tuple[str, str]:

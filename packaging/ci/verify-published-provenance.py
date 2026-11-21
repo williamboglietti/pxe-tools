@@ -17,10 +17,10 @@ publisher=importlib.util.module_from_spec(spec);spec.loader.exec_module(publishe
 
 
 def verify(inrelease: Path, keyring: Path, manifest: dict, primary: str, signing: str,
-           packages: Path | None = None) -> None:
+           packages: Path | None = None, additional_signing: str | None = None) -> None:
     # The signed previous metadata may have expired: it is used only as proof
     # of an earlier publication, not accepted as a currently usable APT index.
-    publisher.validate_keyring(keyring,primary,signing)
+    publisher.validate_keyring(keyring,primary,signing,additional_signing)
     with tempfile.TemporaryDirectory(prefix='pxe-prior-proof-') as tmp:
         clear=Path(tmp)/'Release'
         publisher.verify_signature(keyring,inrelease,signing,primary,output=clear)
@@ -63,9 +63,10 @@ def main() -> None:
     p.add_argument('--inrelease',type=Path,required=True);p.add_argument('--keyring',type=Path,required=True)
     p.add_argument('--manifest',type=Path,required=True);p.add_argument('--primary-fingerprint',required=True)
     p.add_argument('--signing-fingerprint',required=True);p.add_argument('--packages',type=Path)
+    p.add_argument('--additional-signing-fingerprint',help='other pinned public subkey during an explicit transition')
     args=p.parse_args()
     verify(args.inrelease,args.keyring,json.loads(args.manifest.read_text()),
-           args.primary_fingerprint,args.signing_fingerprint,args.packages)
+           args.primary_fingerprint,args.signing_fingerprint,args.packages,args.additional_signing_fingerprint)
     print('Previously published signed provenance matches the approved build and package.')
 
 

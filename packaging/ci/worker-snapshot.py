@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -41,18 +42,30 @@ def live_release() -> bytes | None:
 
 
 
-def validate_recovered(root: Path) -> None:
+def validate_recovered(root: Path, keyring: Path, primary: str, signing: str) -> None:
     spec = importlib.util.spec_from_file_location('static_apt', 'packaging/native/prepare-static-apt.py')
     if spec is None or spec.loader is None:
         raise ValueError('snapshot verifier unavailable')
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
-    verifier.validate(root, Path('packaging/ci/pxe-tools-public.gpg'),
-                      'CD8B4493876B4FBD1009FE2DB195E5DE026807EC',
-                      '76CA2883C9DACEB52D9E806A1F2D96C9062271AB', allow_expired=True)
+    verifier.validate(root, keyring, primary, signing, allow_expired=True)
 
 
-def recover(destination: Path, bootstrap: bool) -> None:
+def recover(destination: Path, bootstrap: bool, *, keyring: Path | None = None,
+            primary: str | None = None, signing: str | None = None) -> None:
+    # An alternate trust anchor is accepted only as a complete, explicit set.
+    # The production workflow passes none of these and retains its fixed pins.
+    alternate = (keyring, primary, signing)
+    if any(value is not None for value in alternate):
+        if (not all(value is not None for value in alternate)
+                or not all(re.fullmatch(r'(?:[0-9A-F]{40}|[0-9A-F]{64})', value or '')
+                           for value in (primary, signing))
+                or keyring.is_symlink() or not keyring.is_file()):
+            raise ValueError('complete explicit snapshot verification identities are required')
+    else:
+        keyring = Path('packaging/ci/pxe-tools-public.gpg')
+        primary = 'CD8B4493876B4FBD1009FE2DB195E5DE026807EC'
+        signing = '76CA2883C9DACEB52D9E806A1F2D96C9062271AB'
     repository = os.environ['GITHUB_REPOSITORY']
     release = subprocess.run(['gh', 'api', f'repos/{repository}/releases/tags/{TAG}'],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -117,11 +130,21 @@ def recover(destination: Path, bootstrap: bool) -> None:
                 continue
             if signed is None or signed.read(1024 * 1024 + 1) != live:
                 continue
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 raise ValueError('snapshot destination already exists')
-            destination.mkdir(parents=True)
-            archive.extractall(destination, filter='data')
-            validate_recovered(destination / 'snapshot')
+            # Never expose an extracted snapshot until every signature and object
+            # has passed validation. A failed check leaves no recovery directory.
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.pxe-recover-', dir=destination.parent) as temporary:
+                staging = Path(temporary)
+                archive.extractall(staging, filter='data')
+                validate_recovered(staging / 'snapshot', keyring, primary, signing)
+                destination.mkdir(mode=0o700)
+                try:
+                    os.rename(staging / 'snapshot', destination / 'snapshot')
+                except BaseException:
+                    destination.rmdir()
+                    raise
             print('Recovered the snapshot matching the live signed metadata.')
             return
     raise ValueError('no persistent snapshot matches the live InRelease')
@@ -131,5 +154,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('destination', type=Path)
     parser.add_argument('--bootstrap', action='store_true')
+    parser.add_argument('--verification-keyring', type=Path, help='explicit public keyring for a rehearsed transition')
+    parser.add_argument('--verification-primary', help='complete expected primary fingerprint')
+    parser.add_argument('--verification-signing', help='complete expected signing subkey fingerprint')
     args = parser.parse_args()
-    recover(args.destination, args.bootstrap)
+    recover(args.destination, args.bootstrap, keyring=args.verification_keyring,
+            primary=args.verification_primary, signing=args.verification_signing)

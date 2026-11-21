@@ -7,6 +7,10 @@ on:
         description: First publication only, when no prior snapshot exists
         type: boolean
         default: false
+      transition_rehearsal:
+        description: Disposable transition rehearsal only; never publish
+        type: boolean
+        default: false
   schedule:
     - cron: '17 3 */2 * *'
 
@@ -15,12 +19,48 @@ permissions:
   actions: read
 
 concurrency:
-  group: pxe-apt-publication
+  # Rehearsals cannot delay or cancel the production renewal group.
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.transition_rehearsal == true && format('pxe-apt-rehearsal-{0}', github.run_id) || 'pxe-apt-publication' }}
   cancel-in-progress: false
 
 jobs:
+  transition-rehearsal:
+    # Explicit manual input: isolated fixtures only, no production environment,
+    # secrets, release publication, Worker deployment or real certificates.
+    if: github.event_name == 'workflow_dispatch' && inputs.transition_rehearsal == true
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install fixture dependencies
+        run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg gpgv python3
+      - name: Stage the source-only client transition candidate
+        shell: bash
+        run: bash packaging/ci/stage-client-transition.sh "$RUNNER_TEMP/client-transition"
+      - name: Rehearse bundled client certificate tool and static APT staging
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/client-transition" && sha256sum --check SHA256SUMS)
+          export PXE_CLIENT_TRANSITION_TOOL="$RUNNER_TEMP/client-transition/packaging/native/prepare-client-key-transition.py"
+          PXE_APT_ROTATION_FIXTURE=1 bash tests/integration/test_apt_rotation_rehearsal.sh
+      - name: Retain candidate for review (no certificates)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pxe-client-transition-candidate
+          path: ${{ runner.temp }}/client-transition/
+          if-no-files-found: error
+          retention-days: 7
+
   prepare:
-    if: github.ref == 'refs/heads/main' && github.ref_protected
+    # Rehearsal must never sign, upload or deploy, even on protected main.
+    if: github.ref == 'refs/heads/main' && github.ref_protected && !(github.event_name == 'workflow_dispatch' && inputs.transition_rehearsal == true)
     environment: production
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -209,6 +249,12 @@ jobs:
             --keyring packaging/ci/pxe-tools-public.gpg \
             --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC \
             --signing-fingerprint 76CA2883C9DACEB52D9E806A1F2D96C9062271AB
+          # The checked-in list is empty by default. Each future entry needs
+          # independently reviewed public material and a separate release decision.
+          python3 packaging/ci/stage-published-client-transitions.py \
+            --assets "$RUNNER_TEMP/assets" --config packaging/ci/client-transitions.json \
+            --data-root packaging/ci/client-transition-data \
+            --primary-fingerprint CD8B4493876B4FBD1009FE2DB195E5DE026807EC
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -237,3 +283,4 @@ jobs:
         run: |
           set -euo pipefail
           python3 packaging/ci/wait-worker-release.py "$RUNNER_TEMP/candidate/snapshot/dists/stable/InRelease"
+          python3 packaging/ci/wait-worker-client-transitions.py "$RUNNER_TEMP/assets"

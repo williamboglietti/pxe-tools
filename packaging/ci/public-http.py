@@ -10,13 +10,13 @@ URL = 'https://packages.pxetools.com/apt/dists/stable/InRelease'
 LIMIT = 1024 * 1024
 
 
-def fetch() -> tuple[int, bytes]:
+def _fetch(url: str) -> tuple[int, bytes]:
     with tempfile.TemporaryDirectory(prefix='pxe-public-http-') as temporary:
         target = Path(temporary) / 'body'
         result = subprocess.run(['curl', '--proto', '=https', '--silent', '--show-error',
                                  '--max-time', '20', '--max-filesize', str(LIMIT),
                                  '--user-agent', 'curl/8.14.1', '--header', 'Cache-Control: no-cache',
-                                 '--output', str(target), '--write-out', '%{http_code}', URL],
+                                 '--output', str(target), '--write-out', '%{http_code}', url],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
         if result.returncode:
             raise ValueError(f'Public HTTPS request failed (curl exit {result.returncode})')
@@ -26,3 +26,14 @@ def fetch() -> tuple[int, bytes]:
         if not target.is_file() or target.stat().st_size > LIMIT:
             raise ValueError('Public HTTPS response body is missing or too large')
         return int(status), target.read_bytes()
+
+
+def fetch() -> tuple[int, bytes]:
+    return _fetch(URL)
+
+
+def fetch_transition(ident: str, name: str) -> tuple[int, bytes]:
+    if not re.fullmatch(r'[0-9a-f]{64}', ident) or name not in (
+            'old-public.gpg', 'new-public.gpg', 'old.InRelease', 'new.InRelease'):
+        raise ValueError('invalid public transition object')
+    return _fetch(f'https://packages.pxetools.com/apt-transition/sha256/{ident}/{name}')

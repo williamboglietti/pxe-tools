@@ -586,6 +586,90 @@ body:has(.mobile-drawer[open]) { overflow: hidden; }
 .field > :is(input, select, textarea) { width: 100%; min-width: 0; }
 .console-main > .page-links { align-items: center; gap: var(--space-2) var(--space-4); margin: 0 0 var(--space-5); }
 .page-links a { display: inline-flex; align-items: center; min-height: 2rem; font-size: .9375rem; font-weight: 600; }
+.accounts-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  margin-block-end: var(--space-5);
+}
+.accounts-toolbar > a:not(.button) { font-weight: 600; font-size: .9375rem; }
+.accounts-list {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  list-style: none;
+}
+.account-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 7rem auto;
+  align-items: center;
+  gap: var(--space-2) var(--space-5);
+  padding: var(--space-4) var(--space-5);
+}
+.account-row + .account-row { border-block-start: 1px solid var(--line); }
+.account-identity { display: grid; gap: var(--space-1); }
+.account-identity .muted { font-size: .875rem; }
+.account-dialog {
+  width: min(44rem, calc(100% - var(--space-5)));
+  max-block-size: min(49rem, calc(100dvh - var(--space-5)));
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 16px 52px rgb(var(--shadow-ink) / .24);
+}
+.account-dialog::backdrop { background: var(--drawer-backdrop); }
+body:has(.account-dialog[open]) { overflow: hidden; }
+.account-dialog > form {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-block-size: inherit;
+}
+.account-dialog-header, .account-dialog-body, .account-dialog-actions {
+  padding: var(--space-4) clamp(var(--space-4), 4vw, var(--space-5));
+}
+.account-dialog-header { border-block-end: 1px solid var(--line); }
+.account-dialog-header > h2 { margin: 0; font-size: 1.3rem; }
+.account-dialog-header > h2:focus { outline: none; }
+.account-dialog-header > p { margin: var(--space-1) 0 0; overflow-wrap: anywhere; }
+.account-dialog-body { gap: var(--space-3); overflow-y: auto; overscroll-behavior: contain; }
+.account-dialog-error {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: .875rem;
+}
+.account-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  border-block-start: 1px solid var(--line);
+}
+.account-dialog:target:not([open]) {
+  position: static;
+  display: block;
+  width: min(100%, 44rem);
+  max-block-size: none;
+  margin: var(--space-5) 0 0;
+  border: 1px solid var(--line);
+  box-shadow: none;
+  scroll-margin-top: calc(var(--header-height) + var(--space-4));
+}
+@media (min-width: 37.5rem) {
+  .account-dialog .permission-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: .9375rem; }
+  .account-dialog .permission-inheritance { grid-column: 1 / -1; }
+}
+@media (max-width: 32rem) {
+  .account-row { grid-template-columns: minmax(0, 1fr) auto; padding-inline: var(--space-4); }
+  .account-row > .button { grid-column: 2; grid-row: 1 / 3; }
+}
 .filter-form {
   display: grid;
   grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)) auto;

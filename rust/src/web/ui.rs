@@ -352,21 +352,35 @@ pub(super) fn home(account: &Account) -> &'static str {
         .map_or(super::profile::ROUTE, |(path, ..)| *path)
 }
 
-fn profile_menu(account: &Account, section: ConsoleSection) -> String {
+fn profile_menu(account: &Account, links: &str, drawer: bool) -> String {
+    let (menu, options) = if drawer {
+        ("drawer-account", "drawer-profile-options")
+    } else {
+        ("profile-menu", "profile-options")
+    };
     let mut html = format!(
-        r#"<details class="profile-menu"><summary class="button button--quiet">{}<span class="profile-name">"#,
+        r#"<details class="{menu}"><summary class="button button--quiet">{}<span class="profile-name">"#,
         icon(PERSON),
     );
     escape(&mut html, &account.username);
     write!(
         html,
-        r#"</span>{}</summary><div class="profile-options">"#,
+        r#"</span>{}</summary><div class="{options}">"#,
         icon(CHEVRON)
     )
     .expect("write to String");
-    html.push_str(r#"<p class="profile-account">"#);
-    escape(&mut html, &account.username);
-    html.push_str("</p>");
+    if !drawer {
+        html.push_str(r#"<p class="profile-account">"#);
+        escape(&mut html, &account.username);
+        html.push_str("</p>");
+    }
+    html.push_str(links);
+    html.push_str("</div></details>");
+    html
+}
+
+fn profile_links(account: &Account, section: ConsoleSection) -> String {
+    let mut html = String::new();
     let mut link = |path, label, item, glyph| {
         let current = if section == item {
             r#" aria-current="page""#
@@ -398,7 +412,6 @@ fn profile_menu(account: &Account, section: ConsoleSection) -> String {
         write!(html, r#"<form method="post" action="/logout"><button type="submit" class="profile-option">{}<span>Se déconnecter</span></button></form>"#, icon(LOGOUT))
             .expect("write to String");
     }
-    html.push_str("</div></details>");
     html
 }
 
@@ -426,18 +439,17 @@ fn notification_menu(account: &Account) -> String {
 
 pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply {
     let brand = brand();
-    let (mask, actions) = NAVIGATION_CONTEXT.with_borrow(|context| {
+    let (mask, actions, drawer_profile) = NAVIGATION_CONTEXT.with_borrow(|context| {
         context.as_ref().map_or_else(
-            || (u16::MAX, String::new()),
+            || (u16::MAX, String::new(), String::new()),
             |nav| {
                 let notices = super::notifications::available_to(&nav.account)
                     .then(|| notification_menu(&nav.account))
                     .unwrap_or_default();
-                let profile = profile_menu(&nav.account, section);
-                (
-                    nav.mask,
-                    format!(r#"<div class="masthead-actions">{notices}{profile}</div>"#),
-                )
+                let links = profile_links(&nav.account, section);
+                let profile = profile_menu(&nav.account, &links, false);
+                let drawer = profile_menu(&nav.account, &links, true);
+                (nav.mask, format!("{notices}{profile}"), drawer)
             },
         )
     });
@@ -453,11 +465,10 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
     write!(
         layout,
         r#"<a class="brand-link" href="{home}">{brand}</a><span class="masthead-label">Console d’administration</span>
-<button type="button" class="button button--quiet mobile-toggle" aria-label="Ouvrir le menu de navigation" aria-haspopup="dialog" aria-controls="mobile-navigation" aria-expanded="false">{}<span>Menu</span></button>"#,
+<div class="masthead-actions">{actions}<button type="button" class="button button--quiet mobile-toggle" aria-label="Ouvrir le menu de navigation" aria-haspopup="dialog" aria-controls="mobile-navigation" aria-expanded="false">{}</button></div>"#,
         icon(MENU),
     )
     .expect("write to String");
-    layout.push_str(&actions);
     let mut navigation = String::new();
     for (group, links) in NAVIGATION {
         if !links.iter().any(|(_, _, item, _)| show(*item)) {
@@ -486,7 +497,7 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
         layout,
         r#"</header><dialog id="mobile-navigation" class="mobile-drawer" aria-label="Navigation PXE Tools">
 <div class="drawer-body"><div class="drawer-header">{brand}<form method="dialog"><button type="submit" class="button button--quiet drawer-close" aria-label="Fermer le menu" autofocus>{}</button></form></div>
-<nav class="rail" aria-label="Navigation principale">{navigation}</nav>"#,
+{drawer_profile}<nav class="rail" aria-label="Navigation principale">{navigation}</nav>"#,
         icon(CLOSE)
     )
     .expect("write to String");

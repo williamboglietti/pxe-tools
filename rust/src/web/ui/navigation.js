@@ -13,10 +13,7 @@
     trigger.setAttribute('aria-expanded', 'false');
   });
   drawer.addEventListener('click', event => {
-    if (event.target === drawer) drawer.close();
-  });
-  drawer.querySelector('nav').addEventListener('click', event => {
-    if (event.target.closest('a')) drawer.close();
+    if (event.target === drawer || event.target.closest('a')) drawer.close();
   });
   compact.addEventListener('change', () => {
     if (!compact.matches && drawer.open) drawer.close();

@@ -12,6 +12,9 @@
     for (const input of document.querySelectorAll('[data-theme-choice]')) {
       input.checked = input.value === choice;
     }
+    for (const label of document.querySelectorAll('[data-theme-label]')) {
+      label.textContent = { auto: 'Système', light: 'Clair', dark: 'Sombre' }[choice];
+    }
   }
 
   apply();

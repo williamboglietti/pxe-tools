@@ -43,6 +43,24 @@
 })();
 
 (() => {
+  for (const fields of document.querySelectorAll('[data-account-rights]')) {
+    const admin = fields.form.elements.namedItem('admin');
+    const scopes = Array.from(fields.querySelectorAll('input[name="scope"]'));
+    let assigned = scopes.map(scope => fields.disabled
+      ? scope.hasAttribute('data-assigned') : scope.checked);
+
+    function applyRole() {
+      if (admin.checked && !fields.disabled) assigned = scopes.map(scope => scope.checked);
+      fields.disabled = admin.checked;
+      scopes.forEach((scope, index) => { scope.checked = admin.checked || assigned[index]; });
+    }
+
+    applyRole();
+    admin.addEventListener('change', applyRole);
+  }
+})();
+
+(() => {
   const menu = document.querySelector('[data-notifications]');
   if (!menu) return;
   const summary = menu.querySelector('summary');

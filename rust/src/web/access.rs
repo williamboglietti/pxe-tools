@@ -448,8 +448,11 @@ pub(super) fn users(
                         return Ok(conflict("Conservez au moins un administrateur actif\n"));
                     }
                 }
+                // An administrator inherits every scope. The disabled rights
+                // fields are omitted from the browser's form submission.
                 tx.execute(
-                    "UPDATE users SET is_admin=?2,enabled=?3,permissions=?4,
+                    "UPDATE users SET is_admin=?2,enabled=?3,
+                       permissions=CASE WHEN ?2 THEN permissions ELSE ?4 END,
                        managed_password_hash=COALESCE(?5,managed_password_hash,password_hash),password_hash='!',
                        session_epoch=session_epoch+CASE WHEN NOT ?3 OR ?5 IS NOT NULL THEN 1 ELSE 0 END
                      WHERE id=?1",
@@ -583,20 +586,43 @@ pub(super) fn tokens(
     ))
 }
 
-fn checkboxes(html: &mut String, offered: i64, selected: i64) -> std::fmt::Result {
-    html.push_str(r#"<fieldset class="permission-fields"><legend>Droits</legend>"#);
+fn checkboxes(
+    html: &mut String,
+    offered: i64,
+    selected: i64,
+    account_admin: Option<bool>,
+) -> std::fmt::Result {
+    let attributes = match account_admin {
+        Some(true) => " data-account-rights disabled",
+        Some(false) => " data-account-rights",
+        None => "",
+    };
+    let inherited = account_admin == Some(true);
+    write!(
+        html,
+        r#"<fieldset class="permission-fields"{attributes}><legend>Droits</legend>"#
+    )?;
+    if account_admin.is_some() {
+        html.push_str(r#"<p class="permission-inheritance">Le rôle administrateur donne tous les droits. Décochez « Administrateur » pour choisir les droits individuellement.</p>"#);
+    }
     for (scope, code, label, _) in SCOPES {
         if offered & scope.bit() == 0 {
             continue;
         }
-        let checked = if selected & scope.bit() != 0 {
+        let assigned = selected & scope.bit() != 0;
+        let fallback = if inherited && assigned {
+            " data-assigned"
+        } else {
+            ""
+        };
+        let checked = if inherited || assigned {
             " checked"
         } else {
             ""
         };
         write!(
             html,
-            r#"<label class="check-label"><input type="checkbox" name="scope" value="{code}"{checked}> {label}</label>"#
+            r#"<label class="check-label"><input type="checkbox" name="scope" value="{code}"{fallback}{checked}> {label}</label>"#
         )?;
     }
     html.push_str("</fieldset>");
@@ -639,7 +665,7 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
         html.push_str(r#"<div class="field"><label for="new-password">Mot de passe initial</label><input id="new-password" type="password" name="password" minlength="12" maxlength="72" autocomplete="new-password" required></div>"#);
     }
     html.push_str(r#"<label class="check-label"><input type="checkbox" name="admin" value="1"> Administrateur</label>"#);
-    checkboxes(&mut html, offered, 0)?;
+    checkboxes(&mut html, offered, 0, Some(false))?;
     html.push_str(r#"<div class="form-actions"><button name="action" value="create">Créer le compte</button></div></form></details>"#);
     let mut rows = db.prepare(
         "SELECT id,username,is_admin,enabled,permissions
@@ -649,11 +675,8 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
-        let admin = if row.get::<_, bool>(2)? {
-            " checked"
-        } else {
-            ""
-        };
+        let is_admin: bool = row.get(2)?;
+        let admin = if is_admin { " checked" } else { "" };
         let enabled = if row.get::<_, bool>(3)? {
             " checked"
         } else {
@@ -661,10 +684,10 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
         };
         let state = if enabled.is_empty() {
             "désactivé"
-        } else if admin.is_empty() {
-            "accès personnalisé"
-        } else {
+        } else if is_admin {
             "administrateur"
+        } else {
+            "accès personnalisé"
         };
         html.push_str(r#"<details class="panel panel--form"><summary>"#);
         escape(
@@ -688,7 +711,7 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
                 r#"<div class="field"><label for="account-password-{id}">Nouveau mot de passe (facultatif)</label><input id="account-password-{id}" type="password" name="password" minlength="12" maxlength="72" autocomplete="new-password"></div>"#
             )?;
         }
-        checkboxes(&mut html, offered, row.get(4)?)?;
+        checkboxes(&mut html, offered, row.get(4)?, Some(is_admin))?;
         html.push_str(r#"<div class="form-actions"><button name="action" value="update">Enregistrer les droits</button></div></form></details>"#);
     }
     let mut events = db.prepare(
@@ -739,7 +762,7 @@ fn tokens_page(
 <div class="field"><label for="token-name">Nom du jeton</label><input id="token-name" name="name" maxlength="100" required></div>
 <div class="field"><label for="token-days">Durée de validité en jours</label><input id="token-days" name="days" type="number" min="1" max="365" value="30" required></div>"#
         )?;
-        checkboxes(&mut html, offered, 0)?;
+        checkboxes(&mut html, offered, 0, None)?;
         html.push_str(r#"<div class="form-actions"><button name="action" value="create">Créer le jeton</button></div></form></details>"#);
     }
     let mut rows = db.prepare(
@@ -789,7 +812,7 @@ fn tokens_page(
                 r#"<form class="form-stack permission-form" method="post" action="{route}">
 <input type="hidden" name="id" value="{id}"><p>La rotation invalide le secret précédent et applique les droits sélectionnés. La date d’expiration est conservée.</p>"#
             )?;
-            checkboxes(&mut html, offered, rights)?;
+            checkboxes(&mut html, offered, rights, None)?;
             html.push_str(r#"<div class="form-actions"><button name="action" value="rotate">Faire tourner le jeton</button></div></form>"#);
         }
         if !revoked && !expired {

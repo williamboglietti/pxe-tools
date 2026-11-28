@@ -173,6 +173,14 @@ docker exec "$container" bash -ec '
         [[ "$console" == *"name=\"theme-drawer\" value=\"$theme\" data-theme-choice"* ]]
     done
     test "$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/notifications")" = "[]"
+    accounts=$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/access/users")
+    [[ "$accounts" == *"<fieldset class=\"permission-fields\" data-account-rights>"* ]]
+    [[ "$accounts" == *"<fieldset class=\"permission-fields\" data-account-rights disabled>"* ]]
+    admin_rights=${accounts#*data-account-rights disabled>}
+    admin_rights=${admin_rights%%</fieldset>*}
+    rights_count=$(grep -o "name=\"scope\"" <<< "$admin_rights" | wc -l)
+    test "$rights_count" -gt 0
+    test "$rights_count" -eq "$(grep -o " checked>" <<< "$admin_rights" | wc -l)"
 
     alias=inventory.example.test
     openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=$alias" \

@@ -20,20 +20,36 @@ static STYLE_VERSION: LazyLock<String> =
 const NAVIGATION_SCRIPT: &str = include_str!("ui/navigation.js");
 const SETUP_COMMAND_SCRIPT: &str = include_str!("ui/setup-command.js");
 const WIZARD_IMAGES_SCRIPT: &str = include_str!("ui/wizard-images.js");
+const THEME_SCRIPT: &str = include_str!("ui/theme.js");
 const POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
-static CONSOLE_POLICY: LazyLock<String> =
-    LazyLock::new(|| format!("{}; connect-src 'self'", script_policy(NAVIGATION_SCRIPT)));
-static SETUP_POLICY: LazyLock<String> = LazyLock::new(|| script_policy(SETUP_COMMAND_SCRIPT));
-static WIZARD_IMAGES_POLICY: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{}; connect-src 'self'",
-        script_policy(WIZARD_IMAGES_SCRIPT)
-    )
-});
+static GUEST_SCRIPT: LazyLock<PageScript> = LazyLock::new(|| PageScript::new(None, false));
+static CONSOLE_SCRIPT: LazyLock<PageScript> =
+    LazyLock::new(|| PageScript::new(Some(NAVIGATION_SCRIPT), true));
+static SETUP_SCRIPT: LazyLock<PageScript> =
+    LazyLock::new(|| PageScript::new(Some(SETUP_COMMAND_SCRIPT), false));
+static IMAGE_SELECTION_SCRIPT: LazyLock<PageScript> =
+    LazyLock::new(|| PageScript::new(Some(WIZARD_IMAGES_SCRIPT), true));
 
-fn script_policy(script: &str) -> String {
-    let digest = STANDARD.encode(Sha256::digest(script.as_bytes()));
-    format!("{POLICY}; script-src 'sha256-{digest}'")
+struct PageScript {
+    source: String,
+    policy: String,
+}
+
+impl PageScript {
+    fn new(behavior: Option<&str>, connect: bool) -> Self {
+        let mut source = THEME_SCRIPT.to_owned();
+        if let Some(behavior) = behavior {
+            write!(
+                source,
+                "\ndocument.addEventListener('DOMContentLoaded', () => {{\n{behavior}\n}}, {{ once: true }});"
+            )
+            .expect("write to String");
+        }
+        let digest = STANDARD.encode(Sha256::digest(source.as_bytes()));
+        let network = if connect { "; connect-src 'self'" } else { "" };
+        let policy = format!("{POLICY}; script-src 'sha256-{digest}'{network}");
+        Self { source, policy }
+    }
 }
 
 const MENU: &str = "M4 6h16M4 12h16M4 18h16";
@@ -43,6 +59,9 @@ const KEY: &str = "M21 7a5 5 0 0 1-6.4 4.8L7 19H3v-4l7.2-7.6A5 5 0 1 1 21 7zm-5 
 const LOGOUT: &str = "M10 4H4v16h6m-1-8h11m-4-4 4 4-4 4";
 const CHEVRON: &str = "m6 9 6 6 6-6";
 const BELL: &str = "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9m-8 12a2 2 0 0 0 4 0";
+const SCREEN: &str = "M3 4h18v13H3zm9 13v4m-4 0h8";
+const SUN: &str = "M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4m0-12.8L17 7M7 17l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z";
+const MOON: &str = "M20.8 14.5A9 9 0 0 1 9.5 3.2 9 9 0 1 0 20.8 14.5z";
 
 fn brand() -> String {
     format!(
@@ -74,7 +93,7 @@ pub(super) fn wizard_images(content: &str) -> Reply {
         "Images de démarrage",
         content,
         StatusCode::OK,
-        Some((WIZARD_IMAGES_SCRIPT, WIZARD_IMAGES_POLICY.as_str())),
+        Some(&IMAGE_SELECTION_SCRIPT),
     )
 }
 
@@ -107,7 +126,7 @@ pub(super) fn wizard_with_setup_code(help: SetupCodeHelp, form: &str, status: St
         "Code de configuration",
         &content,
         status,
-        Some((SETUP_COMMAND_SCRIPT, SETUP_POLICY.as_str())),
+        Some(&SETUP_SCRIPT),
     )
 }
 
@@ -118,7 +137,7 @@ pub(super) fn wizard_welcome() -> Reply {
         r#"<p class="wizard-intro">Créez votre compte d’administration. Vous pourrez ensuite choisir le mode réseau et les images de démarrage de votre serveur.</p>
 <div class="form-actions"><a class="button" id="setup-continue" href="/init/code">Commencer</a></div>"#,
         StatusCode::OK,
-        Some((SETUP_COMMAND_SCRIPT, SETUP_POLICY.as_str())),
+        Some(&SETUP_SCRIPT),
     )
 }
 
@@ -127,7 +146,7 @@ fn wizard_document(
     title: &str,
     content: &str,
     status: StatusCode,
-    script: Option<(&str, &str)>,
+    script: Option<&PageScript>,
 ) -> Reply {
     let mut layout = format!(
         r#"<header class="wizard-header">{}</header><main class="wizard-main">"#,
@@ -374,8 +393,28 @@ fn profile_menu(account: &Account, links: &str, drawer: bool) -> String {
         escape(&mut html, &account.username);
         html.push_str("</p>");
     }
+    html.push_str(&appearance(drawer));
     html.push_str(links);
     html.push_str("</div></details>");
+    html
+}
+
+fn appearance(drawer: bool) -> String {
+    let group = if drawer { "theme-drawer" } else { "theme-header" };
+    let mut html = String::from(r#"<fieldset class="profile-appearance"><legend>Apparence</legend><div class="theme-options">"#);
+    for (value, label, name, glyph, selected) in [
+        ("auto", "Auto", "Automatique", SCREEN, " checked"),
+        ("light", "Clair", "Clair", SUN, ""),
+        ("dark", "Sombre", "Sombre", MOON, ""),
+    ] {
+        write!(
+            html,
+            r#"<label><input type="radio" name="{group}" value="{value}" data-theme-choice aria-label="{name}"{selected}>{}<span>{label}</span></label>"#,
+            icon(glyph),
+        )
+        .expect("write to String");
+    }
+    html.push_str("</div></fieldset>");
     html
 }
 
@@ -515,7 +554,7 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
         title,
         &layout,
         StatusCode::OK,
-        Some((NAVIGATION_SCRIPT, CONSOLE_POLICY.as_str())),
+        Some(&CONSOLE_SCRIPT),
     )
 }
 
@@ -539,7 +578,7 @@ fn document(
     title: &str,
     layout: &str,
     status: StatusCode,
-    script: Option<(&str, &str)>,
+    script: Option<&PageScript>,
 ) -> Reply {
     let mut html = String::from(
         r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -547,18 +586,15 @@ fn document(
     );
     escape(&mut html, title);
     let style_version = STYLE_VERSION.as_str();
+    let script = script.unwrap_or(&GUEST_SCRIPT);
+    let source = &script.source;
     write!(
         html,
-        r#" · PXE Tools</title><link rel="icon" type="image/svg+xml" href="{MARK}">
+        r#" · PXE Tools</title><meta name="color-scheme" content="light dark"><script>{source}</script>
+<link rel="icon" type="image/svg+xml" href="{MARK}">
 <link rel="stylesheet" href="/console-assets/style.css?v={style_version}"></head><body class="{class}">{layout}"#
     )
     .expect("write to String");
-    let policy = if let Some((source, policy)) = script {
-        write!(html, "<script>{source}</script>").expect("write to String");
-        policy
-    } else {
-        POLICY
-    };
     html.push_str("</body></html>");
     Response::builder()
         .status(status)
@@ -568,7 +604,7 @@ fn document(
         // browser form submissions checked by the console.
         .header(header::REFERRER_POLICY, "same-origin")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header("Content-Security-Policy", policy)
+        .header("Content-Security-Policy", &script.policy)
         .body(bytes(html))
         .expect("valid console page")
 }

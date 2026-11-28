@@ -166,7 +166,12 @@ docker exec "$container" bash -ec '
     fixture=$(mktemp -d)
     test "$("${dns_client[@]}" "${status[@]}" --cookie-jar "$fixture/session" -H "Origin: $dns_origin" \
         --data "username=setup-fixture&password=fixture-only-password" "$dns_origin/login")" = 303
-    "${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/inventaire" >/dev/null
+    console=$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/inventaire")
+    [[ "$console" == *"name=\"color-scheme\" content=\"light dark\""* ]]
+    for theme in auto light dark; do
+        [[ "$console" == *"name=\"theme-header\" value=\"$theme\" data-theme-choice"* ]]
+        [[ "$console" == *"name=\"theme-drawer\" value=\"$theme\" data-theme-choice"* ]]
+    done
     test "$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/notifications")" = "[]"
 
     alias=inventory.example.test

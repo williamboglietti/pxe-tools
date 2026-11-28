@@ -22,12 +22,77 @@
 })();
 
 (() => {
-  const menus = document.querySelectorAll('.profile-menu, .notification-menu');
+  const sidebar = document.querySelector('[data-sidebar]');
+  const toggle = sidebar?.querySelector('[data-sidebar-toggle]');
+  if (!toggle) return;
+  const workspace = sidebar.closest('.workspace');
+  const desktop = matchMedia('(min-width: 921px) and (hover: hover)');
+  const key = 'pxe-sidebar-compact';
+  let compact = false;
+  let peek = false;
+  let suppress = false;
+  try { compact = localStorage.getItem(key) === '1'; } catch { /* Open by default. */ }
+
+  function apply() {
+    workspace.toggleAttribute('data-sidebar-compact', compact);
+    sidebar.toggleAttribute('data-sidebar-peek', compact && peek);
+    const label = compact ? 'Déplier le panneau' : 'Replier le panneau';
+    toggle.title = label;
+    toggle.setAttribute('aria-label', label);
+    toggle.setAttribute('aria-expanded', String(!compact || peek));
+  }
+
+  apply();
+  document.documentElement.classList.add('sidebar-enabled');
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    document.documentElement.classList.add('sidebar-motion');
+  }));
+  toggle.addEventListener('click', () => {
+    suppress = sidebar.matches(':hover');
+    peek = false;
+    compact = !compact;
+    try { localStorage.setItem(key, compact ? '1' : '0'); } catch { /* Apply for this page. */ }
+    apply();
+  });
+  const openOnHover = event => {
+    if (!compact || peek || suppress || !desktop.matches || event.pointerType === 'touch'
+        || event.target.closest('.sidebar-footer')) return;
+    peek = true;
+    apply();
+  };
+  function closePeek() {
+    suppress = false;
+    if (!peek) return;
+    peek = false;
+    apply();
+  }
+  sidebar.addEventListener('pointerenter', openOnHover);
+  sidebar.addEventListener('pointermove', openOnHover);
+  sidebar.addEventListener('pointerleave', closePeek);
+  desktop.addEventListener('change', closePeek);
+  window.addEventListener('storage', event => {
+    if (event.key !== key && event.key !== null) return;
+    compact = event.newValue === '1';
+    closePeek();
+    apply();
+  });
+})();
+
+(() => {
+  const menus = document.querySelectorAll('.profile-menu, .drawer-account');
   for (const menu of menus) {
+    const appearance = menu.querySelector('.profile-appearance');
+    menu.addEventListener('toggle', () => { if (!menu.open) appearance.open = false; });
     menu.addEventListener('keydown', event => {
       if (event.key !== 'Escape' || !menu.open) return;
+      // Let Escape close the mobile drawer when focus is outside the profile.
       event.preventDefault();
       event.stopPropagation();
+      if (appearance.open && appearance.contains(event.target)) {
+        appearance.open = false;
+        appearance.querySelector('summary').focus();
+        return;
+      }
       menu.open = false;
       menu.querySelector('summary').focus();
     });
@@ -37,7 +102,7 @@
   }
   document.addEventListener('pointerdown', event => {
     for (const menu of menus) {
-      if (!menu.contains(event.target)) menu.open = false;
+      if (menu.classList.contains('profile-menu') && !menu.contains(event.target)) menu.open = false;
     }
   });
 })();
@@ -135,7 +200,9 @@
 (() => {
   const menu = document.querySelector('[data-notifications]');
   if (!menu) return;
-  const summary = menu.querySelector('summary');
+  const trigger = menu.querySelector('[data-notification-bell]');
+  const panel = menu.querySelector('dialog');
+  const refreshButton = menu.querySelector('[data-notification-refresh]');
   const count = menu.querySelector('[data-notification-count]');
   const status = menu.querySelector('[data-notification-status]');
   const list = menu.querySelector('[data-notification-list]');
@@ -161,11 +228,15 @@
 
   function unread() {
     const pending = entries.filter(entry => !seen.has(entry.key)).length;
-    for (const row of list.children) row.classList.toggle('is-unread', !seen.has(row.dataset.key));
+    for (const row of list.children) {
+      const marked = seen.has(row.dataset.key);
+      row.classList.toggle('is-unread', !marked);
+      row.querySelector('[data-notification-read-item]').hidden = marked;
+    }
     const label = pending > 1 ? `${pending} notifications non lues` : '1 notification non lue';
     const message = pending ? label : '';
     if (announcement.textContent !== message) announcement.textContent = message;
-    summary.setAttribute('aria-label', pending ? 'Notifications, ' + label : 'Notifications');
+    trigger.setAttribute('aria-label', pending ? 'Notifications, ' + label : 'Notifications');
     count.textContent = pending;
     count.hidden = !pending;
     read.disabled = !pending;
@@ -176,7 +247,8 @@
     if (version === snapshot) return;
     snapshot = version;
     entries = items;
-    const focused = list.contains(document.activeElement) ? document.activeElement.closest('li').dataset.key : null;
+    const active = document.activeElement;
+    const focused = list.contains(active) ? active.closest('li')?.dataset.key : null;
     let restoreFocus;
     list.replaceChildren(...items.map(entry => {
       const row = document.createElement('li');
@@ -186,27 +258,41 @@
       link.href = entry.href;
       const title = document.createElement('strong');
       title.textContent = entry.title;
-      const detail = document.createElement('span');
+      const detail = document.createElement('p');
       detail.textContent = entry.detail;
-      link.append(title, detail);
+      row.append(title, detail);
       if (entry.at !== null) {
         const timestamp = new Date(entry.at * 1000);
         const time = document.createElement('time');
         time.dateTime = timestamp.toISOString();
         time.textContent = date.format(timestamp);
-        link.append(time);
+        row.append(time);
       }
-      if (entry.key === focused) restoreFocus = link;
-      row.append(link);
+      const actions = document.createElement('div');
+      actions.className = 'notification-row-actions';
+      link.className = 'button button--quiet';
+      link.textContent = 'Consulter';
+      const mark = document.createElement('button');
+      mark.type = 'button';
+      mark.className = 'button--quiet';
+      mark.dataset.notificationReadItem = '';
+      mark.textContent = 'Marquer comme lue';
+      actions.append(link, mark);
+      row.append(actions);
+      if (entry.key === focused) restoreFocus = active.matches('button') ? mark : link;
       return row;
     }));
-    if (focused) (restoreFocus ?? summary).focus({ preventScroll: true });
     unread();
+    if (focused && panel.open) {
+      const focusTarget = restoreFocus?.hidden ? restoreFocus.previousElementSibling : restoreFocus;
+      (focusTarget ?? panel.querySelector('form button')).focus({ preventScroll: true });
+    }
   }
 
   async function refresh() {
     if (loading || expired || document.hidden) return;
     loading = true;
+    refreshButton.disabled = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     try {
@@ -225,6 +311,7 @@
     } finally {
       clearTimeout(timeout);
       loading = false;
+      refreshButton.disabled = expired;
     }
   }
 
@@ -235,12 +322,15 @@
   }
 
   read.addEventListener('click', () => {
-    if (document.activeElement === read) summary.focus();
+    if (document.activeElement === read) panel.querySelector('form button').focus();
     remember(entries.map(entry => entry.key));
   });
   list.addEventListener('click', event => {
-    const row = event.target.closest('a')?.closest('li');
-    if (row) remember([row.dataset.key]);
+    const action = event.target.closest('a, [data-notification-read-item]');
+    const row = action?.closest('li');
+    if (!row) return;
+    if (action.matches('button')) row.querySelector('a').focus();
+    remember([row.dataset.key]);
   });
   window.addEventListener('storage', event => {
     if (event.key === key) {
@@ -248,7 +338,18 @@
       unread();
     }
   });
-  menu.addEventListener('toggle', () => { if (menu.open) refresh(); });
+  if (typeof panel.showModal !== 'function') return;
+  trigger.disabled = false;
+  trigger.addEventListener('click', () => {
+    panel.showModal();
+    trigger.setAttribute('aria-expanded', 'true');
+    refresh();
+  });
+  panel.addEventListener('close', () => {
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.focus({ preventScroll: true });
+  });
+  refreshButton.addEventListener('click', refresh);
   document.addEventListener('visibilitychange', refresh);
   setInterval(refresh, 15_000);
   refresh();

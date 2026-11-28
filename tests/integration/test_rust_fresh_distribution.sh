@@ -168,6 +168,9 @@ docker exec "$container" bash -ec '
         --data "username=setup-fixture&password=fixture-only-password" "$dns_origin/login")" = 303
     console=$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/inventaire")
     [[ "$console" == *"name=\"color-scheme\" content=\"light dark\""* ]]
+    [[ "$console" == *"data-sidebar-toggle"* && "$console" == *"aria-controls=\"desktop-navigation\""* ]]
+    [[ "$console" == *"class=\"profile-avatar\""* && "$console" == *"class=\"profile-appearance\""* ]]
+    [[ "$console" == *"<dialog class=\"notification-panel\" id=\"notification-panel\""* ]]
     for theme in auto light dark; do
         [[ "$console" == *"name=\"theme-header\" value=\"$theme\" data-theme-choice"* ]]
         [[ "$console" == *"name=\"theme-drawer\" value=\"$theme\" data-theme-choice"* ]]

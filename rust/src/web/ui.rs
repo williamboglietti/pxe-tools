@@ -59,13 +59,13 @@ const KEY: &str = "M21 7a5 5 0 0 1-6.4 4.8L7 19H3v-4l7.2-7.6A5 5 0 1 1 21 7zm-5 
 const LOGOUT: &str = "M10 4H4v16h6m-1-8h11m-4-4 4 4-4 4";
 const CHEVRON: &str = "m6 9 6 6 6-6";
 const BELL: &str = "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9m-8 12a2 2 0 0 0 4 0";
-const SCREEN: &str = "M3 4h18v13H3zm9 13v4m-4 0h8";
-const SUN: &str = "M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4m0-12.8L17 7M7 17l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z";
-const MOON: &str = "M20.8 14.5A9 9 0 0 1 9.5 3.2 9 9 0 1 0 20.8 14.5z";
+const SIDEBAR: &str =
+    "M6 4h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zm3.5 0v16";
+const CHECK: &str = "m5 12 4 4L19 6";
 
 fn brand() -> String {
     format!(
-        r#"<span class="brand"><img src="{MARK}" width="32" height="32" alt="">PXE Tools</span>"#
+        r#"<span class="brand"><img src="{MARK}" width="32" height="32" alt=""><span class="brand-name">PXE Tools</span></span>"#
     )
 }
 
@@ -377,44 +377,71 @@ fn profile_menu(account: &Account, links: &str, drawer: bool) -> String {
     } else {
         ("profile-menu", "profile-options")
     };
+    let initials: String = account
+        .username
+        .split(|character: char| !character.is_alphanumeric())
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .take(2)
+        .collect();
     let mut html = format!(
-        r#"<details class="{menu}"><summary class="button button--quiet">{}<span class="profile-name">"#,
-        icon(PERSON),
+        r#"<details class="{menu}"><summary class="button button--quiet"><span class="profile-avatar" aria-hidden="true">"#
     );
+    if initials.is_empty() {
+        html.push_str(&icon(PERSON));
+    } else {
+        escape(&mut html, &initials);
+    }
+    html.push_str(r#"</span><span class="profile-name">"#);
     escape(&mut html, &account.username);
-    write!(
-        html,
-        r#"</span>{}</summary><div class="{options}">"#,
-        icon(CHEVRON)
-    )
-    .expect("write to String");
+    html.push_str("</span>");
+    if drawer {
+        html.push_str(&icon(CHEVRON));
+    }
+    write!(html, r#"</summary><div class="{options}">"#).expect("write to String");
     if !drawer {
         html.push_str(r#"<p class="profile-account">"#);
         escape(&mut html, &account.username);
-        html.push_str("</p>");
+        html.push_str(if account.admin {
+            "<small>Administrateur</small></p>"
+        } else {
+            "<small>Accès personnalisé</small></p>"
+        });
     }
-    html.push_str(&appearance(drawer));
     html.push_str(links);
+    html.push_str(&appearance(drawer));
+    if !account.is_external() {
+        write!(html, r#"<form method="post" action="/logout"><button type="submit" class="profile-option">{}<span>Se déconnecter</span></button></form>"#, icon(LOGOUT))
+            .expect("write to String");
+    }
     html.push_str("</div></details>");
     html
 }
 
 fn appearance(drawer: bool) -> String {
-    let group = if drawer { "theme-drawer" } else { "theme-header" };
-    let mut html = String::from(r#"<fieldset class="profile-appearance"><legend>Apparence</legend><div class="theme-options">"#);
-    for (value, label, name, glyph, selected) in [
-        ("auto", "Auto", "Automatique", SCREEN, " checked"),
-        ("light", "Clair", "Clair", SUN, ""),
-        ("dark", "Sombre", "Sombre", MOON, ""),
+    let group = if drawer {
+        "theme-drawer"
+    } else {
+        "theme-header"
+    };
+    let mut html = format!(
+        r#"<details class="profile-appearance"><summary class="profile-option"><span>Apparence</span><span class="theme-label" data-theme-label>Système</span>{}</summary><fieldset class="theme-options" aria-label="Apparence">"#,
+        icon(CHEVRON)
+    );
+    for (value, label, selected) in [
+        ("light", "Mode clair", ""),
+        ("dark", "Mode sombre", ""),
+        ("auto", "Système", " checked"),
     ] {
         write!(
             html,
-            r#"<label><input type="radio" name="{group}" value="{value}" data-theme-choice aria-label="{name}"{selected}>{}<span>{label}</span></label>"#,
-            icon(glyph),
+            r#"<label><input type="radio" name="{group}" value="{value}" data-theme-choice{selected}><span>{label}</span>{}</label>"#,
+            icon(CHECK),
         )
         .expect("write to String");
     }
-    html.push_str("</div></fieldset>");
+    html.push_str("</fieldset></details>");
     html
 }
 
@@ -447,15 +474,16 @@ fn profile_links(account: &Account, section: ConsoleSection) -> String {
             KEY,
         );
     }
-    if !account.is_external() {
-        write!(html, r#"<form method="post" action="/logout"><button type="submit" class="profile-option">{}<span>Se déconnecter</span></button></form>"#, icon(LOGOUT))
-            .expect("write to String");
-    }
     html
 }
 
 fn notification_menu(account: &Account) -> String {
-    let identity = format!("{:?}:{}:{}", account.id, account.is_external(), account.username);
+    let identity = format!(
+        "{:?}:{}:{}",
+        account.id,
+        account.is_external(),
+        account.username
+    );
     let key = URL_SAFE_NO_PAD.encode(&Sha256::digest(identity)[..12]);
     let check = if super::notifications::updates_for(account) {
         " data-check-updates"
@@ -464,14 +492,17 @@ fn notification_menu(account: &Account) -> String {
     };
     let route = super::notifications::ROUTE;
     format!(
-        r#"<details class="notification-menu" data-notifications="{route}" data-account="{key}"{check}>
-<summary class="button button--quiet" aria-label="Notifications">{}<span data-notification-count aria-hidden="true" hidden></span></summary>
-<section class="notification-panel" aria-labelledby="notifications-heading">
+        r#"<div class="notification-menu" data-notifications="{route}" data-account="{key}"{check}>
+<button type="button" class="button button--quiet" data-notification-bell aria-label="Notifications" aria-haspopup="dialog" aria-controls="notification-panel" aria-expanded="false" disabled>{}<span data-notification-count aria-hidden="true" hidden></span></button>
+<dialog class="notification-panel" id="notification-panel" aria-labelledby="notifications-heading">
 <header class="notification-heading"><h2 id="notifications-heading">Notifications</h2>
-<button type="button" class="button--quiet" data-notification-read disabled>Tout marquer comme lu</button></header>
+<form method="dialog"><button class="button button--quiet" autofocus>Fermer</button></form></header>
+<div class="notification-actions">
+<button type="button" class="button--quiet" data-notification-refresh>Actualiser</button>
+<button type="button" class="button--quiet" data-notification-read disabled>Tout marquer comme lu</button></div>
 <p class="notification-status" data-notification-status role="status">Chargement des notifications…</p>
 <ul class="notification-list" data-notification-list></ul>
-</section></details><span class="notification-announcement" data-notification-announcement role="status"></span>"#,
+</dialog></div><span class="notification-announcement" data-notification-announcement role="status"></span>"#,
         icon(BELL),
     )
 }
@@ -498,22 +529,12 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
         .flat_map(|(_, links)| *links)
         .find(|(_, _, section, _)| show(*section))
         .map_or(super::profile::ROUTE, |(path, ..)| *path);
-    let mut layout = String::from(
-        r##"<a class="skip-link" href="#main">Aller au contenu</a><header class="masthead">"##,
-    );
-    write!(
-        layout,
-        r#"<a class="brand-link" href="{home}">{brand}</a><span class="masthead-label">Console d’administration</span>
-<div class="masthead-actions">{actions}<button type="button" class="button button--quiet mobile-toggle" aria-label="Ouvrir le menu de navigation" aria-haspopup="dialog" aria-controls="mobile-navigation" aria-expanded="false">{}</button></div>"#,
-        icon(MENU),
-    )
-    .expect("write to String");
     let mut navigation = String::new();
     for (group, links) in NAVIGATION {
         if !links.iter().any(|(_, _, item, _)| show(*item)) {
             continue;
         }
-        write!(navigation, r#"<div class="rail-group"><p>{group}</p>"#).expect("write to String");
+        write!(navigation, r#"<div class="rail-group" role="group" aria-label="{group}"><p aria-hidden="true">{group}</p>"#).expect("write to String");
         for &(path, name, item, glyph) in links {
             if !show(item) {
                 continue;
@@ -525,30 +546,34 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
             };
             write!(
                 navigation,
-                r#"<a href="{path}"{current}>{}<span>{name}</span></a>"#,
+                r#"<a href="{path}" aria-label="{name}"{current}>{}<span>{name}</span></a>"#,
                 icon(glyph)
             )
             .expect("write to String");
         }
         navigation.push_str("</div>");
     }
-    write!(
-        layout,
-        r#"</header><dialog id="mobile-navigation" class="mobile-drawer" aria-label="Navigation PXE Tools">
+    let mut layout = format!(
+        r##"<a class="skip-link" href="#main">Aller au contenu</a>
+<div class="workspace"><aside class="sidebar" data-sidebar>
+<a class="brand-link" href="{home}" aria-label="PXE Tools">{brand}</a>
+<nav class="rail" id="desktop-navigation" aria-label="Navigation principale">{navigation}</nav>
+<footer class="sidebar-footer"><button type="button" class="button--quiet sidebar-toggle" data-sidebar-toggle aria-label="Replier le panneau" title="Replier le panneau" aria-controls="desktop-navigation" aria-expanded="true">{}</button></footer>
+</aside><div class="console-body">
+<header class="masthead"><a class="brand-link" href="{home}">{brand}</a><span class="masthead-label">Console d’administration</span>
+<div class="masthead-actions">{actions}<button type="button" class="button button--quiet mobile-toggle" aria-label="Ouvrir le menu de navigation" aria-haspopup="dialog" aria-controls="mobile-navigation" aria-expanded="false">{}</button></div></header>
+<dialog id="mobile-navigation" class="mobile-drawer" aria-label="Navigation PXE Tools">
 <div class="drawer-body"><div class="drawer-header">{brand}<form method="dialog"><button type="submit" class="button button--quiet drawer-close" aria-label="Fermer le menu" autofocus>{}</button></form></div>
-{drawer_profile}<nav class="rail" aria-label="Navigation principale">{navigation}</nav>"#,
-        icon(CLOSE)
-    )
-    .expect("write to String");
-    write!(
-        layout,
-        r#"</div></dialog><div class="workspace"><nav class="rail" aria-label="Navigation principale">{navigation}</nav><main id="main" class="console-main" tabindex="-1"><h1>"#
-    )
-    .expect("write to String");
+{drawer_profile}<nav class="rail" aria-label="Navigation principale">{navigation}</nav></div></dialog>
+<main id="main" class="console-main" tabindex="-1"><h1>"##,
+        icon(SIDEBAR),
+        icon(MENU),
+        icon(CLOSE),
+    );
     escape(&mut layout, title);
     layout.push_str("</h1>");
     layout.push_str(content);
-    layout.push_str("</main></div>");
+    layout.push_str("</main></div></div>");
     document(
         "console",
         title,

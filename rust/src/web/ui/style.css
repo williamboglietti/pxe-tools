@@ -244,10 +244,11 @@ tbody tr:hover { background: #f7faff; }
 .profile-option:is(:hover, [aria-current]) { background: var(--blue-pale); color: var(--blue-hover); }
 .profile-option svg { width: 1.1rem; height: 1.1rem; }
 .notification-menu { flex: none; margin: 0; padding: 0; border: 0; }
-.notification-menu > summary {
+.console .notification-menu > summary {
   position: relative;
   width: var(--control-height);
   padding: 0;
+  align-items: center;
 }
 .console .notification-menu > summary::before { display: none; }
 .notification-menu > summary svg { width: 1.15rem; height: 1.15rem; }
@@ -310,7 +311,9 @@ tbody tr:hover { background: #f7faff; }
 .notification-row a {
   position: relative;
   display: grid;
-  gap: .15rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: .15rem var(--space-2);
   padding: var(--space-3) var(--space-3) var(--space-3) var(--space-5);
   border-radius: var(--radius);
   color: var(--ink);
@@ -318,6 +321,7 @@ tbody tr:hover { background: #f7faff; }
   text-decoration: none;
   overflow-wrap: anywhere;
 }
+.notification-row strong { grid-column: 1 / -1; }
 .notification-row a:is(:hover, :focus-visible) { background: var(--blue-pale); }
 .notification-row.is-unread a::before {
   content: "";
@@ -330,7 +334,7 @@ tbody tr:hover { background: #f7faff; }
 }
 .notification-row--error strong { color: var(--danger); }
 .notification-row span, .notification-row time { color: var(--muted); }
-.notification-row time { font-size: .78rem; font-variant-numeric: tabular-nums; }
+.notification-row time { font-size: .78rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .profile-settings { max-width: 42rem; }
 .profile-settings .wizard-summary { margin-bottom: 0; }
 .profile-feedback { margin: 0; padding: var(--space-3) var(--space-4); border-radius: var(--radius); background: #e7f4ec; color: #225d3b; }

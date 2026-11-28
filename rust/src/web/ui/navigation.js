@@ -141,11 +141,19 @@
     }
   }
 
-  read.addEventListener('click', () => {
-    if (document.activeElement === read) summary.focus();
-    seen = new Set([...loadSeen(), ...seen, ...entries.map(entry => entry.key)].slice(-100));
+  function remember(keys) {
+    seen = new Set([...loadSeen(), ...seen, ...keys].slice(-100));
     try { localStorage.setItem(key, JSON.stringify([...seen])); } catch { /* Keep this tab usable. */ }
     unread();
+  }
+
+  read.addEventListener('click', () => {
+    if (document.activeElement === read) summary.focus();
+    remember(entries.map(entry => entry.key));
+  });
+  list.addEventListener('click', event => {
+    const row = event.target.closest('a')?.closest('li');
+    if (row) remember([row.dataset.key]);
   });
   window.addEventListener('storage', event => {
     if (event.key === key) {

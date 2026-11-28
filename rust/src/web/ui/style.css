@@ -157,6 +157,9 @@ form p, fieldset p { margin: var(--space-4) 0; }
 .check-label { display: flex; align-items: flex-start; gap: var(--space-2); }
 .permission-form { margin-top: var(--space-4); }
 .permission-fields { display: grid; gap: var(--space-2); margin: 0; }
+.permission-fields:disabled .check-label, .permission-inheritance { color: var(--muted); }
+.permission-inheritance { margin: 0 0 var(--space-2); font-size: .875rem; }
+.permission-fields:not(:disabled) > .permission-inheritance { display: none; }
 label > input:is([type="checkbox"], [type="radio"]) { flex: none; margin-top: .19rem; }
 fieldset { min-width: 0; margin: 1rem 0; padding: .9rem 1rem; border: 1px solid var(--line); border-radius: var(--radius); }
 legend { padding-inline: .45rem; font-weight: 700; }

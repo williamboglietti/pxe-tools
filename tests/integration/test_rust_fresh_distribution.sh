@@ -174,6 +174,9 @@ docker exec "$container" bash -ec '
     done
     test "$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/notifications")" = "[]"
     accounts=$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/access/users")
+    [[ "$accounts" == *"href=\"#add-account\" aria-haspopup=\"dialog\" data-account-open>Ajouter un compte"* ]]
+    [[ "$accounts" == *"<dialog class=\"account-dialog\" id=\"add-account\" aria-labelledby=\"add-account-title\">"* ]]
+    [[ "$accounts" == *"<dialog class=\"account-dialog\" id=\"edit-account-"* ]]
     [[ "$accounts" == *"<fieldset class=\"permission-fields\" data-account-rights>"* ]]
     [[ "$accounts" == *"<fieldset class=\"permission-fields\" data-account-rights disabled>"* ]]
     admin_rights=${accounts#*data-account-rights disabled>}

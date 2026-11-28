@@ -44,10 +44,12 @@
 
 (() => {
   for (const fields of document.querySelectorAll('[data-account-rights]')) {
-    const admin = fields.form.elements.namedItem('admin');
+    const form = fields.form;
+    const admin = form.elements.namedItem('admin');
     const scopes = Array.from(fields.querySelectorAll('input[name="scope"]'));
-    let assigned = scopes.map(scope => fields.disabled
-      ? scope.hasAttribute('data-assigned') : scope.checked);
+    const initial = scopes.map(scope => admin.defaultChecked
+      ? scope.hasAttribute('data-assigned') : scope.defaultChecked);
+    let assigned = initial;
 
     function applyRole() {
       if (admin.checked && !fields.disabled) assigned = scopes.map(scope => scope.checked);
@@ -57,6 +59,76 @@
 
     applyRole();
     admin.addEventListener('change', applyRole);
+    form.addEventListener('reset', () => {
+      queueMicrotask(() => {
+        assigned = initial;
+        fields.disabled = admin.defaultChecked;
+        applyRole();
+      });
+    });
+  }
+})();
+
+(() => {
+  for (const trigger of document.querySelectorAll('[data-account-open]')) {
+    const dialog = document.getElementById(trigger.hash.slice(1));
+    if (typeof dialog?.showModal !== 'function') continue;
+    const form = dialog.querySelector('form');
+    const body = dialog.querySelector('.account-dialog-body');
+    const cancel = dialog.querySelector('[data-account-close]');
+    const submit = form.querySelector('button[type="submit"]');
+    const error = form.querySelector('.account-dialog-error');
+    const submitLabel = submit.textContent;
+
+    trigger.addEventListener('click', event => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      dialog.showModal();
+    });
+    cancel.addEventListener('click', event => {
+      if (!dialog.open) return;
+      event.preventDefault();
+      if (!submit.disabled) dialog.close();
+    });
+    dialog.addEventListener('cancel', event => {
+      if (submit.disabled) event.preventDefault();
+    });
+    dialog.addEventListener('close', () => {
+      form.reset();
+      error.hidden = true;
+      body.scrollTop = 0;
+    });
+    form.addEventListener('submit', async event => {
+      if (!dialog.open) return;
+      event.preventDefault();
+      if (submit.disabled) return;
+      submit.disabled = true;
+      submit.textContent = 'Enregistrement…';
+      error.hidden = true;
+      let message = 'Impossible d’enregistrer le compte. Réessayez.';
+      try {
+        const response = await fetch(form.getAttribute('action'), {
+          method: 'POST',
+          body: new URLSearchParams(new FormData(form)),
+        });
+        if (response.redirected) {
+          location.reload();
+          return;
+        }
+        if (response.status === 422 || response.status === 409) {
+          message = (await response.text()).trim() || message;
+        } else if (response.status === 401 || response.status === 403) {
+          message = 'Accès refusé. Vérifiez votre connexion et vos droits.';
+        }
+      } catch {
+        // Keep the form open so it can be submitted again.
+      }
+      submit.disabled = false;
+      submit.textContent = submitLabel;
+      error.textContent = message;
+      error.hidden = false;
+      error.focus();
+    });
   }
 })();
 

@@ -629,6 +629,39 @@ fn checkboxes(
     Ok(())
 }
 
+fn account_dialog(
+    html: &mut String,
+    id: &str,
+    account: Option<&str>,
+    fields: &str,
+) -> std::fmt::Result {
+    let (title, action, submit) = if account.is_some() {
+        ("Modifier le compte", "update", "Enregistrer")
+    } else {
+        ("Ajouter un compte", "create", "Créer le compte")
+    };
+    write!(
+        html,
+        r##"<dialog class="account-dialog" id="{id}" aria-labelledby="{id}-title">
+<form method="post" action="{USERS}">
+<input type="hidden" name="action" value="{action}">
+<header class="account-dialog-header"><h2 id="{id}-title" tabindex="-1" autofocus>{title}</h2>"##
+    )?;
+    if let Some(account) = account {
+        html.push_str(r#"<p class="muted">"#);
+        escape(html, account);
+        html.push_str("</p>");
+    }
+    write!(
+        html,
+        r##"</header><div class="account-dialog-body form-stack">
+<p class="account-dialog-error" role="alert" tabindex="-1" hidden></p>
+{fields}</div>
+<footer class="account-dialog-actions"><a class="button button--quiet" href="#accounts-list" data-account-close>Annuler</a>
+<button type="submit">{submit}</button></footer></form></dialog>"##
+    )
+}
+
 fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
     let mut html = String::new();
     if actor.id.is_none() {
@@ -653,20 +686,23 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
     };
     write!(
         html,
-        r#"<nav class="page-links" aria-label="Administration des accès"><a href="{TOKENS}">Jetons de tous les comptes</a></nav>"#
+        r##"<div class="accounts-toolbar">
+<a class="button" href="#add-account" aria-haspopup="dialog" data-account-open>Ajouter un compte</a>
+<a href="{TOKENS}">Jetons de tous les comptes</a>
+</div><ul class="accounts-list" id="accounts-list" aria-label="Comptes">"##
     )?;
+    let mut fields = String::new();
     write!(
-        html,
-        r#"<details class="panel panel--form"><summary>Ajouter un compte</summary>
-<form class="form-stack permission-form" method="post" action="{USERS}">
-<div class="field"><label for="new-account">{username_label}</label><input id="new-account" name="username" required maxlength="256" autocomplete="off"></div>"#
+        fields,
+        r#"<div class="field"><label for="new-account">{username_label}</label><input id="new-account" name="username" required maxlength="256" autocomplete="off"></div>"#
     )?;
     if !actor.external {
-        html.push_str(r#"<div class="field"><label for="new-password">Mot de passe initial</label><input id="new-password" type="password" name="password" minlength="12" maxlength="72" autocomplete="new-password" required></div>"#);
+        fields.push_str(r#"<div class="field"><label for="new-password">Mot de passe initial</label><input id="new-password" type="password" name="password" minlength="12" maxlength="72" autocomplete="new-password" required><small>12 caractères minimum.</small></div>"#);
     }
-    html.push_str(r#"<label class="check-label"><input type="checkbox" name="admin" value="1"> Administrateur</label>"#);
-    checkboxes(&mut html, offered, 0, Some(false))?;
-    html.push_str(r#"<div class="form-actions"><button name="action" value="create">Créer le compte</button></div></form></details>"#);
+    fields.push_str(r#"<label class="check-label"><input type="checkbox" name="admin" value="1"> Administrateur</label>"#);
+    checkboxes(&mut fields, offered, 0, Some(false))?;
+    let mut dialogs = String::new();
+    account_dialog(&mut dialogs, "add-account", None, &fields)?;
     let mut rows = db.prepare(
         "SELECT id,username,is_admin,enabled,permissions
                               FROM users WHERE external=?1 ORDER BY username",
@@ -675,45 +711,55 @@ fn users_page(db: &Connection, actor: &Account) -> Result<Reply, ErrorBox> {
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
+        let name = if actor.external {
+            name.strip_prefix("sso:").unwrap_or(&name)
+        } else {
+            &name
+        };
         let is_admin: bool = row.get(2)?;
         let admin = if is_admin { " checked" } else { "" };
-        let enabled = if row.get::<_, bool>(3)? {
-            " checked"
+        let active: bool = row.get(3)?;
+        let enabled = if active { " checked" } else { "" };
+        let (status, tone) = if active {
+            ("Actif", " status-badge--success")
         } else {
-            ""
+            ("Désactivé", "")
         };
-        let state = if enabled.is_empty() {
-            "désactivé"
-        } else if is_admin {
-            "administrateur"
+        let role = if is_admin {
+            "Administrateur"
         } else {
-            "accès personnalisé"
+            "Accès personnalisé"
         };
-        html.push_str(r#"<details class="panel panel--form"><summary>"#);
-        escape(
-            &mut html,
-            if actor.external {
-                name.strip_prefix("sso:").unwrap_or(&name)
-            } else {
-                &name
-            },
-        );
+        let dialog_id = format!("edit-account-{id}");
         write!(
             html,
-            r#" <span class="muted">· {state}</span></summary>
-<form class="form-stack permission-form" method="post" action="{USERS}"><input type="hidden" name="id" value="{id}">
+            r#"<li class="account-row"><div class="account-identity"><strong id="account-name-{id}">"#
+        )?;
+        escape(&mut html, name);
+        write!(
+            html,
+            r##"</strong><span class="muted">{role}</span></div>
+<span class="status-badge{tone}">{status}</span>
+<a class="button button--quiet" href="#{dialog_id}" aria-haspopup="dialog" aria-labelledby="account-edit-{id} account-name-{id}" id="account-edit-{id}" data-account-open>Modifier</a></li>"##
+        )?;
+        fields.clear();
+        write!(
+            fields,
+            r#"<input type="hidden" name="id" value="{id}">
 <label class="check-label"><input type="checkbox" name="enabled" value="1"{enabled}> Compte actif</label>
 <label class="check-label"><input type="checkbox" name="admin" value="1"{admin}> Administrateur</label>"#
         )?;
         if !actor.external {
             write!(
-                html,
+                fields,
                 r#"<div class="field"><label for="account-password-{id}">Nouveau mot de passe (facultatif)</label><input id="account-password-{id}" type="password" name="password" minlength="12" maxlength="72" autocomplete="new-password"></div>"#
             )?;
         }
-        checkboxes(&mut html, offered, row.get(4)?, Some(is_admin))?;
-        html.push_str(r#"<div class="form-actions"><button name="action" value="update">Enregistrer les droits</button></div></form></details>"#);
+        checkboxes(&mut fields, offered, row.get(4)?, Some(is_admin))?;
+        account_dialog(&mut dialogs, &dialog_id, Some(name), &fields)?;
     }
+    html.push_str("</ul>");
+    html.push_str(&dialogs);
     let mut events = db.prepare(
         "SELECT datetime(created_at,'unixepoch'),actor,operation,target
                                  FROM access_events ORDER BY id DESC LIMIT 30",

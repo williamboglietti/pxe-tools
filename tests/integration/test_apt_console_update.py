@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 
 ORIGIN = 'https://127.0.0.1'
 ROUTE = '/settings/updates'
+NOTIFICATIONS = '/admin/notifications'
 RELEASES = 'https://github.com/TWTCloud/pxe-tools/releases/tag/v'
 WORK = Path('/var/tmp/apt-update-fixture')
 UPDATER = '/usr/lib/pxe-tools/native/apt-console-update.py'
@@ -24,8 +25,8 @@ AUTH = 'Basic ' + base64.b64encode(b'setup-fixture:fixture-only-password').decod
 CONTEXT = ssl._create_unverified_context()
 
 
-def request(path, form=None, *, authenticate=True, origin=ORIGIN, as_json=False):
-    options = {'Authorization': AUTH} if authenticate else {}
+def request(path, form=None, *, authenticate=True, origin=ORIGIN, as_json=False, authorization=AUTH):
+    options = {'Authorization': authorization} if authenticate else {}
     if as_json:
         options['Accept'] = 'application/json'
     if form is not None:
@@ -60,6 +61,54 @@ def wait_for(expected, timeout=100):
 
 def command(*args, **options):
     return subprocess.run(args, check=True, **options)
+
+
+def notifications(db_path):
+    assert request(NOTIFICATIONS, authenticate=False)[0] == 401
+    assert request(NOTIFICATIONS, {'action': 'read'})[0] == 405
+    mac = '02:00:00:00:00:98'
+    with sqlite3.connect(db_path) as db:
+        db.execute('PRAGMA foreign_keys=ON')
+        machine = db.execute(
+            "INSERT INTO machines(mac,hostname) VALUES(?, 'console-test-device')", [mac],
+        ).lastrowid
+        for _ in range(2):
+            db.execute(
+                "INSERT INTO machine_events(machine_id,message,checkpoint) "
+                "VALUES(?, 'internal boot data', 'pxe_boot_observed')", [machine],
+            )
+        db.execute(
+            "INSERT INTO discoveries(machine_id,discovery_status,ended_at) "
+            "VALUES(?, 'success', CURRENT_TIMESTAMP)", [machine],
+        )
+        db.execute(
+            "INSERT INTO disk_tests(machine_id,job_status,jobs_json,ended_at) "
+            "VALUES(?, 'failed', '[]', CURRENT_TIMESTAMP)", [machine],
+        )
+        task = db.execute(
+            "INSERT INTO actions(machine_id,type,status,token,ended_at) "
+            "VALUES(?, 'install_only','success', 'private-action-token', CURRENT_TIMESTAMP)", [machine],
+        ).lastrowid
+        db.execute("""INSERT INTO users(username,password_hash,managed_password_hash,is_admin,permissions)
+                   SELECT 'notification-inventory',password_hash,managed_password_hash,0,1
+                   FROM users WHERE username='setup-fixture'""")
+    try:
+        code, body = request(NOTIFICATIONS)
+        assert code == 200 and b'internal boot data' not in body and b'private-action-token' not in body
+        items = {row['title']: row for row in json.loads(body)}
+        assert len(json.loads(body)) == len(items) == 4
+        assert items['Provisionnement terminé']['href'] == f'/tasks/{task}'
+        assert items['Inventaire reçu']['href'] == f'/admin/inventaire/{machine}'
+        assert items['Échec du test disque']['tone'] == 'error'
+        reader = 'Basic ' + base64.b64encode(b'notification-inventory:fixture-only-password').decode()
+        status, restricted = request(NOTIFICATIONS, authorization=reader)
+        assert status == 200
+        assert {item['title'] for item in json.loads(restricted)} == {'Inventaire reçu', 'Démarrage PXE détecté'}
+    finally:
+        with sqlite3.connect(db_path) as db:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute("DELETE FROM users WHERE username='notification-inventory'")
+            db.execute('DELETE FROM machines WHERE id=?', [machine])
 
 
 def signed_fixture(current, target):
@@ -148,10 +197,14 @@ def main():
     assert b'data-update-action="install" hidden' in page
     assert (RELEASES + current.replace('~', '-')).encode() in page
     assert page.count(b'<details class="profile-menu">') == 1
+    assert b'data-notifications="/admin/notifications"' in page
+    assert b'data-check-updates' in page and b'data-update-notice' not in page
     assert b'<span class="profile-name">setup-fixture</span>' in page
     assert b'href="/admin/profile/tokens"' in page and b'action="/logout"' in page
     assert request(ROUTE + '/status', authenticate=False)[0] == 401
     assert request(ROUTE, {'action': 'auto'}, origin='https://example.invalid')[0] == 403
+    db_path = json.loads(Path('/etc/pxe-tools/db.conf').read_text())['path']
+    notifications(db_path)
 
     command('systemctl', 'stop', 'pxe-tools-worker.service')
     try:
@@ -188,11 +241,14 @@ def main():
     assert status['candidates'] == {'pxe-tools': target}
     assert status['release_notes'] == RELEASES + target.replace('~', '-')
     assert status['release_notes'].encode() in page
+    code, body = request(NOTIFICATIONS)
+    assert code == 200
+    update, = json.loads(body)
+    assert update['title'] == 'Mise à jour disponible' and update['href'] == ROUTE and target in update['detail']
     install = {'action': 'install', 'plan': status['plan']}
     assert request(ROUTE, {**install, 'plan': '{}'})[0] == 409
     code, body = request(ROUTE, {**install, 'plan': '{}'}, as_json=True)
     assert code == 409 and json.loads(body)['plan'] == status['plan']
-    db_path = json.loads(Path('/etc/pxe-tools/db.conf').read_text())['path']
     with sqlite3.connect(db_path) as db:
         fixture = db.execute("INSERT INTO init_jobs(job_type,status) VALUES('fixture','running')").lastrowid
     assert request(ROUTE, install)[0] == 303
@@ -217,6 +273,7 @@ def main():
     code, page = request(ROUTE)
     assert code == 200 and target.encode() in page and b'data-update-action="install" hidden' in page
     assert 'Mise à jour terminée'.encode() in page
+    assert json.loads(request(NOTIFICATIONS)[1]) == []
     command('systemctl', 'is-active', '--quiet', 'pxe-tools-worker.service')
     print('Native web-triggered signed APT update restored HTTPS, SQLite, the master key and TLS.')
 

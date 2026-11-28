@@ -70,6 +70,7 @@ pub(super) enum Action {
     Users(Option<Bytes>),
     Tokens(Option<Bytes>, bool),
     Profile(Option<Bytes>),
+    Notifications,
 }
 
 impl Action {
@@ -135,7 +136,7 @@ impl Action {
             | Self::Certificates(..)
             | Self::Acme(..)
             | Self::Users(..) => Admin,
-            Self::Tokens(..) | Self::Profile(_) => return None,
+            Self::Tokens(..) | Self::Profile(_) | Self::Notifications => return None,
         })
     }
 }
@@ -417,6 +418,9 @@ impl Console {
                 }
                 if let Action::Users(form) = &action {
                     return access::users(&db, &db_path, &account, form.as_deref()).ok();
+                }
+                if matches!(action, Action::Notifications) {
+                    return super::notifications::feed(&db, &account).ok();
                 }
                 if let Action::Overview(address, networks) = &action {
                     return super::overview::show(&db, &account, *address, networks.as_deref()).ok();

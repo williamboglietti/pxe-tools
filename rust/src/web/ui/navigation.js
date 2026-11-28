@@ -25,7 +25,7 @@
 })();
 
 (() => {
-  const menus = document.querySelectorAll('.profile-menu');
+  const menus = document.querySelectorAll('.profile-menu, .notification-menu');
   for (const menu of menus) {
     menu.addEventListener('keydown', event => {
       if (event.key !== 'Escape' || !menu.open) return;
@@ -46,9 +46,135 @@
 })();
 
 (() => {
-  const notice = document.querySelector('[data-update-notice] a');
+  const menu = document.querySelector('[data-notifications]');
+  if (!menu) return;
+  const summary = menu.querySelector('summary');
+  const count = menu.querySelector('[data-notification-count]');
+  const status = menu.querySelector('[data-notification-status]');
+  const list = menu.querySelector('[data-notification-list]');
+  const read = menu.querySelector('[data-notification-read]');
+  const announcement = document.querySelector('[data-notification-announcement]');
+  const key = 'pxe-notifications:' + menu.dataset.account;
+  const date = new Intl.DateTimeFormat('fr', { dateStyle: 'short', timeStyle: 'short' });
+  let entries = [];
+  let snapshot = '';
+  let loading = false;
+  let expired = false;
+  let seen = loadSeen();
+
+  function loadSeen() {
+    try {
+      const values = JSON.parse(localStorage.getItem(key));
+      if (Array.isArray(values)) return new Set(values.slice(-100));
+    } catch {
+      // Reading still works when browser storage is unavailable.
+    }
+    return new Set();
+  }
+
+  function unread() {
+    const pending = entries.filter(entry => !seen.has(entry.key)).length;
+    for (const row of list.children) row.classList.toggle('is-unread', !seen.has(row.dataset.key));
+    const label = pending > 1 ? `${pending} notifications non lues` : '1 notification non lue';
+    const message = pending ? label : '';
+    if (announcement.textContent !== message) announcement.textContent = message;
+    summary.setAttribute('aria-label', pending ? 'Notifications, ' + label : 'Notifications');
+    count.textContent = pending;
+    count.hidden = !pending;
+    read.disabled = !pending;
+  }
+
+  function render(items) {
+    const version = JSON.stringify(items);
+    if (version === snapshot) return;
+    snapshot = version;
+    entries = items;
+    const focused = list.contains(document.activeElement) ? document.activeElement.closest('li').dataset.key : null;
+    let restoreFocus;
+    list.replaceChildren(...items.map(entry => {
+      const row = document.createElement('li');
+      row.dataset.key = entry.key;
+      row.className = 'notification-row notification-row--' + entry.tone;
+      const link = document.createElement('a');
+      link.href = entry.href;
+      const title = document.createElement('strong');
+      title.textContent = entry.title;
+      const detail = document.createElement('span');
+      detail.textContent = entry.detail;
+      link.append(title, detail);
+      if (entry.at !== null) {
+        const timestamp = new Date(entry.at * 1000);
+        const time = document.createElement('time');
+        time.dateTime = timestamp.toISOString();
+        time.textContent = date.format(timestamp);
+        link.append(time);
+      }
+      if (entry.key === focused) restoreFocus = link;
+      row.append(link);
+      return row;
+    }));
+    if (focused) (restoreFocus ?? summary).focus({ preventScroll: true });
+    unread();
+  }
+
+  async function refresh() {
+    if (loading || expired || document.hidden) return;
+    loading = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(menu.dataset.notifications, {
+        headers: { Accept: 'application/json' }, cache: 'no-store', signal: controller.signal,
+      });
+      expired = response.redirected || [401, 403].includes(response.status);
+      if (!response.ok || expired) throw new Error();
+      render(await response.json());
+      status.hidden = entries.length > 0;
+      if (!status.hidden) status.textContent = 'Aucune notification récente.';
+    } catch {
+      if (expired) render([]);
+      status.hidden = false;
+      status.textContent = expired ? 'Reconnectez-vous pour recevoir les notifications.' : 'Notifications indisponibles. Un nouvel essai aura lieu automatiquement.';
+    } finally {
+      clearTimeout(timeout);
+      loading = false;
+    }
+  }
+
+  read.addEventListener('click', () => {
+    if (document.activeElement === read) summary.focus();
+    seen = new Set([...loadSeen(), ...seen, ...entries.map(entry => entry.key)].slice(-100));
+    try { localStorage.setItem(key, JSON.stringify([...seen])); } catch { /* Keep this tab usable. */ }
+    unread();
+  });
+  window.addEventListener('storage', event => {
+    if (event.key === key) {
+      seen = loadSeen();
+      unread();
+    }
+  });
+  menu.addEventListener('toggle', () => { if (menu.open) refresh(); });
+  document.addEventListener('visibilitychange', refresh);
+  setInterval(refresh, 15_000);
+  refresh();
+
+  if (menu.hasAttribute('data-check-updates') && !document.querySelector('[data-update-phase]')) {
+    const checkUpdates = () => {
+      if (expired || document.hidden) return;
+      fetch('/settings/updates', {
+        method: 'POST', headers: { Accept: 'application/json' },
+        body: new URLSearchParams({ action: 'auto' }), cache: 'no-store',
+        signal: AbortSignal.timeout(8000),
+      }).catch(() => {});
+    };
+    checkUpdates();
+    setInterval(checkUpdates, 15 * 60_000);
+  }
+})();
+
+(() => {
   const panel = document.querySelector('[data-update-phase]');
-  if (!notice && !panel) return;
+  if (!panel) return;
   const pending = phase => ['queued', 'checking', 'install_queued', 'installing'].includes(phase);
   const route = '/settings/updates';
   const authenticationLost = response => response.redirected || [401, 403].includes(response.status);
@@ -69,25 +195,6 @@
     } finally {
       clearTimeout(timeout);
     }
-  }
-
-  if (notice) {
-    const deadline = Date.now() + 90_000;
-    async function checkNotice(body) {
-      try {
-        const { response, update } = await request(body);
-        if (authenticationLost(response) || response.status === 404) return;
-        if (update) {
-          notice.hidden = !update.available || pending(update.phase);
-          if (!pending(update.phase)) return;
-        }
-      } catch {
-        // Check the persisted state if the automatic request could not be confirmed.
-      }
-      if (Date.now() < deadline) setTimeout(checkNotice, 5000);
-    }
-    checkNotice(new URLSearchParams({ action: 'auto' }));
-    return;
   }
 
   const check = panel.querySelector('[data-update-action="check"]');

@@ -20,6 +20,7 @@ mod hostnames;
 mod images;
 mod jobs;
 mod linux_boot;
+mod notifications;
 mod onboarding;
 mod overview;
 mod presets;
@@ -759,6 +760,18 @@ async fn dispatch(
             _ => admin::Action::Tokens(form, path == access::PERSONAL_TOKENS),
         };
         return site.admin.serve(&parts, peer, &site.database, action).await;
+    }
+    if path == notifications::ROUTE {
+        if !secure {
+            return plain(StatusCode::NOT_FOUND, "Not found\n");
+        }
+        if !readable {
+            return plain(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed\n");
+        }
+        return site
+            .admin
+            .serve(&parts, peer, &site.database, admin::Action::Notifications)
+            .await;
     }
     if matches!(path, "/admin/" | "/admin/inventaire") && readable {
         if !secure {

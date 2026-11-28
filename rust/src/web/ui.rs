@@ -42,6 +42,7 @@ const PERSON: &str = "M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M14 7a4 4 0 1 1-8
 const KEY: &str = "M21 7a5 5 0 0 1-6.4 4.8L7 19H3v-4l7.2-7.6A5 5 0 1 1 21 7zm-5 0h.01";
 const LOGOUT: &str = "M10 4H4v16h6m-1-8h11m-4-4 4 4-4 4";
 const CHEVRON: &str = "m6 9 6 6 6-6";
+const BELL: &str = "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9m-8 12a2 2 0 0 0 4 0";
 
 fn brand() -> String {
     format!(
@@ -401,12 +402,43 @@ fn profile_menu(account: &Account, section: ConsoleSection) -> String {
     html
 }
 
+fn notification_menu(account: &Account) -> String {
+    let identity = format!("{:?}:{}:{}", account.id, account.is_external(), account.username);
+    let key = URL_SAFE_NO_PAD.encode(&Sha256::digest(identity)[..12]);
+    let check = if super::notifications::updates_for(account) {
+        " data-check-updates"
+    } else {
+        ""
+    };
+    let route = super::notifications::ROUTE;
+    format!(
+        r#"<details class="notification-menu" data-notifications="{route}" data-account="{key}"{check}>
+<summary class="button button--quiet" aria-label="Notifications">{}<span data-notification-count aria-hidden="true" hidden></span></summary>
+<section class="notification-panel" aria-labelledby="notifications-heading">
+<header class="notification-heading"><h2 id="notifications-heading">Notifications</h2>
+<button type="button" class="button--quiet" data-notification-read disabled>Tout marquer comme lu</button></header>
+<p class="notification-status" data-notification-status role="status">Chargement des notifications…</p>
+<ul class="notification-list" data-notification-list></ul>
+</section></details><span class="notification-announcement" data-notification-announcement role="status"></span>"#,
+        icon(BELL),
+    )
+}
+
 pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply {
     let brand = brand();
-    let (mask, profile) = NAVIGATION_CONTEXT.with_borrow(|context| {
+    let (mask, actions) = NAVIGATION_CONTEXT.with_borrow(|context| {
         context.as_ref().map_or_else(
             || (u16::MAX, String::new()),
-            |nav| (nav.mask, profile_menu(&nav.account, section)),
+            |nav| {
+                let notices = super::notifications::available_to(&nav.account)
+                    .then(|| notification_menu(&nav.account))
+                    .unwrap_or_default();
+                let profile = profile_menu(&nav.account, section);
+                (
+                    nav.mask,
+                    format!(r#"<div class="masthead-actions">{notices}{profile}</div>"#),
+                )
+            },
         )
     });
     let show = |section: ConsoleSection| section.bit() & mask != 0;
@@ -425,7 +457,7 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
         icon(MENU),
     )
     .expect("write to String");
-    layout.push_str(&profile);
+    layout.push_str(&actions);
     let mut navigation = String::new();
     for (group, links) in NAVIGATION {
         if !links.iter().any(|(_, _, item, _)| show(*item)) {
@@ -465,9 +497,6 @@ pub(super) fn page(section: ConsoleSection, title: &str, content: &str) -> Reply
     .expect("write to String");
     escape(&mut layout, title);
     layout.push_str("</h1>");
-    if show(ConsoleSection::Updates) && section != ConsoleSection::Updates {
-        layout.push_str(r#"<p data-update-notice role="status"><a href="/settings/updates" hidden>Une mise à jour de PXE Tools est disponible</a></p>"#);
-    }
     layout.push_str(content);
     layout.push_str("</main></div>");
     document(

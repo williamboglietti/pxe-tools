@@ -167,6 +167,7 @@ docker exec "$container" bash -ec '
     test "$("${dns_client[@]}" "${status[@]}" --cookie-jar "$fixture/session" -H "Origin: $dns_origin" \
         --data "username=setup-fixture&password=fixture-only-password" "$dns_origin/login")" = 303
     "${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/inventaire" >/dev/null
+    test "$("${dns_client[@]}" -f --cookie "$fixture/session" "$dns_origin/admin/notifications")" = "[]"
 
     alias=inventory.example.test
     openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=$alias" \
